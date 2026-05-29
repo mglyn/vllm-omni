@@ -73,6 +73,134 @@ class TestPipelineIndependence:
         assert issubclass(LTX23Pipeline, CFGParallelMixin)
 
 
+class TestLTX23VaeDecodeParallel:
+    """Test LTX-2.3 video VAE tiled parallel helpers without loading weights."""
+
+    def test_ltx23_video_vae_is_distributed_tile_only_class(self):
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+            DistributedAutoencoderKLLTX2Video,
+        )
+        from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
+
+        assert issubclass(DistributedAutoencoderKLLTX2Video, DistributedVaeMixin)
+        assert not hasattr(DistributedAutoencoderKLLTX2Video, "patch_split")
+
+    def test_ltx23_video_vae_tile_split_uses_native_ltx23_tile_geometry(self):
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+            DistributedAutoencoderKLLTX2Video,
+        )
+
+        vae = SimpleNamespace(
+            spatial_compression_ratio=32,
+            tile_sample_min_height=512,
+            tile_sample_min_width=512,
+            tile_sample_stride_height=448,
+            tile_sample_stride_width=448,
+            dtype=torch.float32,
+        )
+
+        z = torch.zeros(1, 2, 5, 16, 24)
+        tasks, grid_spec = DistributedAutoencoderKLLTX2Video.tile_split(vae, z)
+
+        assert grid_spec.grid_shape == (2, 2)
+        assert grid_spec.split_dims == (3, 4)
+        assert grid_spec.tile_spec["sample_height"] == 512
+        assert grid_spec.tile_spec["sample_width"] == 768
+        assert grid_spec.tile_spec["blend_height"] == 64
+        assert grid_spec.tile_spec["blend_width"] == 64
+        assert [task.grid_coord for task in tasks] == [(0, 0), (0, 1), (1, 0), (1, 1)]
+        assert [tuple(task.tensor.shape) for task in tasks] == [
+            (1, 2, 5, 16, 16),
+            (1, 2, 5, 16, 10),
+            (1, 2, 5, 2, 16),
+            (1, 2, 5, 2, 10),
+        ]
+        assert [task.workload for task in tasks] == [5 * 16 * 16, 5 * 16 * 10, 5 * 2 * 16, 5 * 2 * 10]
+
+    def test_ltx23_video_vae_tile_merge_blends_and_crops_like_tiled_decode(self):
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+            DistributedAutoencoderKLLTX2Video,
+        )
+        from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import GridSpec
+
+        class FakeVae:
+            def __init__(self):
+                self.blend_calls = []
+
+            def clear_cache(self):
+                pass
+
+            def blend_v(self, _previous, current, blend_height):
+                self.blend_calls.append(("v", blend_height))
+                return current
+
+            def blend_h(self, _previous, current, blend_width):
+                self.blend_calls.append(("h", blend_width))
+                return current
+
+        fake_vae = FakeVae()
+        grid_spec = GridSpec(
+            split_dims=(3, 4),
+            grid_shape=(2, 2),
+            tile_spec={
+                "sample_height": 10,
+                "sample_width": 10,
+                "blend_height": 1,
+                "blend_width": 2,
+                "tile_sample_stride_height": 5,
+                "tile_sample_stride_width": 5,
+            },
+        )
+        tiles = {
+            (0, 0): torch.full((1, 3, 2, 6, 6), 1.0),
+            (0, 1): torch.full((1, 3, 2, 6, 6), 2.0),
+            (1, 0): torch.full((1, 3, 2, 6, 6), 3.0),
+            (1, 1): torch.full((1, 3, 2, 6, 6), 4.0),
+        }
+
+        merged = DistributedAutoencoderKLLTX2Video.tile_merge(fake_vae, tiles, grid_spec)
+
+        assert merged.shape == (1, 3, 2, 10, 10)
+        assert fake_vae.blend_calls == [("h", 2), ("v", 1), ("v", 1), ("h", 2)]
+        torch.testing.assert_close(merged[:, :, :, :5, :5], torch.ones(1, 3, 2, 5, 5))
+        torch.testing.assert_close(merged[:, :, :, :5, 5:], torch.full((1, 3, 2, 5, 5), 2.0))
+        torch.testing.assert_close(merged[:, :, :, 5:, :5], torch.full((1, 3, 2, 5, 5), 3.0))
+        torch.testing.assert_close(merged[:, :, :, 5:, 5:], torch.full((1, 3, 2, 5, 5), 4.0))
+
+    def test_ltx23_video_vae_tiled_decode_dispatches_to_tile_operator(self):
+        from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_ltx2
+
+        z = torch.zeros(1, 2, 1, 16, 24)
+        expected = torch.ones(1, 3, 1, 512, 768)
+        seen = {}
+
+        class FakeExecutor:
+            def execute(self, tensor, operator, broadcast_result=True):
+                seen["tensor"] = tensor
+                seen["operator"] = operator
+                seen["broadcast_result"] = broadcast_result
+                return expected
+
+        vae = SimpleNamespace(distributed_executor=FakeExecutor(), is_distributed_enabled=lambda: True)
+        vae.tile_split = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tile_split.__get__(vae)
+        vae.tile_exec = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tile_exec.__get__(vae)
+        vae.tile_merge = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tile_merge.__get__(vae)
+
+        output = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tiled_decode(
+            vae,
+            z,
+            temb=torch.tensor(0.5),
+            return_dict=False,
+        )
+
+        assert len(output) == 1
+        assert output[0] is expected
+        assert seen["tensor"] is z
+        assert seen["broadcast_result"] is True
+        assert seen["operator"].split.__name__ == "tile_split"
+        assert seen["operator"].merge.__name__ == "tile_merge"
+
+
 class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""
 
