@@ -10,7 +10,6 @@ This pipeline does NOT inherit from LTX2Pipeline because:
   versus LTX-2's per_layer_masked_mean_norm + shared projection path
 - LTX-2.3 uses a BWE vocoder outputting 48kHz audio (not 16kHz)
 - LTX-2.3 transformer requires the sigma parameter for prompt modulation
-- CPU offloading is required for the 22B transformer (~44GB VRAM)
 """
 
 from __future__ import annotations
@@ -120,7 +119,6 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     - Connectors: uses padding_side API (not additive_mask)
     - Vocoder: uses LTX2VocoderWithBWE (48kHz output)
     - Transformer: passes sigma for prompt_adaln
-    - CPU offloading: text encoder, connectors, VAE, vocoder stay on CPU
     """
 
     # Audio is diffused jointly with video; warmup must size audio tokens.
@@ -166,7 +164,7 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         # --- Tokenizer (lightweight, stays wherever) ---
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
-        # --- Text encoder: load on CPU, move to GPU only during encoding ---
+        # --- Text encoder ---
         with torch.device("cpu"):
             self.text_encoder = from_pretrained_with_prefetch(
                 Gemma3ForConditionalGeneration.from_pretrained,
@@ -175,9 +173,9 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 prefetch_list=ltx2_subfolders,
                 local_files_only=local_files_only,
                 torch_dtype=dtype,
-            )
+            ).to(self.device)
 
-        # --- Connectors: CPU (LTX-2.3 connectors include caption projection) ---
+        # --- Connectors (LTX-2.3 connectors include caption projection) ---
         self.connectors = from_pretrained_with_prefetch(
             LTX2TextConnectors.from_pretrained,
             model,
@@ -185,9 +183,9 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        )
+        ).to(self.device)
 
-        # --- VAE, Audio VAE: CPU ---
+        # --- VAE, Audio VAE ---
         self.vae = from_pretrained_with_prefetch(
             AutoencoderKLLTX2Video.from_pretrained,
             model,
@@ -195,7 +193,7 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        )
+        ).to(self.device)
         self.audio_vae = from_pretrained_with_prefetch(
             AutoencoderKLLTX2Audio.from_pretrained,
             model,
@@ -203,18 +201,18 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        )
+        ).to(self.device)
 
         # --- Vocoder: prefer BWE vocoder (48kHz) for LTX-2.3 ---
         vocoder_cls = LTX2VocoderWithBWE or LTX2Vocoder
         try:
             self.vocoder = vocoder_cls.from_pretrained(
                 model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
-            )
+            ).to(self.device)
         except (TypeError, OSError, ValueError):
             self.vocoder = LTX2Vocoder.from_pretrained(
                 model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
-            )
+            ).to(self.device)
 
         # --- Transformer: created empty, weights loaded via AutoWeightsLoader ---
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
@@ -303,16 +301,11 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         text_input_ids = text_inputs.input_ids.to(device)
         prompt_attention_mask = text_inputs.attention_mask.to(device)
 
-        # Move text encoder to GPU for encoding
-        self.text_encoder.to(device)
         text_encoder_outputs = self.text_encoder(
             input_ids=text_input_ids,
             attention_mask=prompt_attention_mask,
             output_hidden_states=True,
         )
-        # Move text encoder back to CPU immediately
-        self.text_encoder.to("cpu")
-        torch.accelerator.empty_cache()
 
         hidden_states = text_encoder_outputs.hidden_states
 
@@ -958,14 +951,10 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
-        self.connectors.to(device)
         tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
         connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
             prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
         )
-        self.connectors.to("cpu")
-        if torch.cuda.is_available():
-            torch.accelerator.empty_cache()
 
         positive_connector_prompt_embeds = connector_prompt_embeds
         positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds
@@ -1241,22 +1230,14 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 ]
                 latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
 
-            # Move VAE, audio_vae, vocoder to GPU for decoding
-            self.vae.to(device)
             latents = latents.to(self.vae.dtype)
             video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
-            self.vae.to("cpu")
 
-            self.audio_vae.to(device)
             audio_latents = audio_latents.to(self.audio_vae.dtype)
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
-            self.audio_vae.to("cpu")
 
-            self.vocoder.to(device)
             audio = self.vocoder(generated_mel_spectrograms)
-            self.vocoder.to("cpu")
-            torch.accelerator.empty_cache()
 
         return DiffusionOutput(output=(video, audio))
 
