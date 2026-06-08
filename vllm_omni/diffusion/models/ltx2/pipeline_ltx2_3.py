@@ -47,6 +47,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .pipeline_ltx2 import (
@@ -141,14 +142,6 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompo
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
-        use_managed_offload = bool(
-            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
-        )
-
-        def place_module(module: nn.Module) -> nn.Module:
-            if not use_managed_offload:
-                module.to(self.device)
-            return module
 
         # Weight sources for transformer (loaded via AutoWeightsLoader)
         self.weights_sources = [
@@ -179,70 +172,59 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompo
 
         # --- Text encoder ---
         with torch.device("cpu"):
-            self.text_encoder = place_module(
-                from_pretrained_with_prefetch(
-                    Gemma3ForConditionalGeneration.from_pretrained,
-                    model,
-                    subfolder="text_encoder",
-                    prefetch_list=ltx2_subfolders,
-                    local_files_only=local_files_only,
-                    torch_dtype=dtype,
-                )
+            self.text_encoder = from_pretrained_with_prefetch(
+                Gemma3ForConditionalGeneration.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=ltx2_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
             )
 
         # --- Connectors (LTX-2.3 connectors include caption projection) ---
-        self.connectors = place_module(
-            from_pretrained_with_prefetch(
-                LTX2TextConnectors.from_pretrained,
-                model,
-                subfolder="connectors",
-                prefetch_list=ltx2_subfolders,
-                local_files_only=local_files_only,
-                torch_dtype=dtype,
-            )
+        self.connectors = from_pretrained_with_prefetch(
+            LTX2TextConnectors.from_pretrained,
+            model,
+            subfolder="connectors",
+            prefetch_list=ltx2_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
 
         # --- VAE, Audio VAE ---
-        self.vae = place_module(
-            from_pretrained_with_prefetch(
-                AutoencoderKLLTX2Video.from_pretrained,
-                model,
-                subfolder="vae",
-                prefetch_list=ltx2_subfolders,
-                local_files_only=local_files_only,
-                torch_dtype=dtype,
-            )
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Video.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=ltx2_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
-        self.audio_vae = place_module(
-            from_pretrained_with_prefetch(
-                AutoencoderKLLTX2Audio.from_pretrained,
-                model,
-                subfolder="audio_vae",
-                prefetch_list=ltx2_subfolders,
-                local_files_only=local_files_only,
-                torch_dtype=dtype,
-            )
+        self.audio_vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Audio.from_pretrained,
+            model,
+            subfolder="audio_vae",
+            prefetch_list=ltx2_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
 
         # --- Vocoder: prefer BWE vocoder (48kHz) for LTX-2.3 ---
         vocoder_cls = LTX2VocoderWithBWE or LTX2Vocoder
         try:
-            self.vocoder = place_module(
-                vocoder_cls.from_pretrained(
-                    model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
-                )
+            self.vocoder = vocoder_cls.from_pretrained(
+                model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
             )
         except (TypeError, OSError, ValueError):
-            self.vocoder = place_module(
-                LTX2Vocoder.from_pretrained(
-                    model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
-                )
+            self.vocoder = LTX2Vocoder.from_pretrained(
+                model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
             )
 
         # --- Transformer: created empty, weights loaded via AutoWeightsLoader ---
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         quant_config = getattr(self.od_config, "quantization_config", None)
         self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
+        self._place_aux_components()
 
         # --- Scheduler ---
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -283,6 +265,20 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompo
         self._interrupt = False
         self._num_timesteps = None
         self._current_timestep = None
+
+    def _place_aux_components(self) -> None:
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        use_managed_placement = bool(
+            getattr(self.od_config, "enable_cpu_offload", False)
+            or getattr(self.od_config, "enable_layerwise_offload", False)
+            or getattr(parallel_config, "use_hsdp", False)
+        )
+        if use_managed_placement:
+            return
+
+        modules = ModuleDiscovery.discover(self)
+        for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):
+            module.to(self.device)
 
     # ------------------------------------------------------------------
     # Text Encoding (LTX-2.3 specific)
