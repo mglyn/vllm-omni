@@ -19,7 +19,7 @@ import json
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -111,7 +112,7 @@ def get_ltx2_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsComponentDiscovery):
     """Fully independent LTX-2.3 pipeline.
 
     Key differences from LTX2Pipeline:
@@ -123,6 +124,10 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
     # Audio is diffused jointly with video; warmup must size audio tokens.
     dummy_run_num_frames = 2
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "connectors"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+    _resident_modules: ClassVar[list[str]] = ["vocoder"]
 
     def __init__(
         self,
@@ -136,6 +141,14 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
+        use_managed_offload = bool(
+            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
+        )
+
+        def place_module(module: nn.Module) -> nn.Module:
+            if not use_managed_offload:
+                module.to(self.device)
+            return module
 
         # Weight sources for transformer (loaded via AutoWeightsLoader)
         self.weights_sources = [
@@ -166,53 +179,65 @@ class LTX23Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
         # --- Text encoder ---
         with torch.device("cpu"):
-            self.text_encoder = from_pretrained_with_prefetch(
-                Gemma3ForConditionalGeneration.from_pretrained,
+            self.text_encoder = place_module(
+                from_pretrained_with_prefetch(
+                    Gemma3ForConditionalGeneration.from_pretrained,
+                    model,
+                    subfolder="text_encoder",
+                    prefetch_list=ltx2_subfolders,
+                    local_files_only=local_files_only,
+                    torch_dtype=dtype,
+                )
+            )
+
+        # --- Connectors (LTX-2.3 connectors include caption projection) ---
+        self.connectors = place_module(
+            from_pretrained_with_prefetch(
+                LTX2TextConnectors.from_pretrained,
                 model,
-                subfolder="text_encoder",
+                subfolder="connectors",
                 prefetch_list=ltx2_subfolders,
                 local_files_only=local_files_only,
                 torch_dtype=dtype,
-            ).to(self.device)
-
-        # --- Connectors (LTX-2.3 connectors include caption projection) ---
-        self.connectors = from_pretrained_with_prefetch(
-            LTX2TextConnectors.from_pretrained,
-            model,
-            subfolder="connectors",
-            prefetch_list=ltx2_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
+            )
+        )
 
         # --- VAE, Audio VAE ---
-        self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLLTX2Video.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=ltx2_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
-        self.audio_vae = from_pretrained_with_prefetch(
-            AutoencoderKLLTX2Audio.from_pretrained,
-            model,
-            subfolder="audio_vae",
-            prefetch_list=ltx2_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
+        self.vae = place_module(
+            from_pretrained_with_prefetch(
+                AutoencoderKLLTX2Video.from_pretrained,
+                model,
+                subfolder="vae",
+                prefetch_list=ltx2_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
+            )
+        )
+        self.audio_vae = place_module(
+            from_pretrained_with_prefetch(
+                AutoencoderKLLTX2Audio.from_pretrained,
+                model,
+                subfolder="audio_vae",
+                prefetch_list=ltx2_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
+            )
+        )
 
         # --- Vocoder: prefer BWE vocoder (48kHz) for LTX-2.3 ---
         vocoder_cls = LTX2VocoderWithBWE or LTX2Vocoder
         try:
-            self.vocoder = vocoder_cls.from_pretrained(
-                model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
-            ).to(self.device)
+            self.vocoder = place_module(
+                vocoder_cls.from_pretrained(
+                    model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
+                )
+            )
         except (TypeError, OSError, ValueError):
-            self.vocoder = LTX2Vocoder.from_pretrained(
-                model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
-            ).to(self.device)
+            self.vocoder = place_module(
+                LTX2Vocoder.from_pretrained(
+                    model, subfolder="vocoder", torch_dtype=dtype, local_files_only=local_files_only
+                )
+            )
 
         # --- Transformer: created empty, weights loaded via AutoWeightsLoader ---
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
