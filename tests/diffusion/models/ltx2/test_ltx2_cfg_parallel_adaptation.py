@@ -56,3 +56,67 @@ def test_unpad_audio_latents_restores_original_frames_before_unpack():
     assert unpacked.shape == (1, 2, 10, 2)
     assert not (unpacked == 999.0).any()
     torch.testing.assert_close(unpacked, expected)
+
+
+def test_ltx2_pipeline_loads_distributed_video_vae(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+        DistributedAutoencoderKLLTX2Video,
+    )
+    from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx2
+
+    loaded_subfolders = {}
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace()
+
+        def to(self, *_args, **_kwargs):
+            return self
+
+    class FakeVideoVae(FakeModule):
+        spatial_compression_ratio = 32
+        temporal_compression_ratio = 8
+
+    class FakeAudioVae(FakeModule):
+        mel_compression_ratio = 4
+        temporal_compression_ratio = 4
+
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(sample_rate=16000, mel_hop_length=160)
+
+    class FakeTransformer(FakeModule):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(patch_size=1, patch_size_t=1)
+
+    def fake_from_pretrained_with_prefetch(from_pretrained, *_args, subfolder, **_kwargs):
+        loaded_subfolders[subfolder] = from_pretrained
+        if subfolder == "vae":
+            return FakeVideoVae()
+        if subfolder == "audio_vae":
+            return FakeAudioVae()
+        return FakeModule()
+
+    monkeypatch.setattr(ltx2, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(ltx2, "prefetch_subfolders", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ltx2, "from_pretrained_with_prefetch", fake_from_pretrained_with_prefetch)
+    monkeypatch.setattr(
+        ltx2.AutoTokenizer,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(model_max_length=1024),
+    )
+    monkeypatch.setattr(
+        ltx2.FlowMatchEulerDiscreteScheduler,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(ltx2, "load_transformer_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ltx2, "create_transformer_from_config", lambda *_args, **_kwargs: FakeTransformer())
+
+    od_config = SimpleNamespace(model=str(tmp_path), dtype=torch.float32, quantization_config=None)
+    pipe = LTX2Pipeline(od_config=od_config)
+
+    assert getattr(loaded_subfolders["vae"], "__self__", None) is DistributedAutoencoderKLLTX2Video
+    assert isinstance(pipe.vae, FakeVideoVae)
