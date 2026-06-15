@@ -17,7 +17,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import weakref
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Any, ClassVar
 
@@ -51,6 +53,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.platforms import current_omni_platform
 
 from .pipeline_ltx2 import (
     _get_prompt_field,
@@ -273,6 +276,7 @@ class LTX23Pipeline(
         self._interrupt = False
         self._num_timesteps = None
         self._current_timestep = None
+        self._video_postprocess_executor: ThreadPoolExecutor | None = None
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -291,6 +295,56 @@ class LTX23Pipeline(
         modules = ModuleDiscovery.discover(self)
         for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):
             module.to(self.device)
+
+    def _should_async_video_postprocess(self, video: torch.Tensor, output_type: str) -> bool:
+        if not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm()):
+            return False
+        return output_type == "np" and video.device.type == current_omni_platform.device_type
+
+    def _get_video_postprocess_executor(self) -> ThreadPoolExecutor:
+        if self._video_postprocess_executor is None:
+            self._video_postprocess_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="ltx23-video-postprocess",
+            )
+            weakref.finalize(
+                self,
+                self._video_postprocess_executor.shutdown,
+                wait=False,
+                cancel_futures=True,
+            )
+        return self._video_postprocess_executor
+
+    def _decode_audio(self, audio_latents: torch.Tensor) -> torch.Tensor:
+        audio_latents = audio_latents.to(self.audio_vae.dtype)
+        generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
+        return self.vocoder(generated_mel_spectrograms)
+
+    def _postprocess_video_on_stream(
+        self,
+        video: torch.Tensor,
+        stream: current_omni_platform.Stream,
+        ready_event: current_omni_platform.Event,
+        device: torch.device,
+    ) -> np.ndarray:
+        current_omni_platform.set_device(device)
+        with torch.inference_mode(), current_omni_platform.stream(stream):
+            stream.wait_event(ready_event)
+            host_video = None
+            for batch_idx in range(video.shape[0]):
+                batch_video = video[batch_idx].permute(1, 0, 2, 3)
+                batch_video = self.video_processor.postprocess(batch_video, output_type="pt")
+                if host_video is None:
+                    host_video = torch.empty(
+                        (video.shape[0], *batch_video.shape),
+                        dtype=batch_video.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                host_video[batch_idx].copy_(batch_video, non_blocking=True)
+        stream.synchronize()
+        assert host_video is not None
+        return host_video.permute(0, 1, 3, 4, 2).float().numpy()
 
     # ------------------------------------------------------------------
     # Text Encoding (LTX-2.3 specific)
@@ -1242,39 +1296,54 @@ class LTX23Pipeline(
 
         # ---- Decode ----
         if output_type == "latent":
-            video = latents
-            audio = audio_latents
+            return DiffusionOutput(
+                output=(latents, audio_latents),
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        latents = latents.to(connector_prompt_embeds.dtype)
+
+        if not self.vae.config.timestep_conditioning:
+            timestep_decode = None
         else:
-            latents = latents.to(connector_prompt_embeds.dtype)
+            noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+            if not isinstance(decode_timestep, list):
+                decode_timestep = [decode_timestep] * batch_size
+            if decode_noise_scale is None:
+                decode_noise_scale = decode_timestep
+            elif not isinstance(decode_noise_scale, list):
+                decode_noise_scale = [decode_noise_scale] * batch_size
+            timestep_decode = torch.tensor(decode_timestep, device=device, dtype=latents.dtype)
+            decode_noise_scale_t = torch.tensor(decode_noise_scale, device=device, dtype=latents.dtype)[
+                :, None, None, None, None
+            ]
+            latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
 
-            if not self.vae.config.timestep_conditioning:
-                timestep_decode = None
+        latents = latents.to(self.vae.dtype)
+        video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
+
+        # ---- Postprocess video ----
+        video_future = None
+        if video.numel() > 0:
+            if self._should_async_video_postprocess(video, output_type):
+                ready_event = current_omni_platform.Event()
+                ready_event.record(current_omni_platform.current_stream(video.device))
+                postprocess_stream = current_omni_platform.Stream(device=video.device)
+                video_future = self._get_video_postprocess_executor().submit(
+                    self._postprocess_video_on_stream,
+                    video,
+                    postprocess_stream,
+                    ready_event,
+                    video.device,
+                )
             else:
-                noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
-                if not isinstance(decode_timestep, list):
-                    decode_timestep = [decode_timestep] * batch_size
-                if decode_noise_scale is None:
-                    decode_noise_scale = decode_timestep
-                elif not isinstance(decode_noise_scale, list):
-                    decode_noise_scale = [decode_noise_scale] * batch_size
-                timestep_decode = torch.tensor(decode_timestep, device=device, dtype=latents.dtype)
-                decode_noise_scale_t = torch.tensor(decode_noise_scale, device=device, dtype=latents.dtype)[
-                    :, None, None, None, None
-                ]
-                latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
-
-            latents = latents.to(self.vae.dtype)
-            video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
-            if video.numel() > 0:
                 video = self.video_processor.postprocess_video(video, output_type=output_type)
 
-            audio_latents = audio_latents.to(self.audio_vae.dtype)
-            generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
-
-            audio = self.vocoder(generated_mel_spectrograms)
+        # ---- Decode audio ----
+        audio = self._decode_audio(audio_latents)
 
         return DiffusionOutput(
-            output=(video, audio),
+            output=(video_future.result() if video_future is not None else video, audio),
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 

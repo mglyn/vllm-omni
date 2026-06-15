@@ -15,8 +15,10 @@ These tests verify:
 import json
 import os
 import tempfile
+from contextlib import nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -103,6 +105,105 @@ class TestPipelineIndependence:
         from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 
         assert issubclass(LTX23Pipeline, DiffusionPipelineProfilerMixin)
+
+    def test_ltx23_pipeline_reuses_video_postprocess_executor(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        executor = mocker.Mock()
+        executor_cls = mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.ThreadPoolExecutor",
+            return_value=executor,
+        )
+        pipe = object.__new__(LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe._video_postprocess_executor = None
+
+        assert pipe._get_video_postprocess_executor() is executor
+        assert pipe._get_video_postprocess_executor() is executor
+        executor_cls.assert_called_once_with(
+            max_workers=1,
+            thread_name_prefix="ltx23-video-postprocess",
+        )
+
+    def test_ltx23_async_video_postprocess_matches_diffusers(self, mocker):
+        from diffusers.video_processor import VideoProcessor
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        stream = mocker.Mock()
+        ready_event = mocker.Mock()
+        platform = SimpleNamespace(
+            set_device=mocker.Mock(),
+            stream=lambda _: nullcontext(),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            platform,
+        )
+        original_empty = torch.empty
+
+        def empty_without_pinning(*args, **kwargs):
+            assert kwargs.pop("pin_memory") is True
+            return original_empty(*args, **kwargs)
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.empty",
+            side_effect=empty_without_pinning,
+        )
+
+        pipe = object.__new__(LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.video_processor = VideoProcessor(vae_scale_factor=32)
+        video = torch.linspace(-1, 1, 2 * 3 * 2 * 4 * 4).reshape(2, 3, 2, 4, 4)
+        expected = pipe.video_processor.postprocess_video(video, output_type="np")
+
+        actual = pipe._postprocess_video_on_stream(video, stream, ready_event, video.device)
+
+        np.testing.assert_array_equal(actual, expected)
+        platform.set_device.assert_called_once_with(video.device)
+        stream.wait_event.assert_called_once_with(ready_event)
+        stream.synchronize.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        (
+            "platform",
+            "output_type",
+            "device_type",
+            "expected",
+        ),
+        [
+            ("cuda", "np", "cuda", True),
+            ("rocm", "np", "cuda", True),
+            ("xpu", "np", "xpu", False),
+            ("npu", "np", "npu", False),
+            ("cuda", "np", "cpu", False),
+            ("cuda", "pt", "cuda", False),
+        ],
+    )
+    def test_ltx23_async_video_postprocess_conditions(
+        self,
+        mocker,
+        platform,
+        output_type,
+        device_type,
+        expected,
+    ):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        current_platform = SimpleNamespace(
+            device_type="cuda" if platform == "rocm" else platform,
+            is_cuda=lambda: platform == "cuda",
+            is_rocm=lambda: platform == "rocm",
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            current_platform,
+        )
+        pipe = object.__new__(LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        video = SimpleNamespace(device=SimpleNamespace(type=device_type))
+
+        assert pipe._should_async_video_postprocess(video, output_type) is expected
 
 
 class TestLTX23VaeDecodeParallel:
