@@ -31,6 +31,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
 from torch import nn
+from torch.profiler import record_function
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -61,6 +62,21 @@ from .pipeline_ltx2 import (
 )
 
 logger = init_logger(__name__)
+
+
+def _record_profile_call(name: str, func, *args, **kwargs):
+    with record_function(name):
+        return func(*args, **kwargs)
+
+
+def _start_profile_range(name: str):
+    scope = record_function(name)
+    scope.__enter__()
+    return scope
+
+
+def _end_profile_range(scope) -> None:
+    scope.__exit__(None, None, None)
 
 # Try to import LTX2VocoderWithBWE (diffusers >= 0.38.0)
 try:
@@ -963,7 +979,9 @@ class LTX23Pipeline(
             prompt_attention_mask,
             negative_prompt_embeds,
             negative_prompt_attention_mask,
-        ) = self.encode_prompt(
+        ) = _record_profile_call(
+            "ltx23.text_encoding",
+            self.encode_prompt,
             prompt=prompt,
             negative_prompt=negative_prompt,
             do_classifier_free_guidance=self.do_classifier_free_guidance,
@@ -985,8 +1003,12 @@ class LTX23Pipeline(
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
         tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
-        connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
-            prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
+        connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = _record_profile_call(
+            "ltx23.connector",
+            self.connectors,
+            prompt_embeds,
+            prompt_attention_mask,
+            padding_side=tokenizer_padding_side,
         )
 
         positive_connector_prompt_embeds = connector_prompt_embeds
@@ -1101,6 +1123,7 @@ class LTX23Pipeline(
                 if self.interrupt:
                     continue
 
+                step_profile_scope = _start_profile_range(f"ltx23.denoising_step.{i}")
                 self._current_timestep = t
 
                 if cfg_parallel_ready:
@@ -1211,8 +1234,10 @@ class LTX23Pipeline(
                     audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
 
                 pbar.update()
+                _end_profile_range(step_profile_scope)
 
         # ---- Unpack and denormalize ----
+        unpack_profile_scope = _start_profile_range("ltx23.unpack_and_denormalize")
         latents = self._unpack_latents(
             latents,
             latent_num_frames,
@@ -1239,12 +1264,14 @@ class LTX23Pipeline(
             original_audio_num_frames,
             num_mel_bins=latent_mel_bins,
         )
+        _end_profile_range(unpack_profile_scope)
 
         # ---- Decode ----
         if output_type == "latent":
             video = latents
             audio = audio_latents
         else:
+            decode_profile_scope = _start_profile_range("ltx23.decode")
             latents = latents.to(connector_prompt_embeds.dtype)
 
             if not self.vae.config.timestep_conditioning:
@@ -1265,13 +1292,21 @@ class LTX23Pipeline(
 
             latents = latents.to(self.vae.dtype)
             video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
+            _end_profile_range(decode_profile_scope)
             if video.numel() > 0:
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
+                video = _record_profile_call(
+                    "ltx23.video_postprocess.task",
+                    self.video_processor.postprocess_video,
+                    video,
+                    output_type=output_type,
+                )
 
+            audio_decode_scope = _start_profile_range("ltx23.audio_decode")
             audio_latents = audio_latents.to(self.audio_vae.dtype)
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
 
             audio = self.vocoder(generated_mel_spectrograms)
+            _end_profile_range(audio_decode_scope)
 
         return DiffusionOutput(
             output=(video, audio),
