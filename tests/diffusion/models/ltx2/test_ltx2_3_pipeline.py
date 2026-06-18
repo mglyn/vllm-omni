@@ -15,8 +15,10 @@ These tests verify:
 import json
 import os
 import tempfile
+from contextlib import nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -103,6 +105,253 @@ class TestPipelineIndependence:
         from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 
         assert issubclass(LTX23Pipeline, DiffusionPipelineProfilerMixin)
+
+    def test_ltx23_video_postprocessor_submit_enqueues_stream_task(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _LTX23VideoPostprocessor
+
+        ready_event = mocker.Mock()
+        done_event = mocker.Mock()
+        current_stream = mocker.Mock()
+        stream = mocker.Mock()
+        platform = SimpleNamespace(
+            set_device=mocker.Mock(),
+            Event=mocker.Mock(side_effect=[ready_event, done_event]),
+            current_stream=mocker.Mock(return_value=current_stream),
+            Stream=mocker.Mock(return_value=stream),
+            stream=lambda _: nullcontext(),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            platform,
+        )
+        original_empty = torch.empty
+
+        def empty_without_pinning(*args, **kwargs):
+            kwargs.pop("pin_memory", None)
+            return original_empty(*args, **kwargs)
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.empty",
+            side_effect=empty_without_pinning,
+        )
+
+        postprocessor = _LTX23VideoPostprocessor(SimpleNamespace())
+        video = torch.zeros(1, 3, 1, 1, 1)
+
+        result = postprocessor.submit(video)
+
+        assert result._done_event is done_event
+        platform.set_device.assert_called_once_with(video.device)
+        assert platform.Event.call_count == 2
+        platform.current_stream.assert_called_once_with(video.device)
+        ready_event.record.assert_called_once_with(current_stream)
+        platform.Stream.assert_called_once_with(device=video.device)
+        stream.wait_event.assert_called_once_with(ready_event)
+        done_event.record.assert_called_once_with(stream)
+
+    def test_ltx23_video_postprocess_matches_diffusers(self, mocker):
+        from diffusers.video_processor import VideoProcessor
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _LTX23VideoPostprocessor
+
+        stream = mocker.Mock()
+        ready_event = mocker.Mock()
+        done_event = mocker.Mock()
+        current_stream = mocker.Mock()
+        platform = SimpleNamespace(
+            set_device=mocker.Mock(),
+            Event=mocker.Mock(side_effect=[ready_event, done_event]),
+            current_stream=mocker.Mock(return_value=current_stream),
+            Stream=mocker.Mock(return_value=stream),
+            stream=lambda _: nullcontext(),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            platform,
+        )
+        original_empty = torch.empty
+
+        def empty_without_pinning(*args, **kwargs):
+            if "pin_memory" in kwargs:
+                assert kwargs.pop("pin_memory") is True
+            return original_empty(*args, **kwargs)
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.empty",
+            side_effect=empty_without_pinning,
+        )
+
+        video_processor = VideoProcessor(vae_scale_factor=32)
+        postprocessor = _LTX23VideoPostprocessor(video_processor)
+        video = torch.linspace(-1, 1, 2 * 3 * 2 * 4 * 4).reshape(2, 3, 2, 4, 4)
+        expected = video_processor.postprocess_video(video, output_type="np")
+
+        handle = postprocessor.submit(video)
+        actual = handle.result()
+
+        np.testing.assert_array_equal(actual, expected)
+        platform.set_device.assert_called_once_with(video.device)
+        ready_event.record.assert_called_once()
+        stream.wait_event.assert_called_once_with(ready_event)
+        done_event = handle._done_event
+        done_event.record.assert_called_once_with(stream)
+        done_event.synchronize.assert_called_once_with()
+
+    def test_ltx23_video_postprocess_buffers_reuse_capacity_and_grow(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _LTX23VideoPostprocessor
+
+        original_empty = torch.empty
+
+        def empty_without_pinning(*args, **kwargs):
+            kwargs.pop("pin_memory", None)
+            return original_empty(*args, **kwargs)
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.empty",
+            side_effect=empty_without_pinning,
+        )
+
+        postprocessor = _LTX23VideoPostprocessor(SimpleNamespace())
+
+        small_shape = torch.Size((1, 2, 4, 4, 3))
+        smaller_shape = torch.Size((1, 1, 4, 4, 3))
+        larger_shape = torch.Size((1, 3, 4, 4, 3))
+
+        small_host = postprocessor._get_host_buffer(small_shape, torch.float32)
+        small_device = postprocessor._get_device_buffer(small_shape, torch.float32, torch.device("cpu"))
+        host_capacity = postprocessor._host_buffer
+        device_capacity = postprocessor._device_buffer
+
+        smaller_host = postprocessor._get_host_buffer(smaller_shape, torch.float32)
+        smaller_device = postprocessor._get_device_buffer(smaller_shape, torch.float32, torch.device("cpu"))
+
+        assert postprocessor._host_buffer is host_capacity
+        assert postprocessor._device_buffer is device_capacity
+        assert small_host.is_contiguous()
+        assert small_device.is_contiguous()
+        assert smaller_host.is_contiguous()
+        assert smaller_device.is_contiguous()
+
+        larger_host = postprocessor._get_host_buffer(larger_shape, torch.float32)
+        larger_device = postprocessor._get_device_buffer(larger_shape, torch.float32, torch.device("cpu"))
+
+        assert postprocessor._host_buffer is not host_capacity
+        assert postprocessor._device_buffer is not device_capacity
+        assert larger_host.shape == larger_shape
+        assert larger_device.shape == larger_shape
+        assert postprocessor._host_buffer.numel() == larger_host.numel()
+        assert postprocessor._device_buffer.numel() == larger_device.numel()
+
+    def test_ltx23_video_postprocess_prealloc_uses_guard_sized_capacity(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _LTX23VideoPostprocessor
+
+        platform = SimpleNamespace(
+            device_type="cuda",
+            is_cuda=lambda: True,
+            is_rocm=lambda: False,
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            platform,
+        )
+
+        postprocessor = _LTX23VideoPostprocessor(SimpleNamespace())
+        get_device_buffer = mocker.patch.object(postprocessor, "_get_device_buffer")
+        get_host_buffer = mocker.patch.object(postprocessor, "_get_host_buffer")
+
+        postprocessor.preallocate(torch.device("cuda:0"))
+
+        prealloc_shape = torch.Size((1, 25, 512, 512, 3))
+        get_device_buffer.assert_called_once_with(prealloc_shape, torch.float32, torch.device("cuda:0"))
+        get_host_buffer.assert_called_once_with(prealloc_shape, torch.float32)
+
+    def test_ltx23_async_video_postprocess_env_switch_disables_path(self, mocker, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _LTX23VideoPostprocessor
+
+        monkeypatch.setenv("VLLM_OMNI_LTX23_ASYNC_VIDEO_POSTPROCESS", "0")
+        platform = SimpleNamespace(
+            device_type="cuda",
+            is_cuda=lambda: True,
+            is_rocm=lambda: False,
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            platform,
+        )
+
+        postprocessor = _LTX23VideoPostprocessor(SimpleNamespace())
+        get_device_buffer = mocker.patch.object(postprocessor, "_get_device_buffer")
+        get_host_buffer = mocker.patch.object(postprocessor, "_get_host_buffer")
+        video = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+
+        assert postprocessor.can_run(video, "np") is False
+
+        postprocessor.preallocate(torch.device("cuda:0"))
+
+        get_device_buffer.assert_not_called()
+        get_host_buffer.assert_not_called()
+
+    def test_ltx23_load_weights_preallocates_video_postprocess_buffers(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        loader = mocker.Mock()
+        loader.load_weights.return_value = {"transformer.weight"}
+        loader_cls = mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.AutoWeightsLoader",
+            return_value=loader,
+        )
+
+        pipe = object.__new__(LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.device = torch.device("cpu")
+        postprocessor = mocker.Mock()
+        pipe._video_postprocessor = postprocessor
+        weights = [("transformer.weight", torch.empty(0))]
+
+        assert pipe.load_weights(weights) == {"transformer.weight"}
+        loader_cls.assert_called_once_with(pipe)
+        loader.load_weights.assert_called_once_with(weights)
+        postprocessor.preallocate.assert_called_once_with(torch.device("cpu"))
+
+    @pytest.mark.parametrize(
+        (
+            "platform",
+            "output_type",
+            "device_type",
+            "expected",
+        ),
+        [
+            ("cuda", "np", "cuda", True),
+            ("rocm", "np", "cuda", True),
+            ("xpu", "np", "xpu", False),
+            ("npu", "np", "npu", False),
+            ("cuda", "np", "cpu", False),
+            ("cuda", "pt", "cuda", False),
+        ],
+    )
+    def test_ltx23_video_postprocess_conditions(
+        self,
+        mocker,
+        platform,
+        output_type,
+        device_type,
+        expected,
+    ):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _LTX23VideoPostprocessor
+
+        current_platform = SimpleNamespace(
+            device_type="cuda" if platform == "rocm" else platform,
+            is_cuda=lambda: platform == "cuda",
+            is_rocm=lambda: platform == "rocm",
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            current_platform,
+        )
+        postprocessor = _LTX23VideoPostprocessor(SimpleNamespace())
+        video = SimpleNamespace(device=SimpleNamespace(type=device_type))
+
+        assert postprocessor.can_run(video, output_type) is expected
 
 
 class TestLTX23VaeDecodeParallel:
