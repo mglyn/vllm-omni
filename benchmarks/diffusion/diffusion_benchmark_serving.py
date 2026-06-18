@@ -600,20 +600,29 @@ class CustomDataset(BaseDataset):
 
     def load_data(self) -> None:
         """Load data from JSONL file."""
-        import pandas as pd
-
         if not self.dataset_path.endswith(".jsonl"):
             raise ValueError("Custom dataset must be a JSONL file")
 
         try:
-            df = pd.read_json(path_or_buf=self.dataset_path, lines=True)
+            records = []
+            with open(self.dataset_path, encoding="utf-8") as f:
+                for line_num, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid JSON on line {line_num}: {exc}") from exc
         except Exception as e:
             raise ValueError(f"Failed to load JSONL file {self.dataset_path}: {e}")
 
-        if "prompt" not in df.columns:
-            raise ValueError("JSONL file must contain a 'prompt' column")
+        if not records:
+            raise ValueError("Custom dataset is empty")
+        if any("prompt" not in item for item in records):
+            raise ValueError("Each JSONL row must contain a 'prompt' field")
 
-        self.data = df.to_dict("records")
+        self.data = records
         print(f"Loaded {len(self.data)} requests from {self.dataset_path}")
 
     def _resolve_image_paths(self, item: dict) -> list[str] | None:
@@ -913,7 +922,9 @@ def _make_warmup_request(
             num_inference_steps=args.warmup_num_inference_steps,
         )
     if args.task == "t2v":
-        warm_req = replace(warm_req, num_frames=1)
+        configured_num_frames = getattr(args, "warmup_num_frames", None)
+        warmup_num_frames = configured_num_frames if configured_num_frames is not None else 1
+        warm_req = replace(warm_req, num_frames=warmup_num_frames)
     return warm_req
 
 
@@ -930,9 +941,13 @@ async def _run_warmups(
     warmup_concurrency = min(int(args.warmup_concurrency), len(warmup_requests))
     warmup_semaphore = asyncio.Semaphore(warmup_concurrency)
 
+    warmup_num_frames = getattr(args, "warmup_num_frames", None)
+    if args.task == "t2v" and warmup_num_frames is None:
+        warmup_num_frames = 1
     print(
         f"Running {len(warmup_requests)} warmup request(s) "
         f"with num_inference_steps={args.warmup_num_inference_steps} "
+        f"num_frames={warmup_num_frames if warmup_num_frames is not None else 'request'} "
         f"and warmup_concurrency={warmup_concurrency}..."
     )
 
@@ -1163,6 +1178,21 @@ async def benchmark(args):
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
+    if getattr(args, "extra_body", None):
+        try:
+            extra_body = json.loads(args.extra_body)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--extra-body must be valid JSON: {exc}") from exc
+        if not isinstance(extra_body, dict):
+            raise ValueError("--extra-body must decode to a JSON object.")
+        requests_list = [
+            replace(
+                req,
+                extra_body={**extra_body, **(req.extra_body or {})},
+            )
+            for req in requests_list
+        ]
+
     if args.endpoint == "/v1/images/edits":
         for req in requests_list:
             req.default_bot_task = args.bot_task
@@ -1363,6 +1393,16 @@ if __name__ == "__main__":
         "Default is 2 to ensure at least one denoising step is executed.",
     )
     parser.add_argument(
+        "--warmup-num-frames",
+        type=int,
+        default=None,
+        help=(
+            "Number of frames used for T2V warmup requests. "
+            "Defaults to 1 for compatibility; set this to the measured frame count "
+            "when warming up torch.compile or CUDA graphs."
+        ),
+    )
+    parser.add_argument(
         "--warmup-concurrency",
         type=int,
         default=1,
@@ -1426,6 +1466,15 @@ if __name__ == "__main__":
             "Example: "
             '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
             '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
+        ),
+    )
+    parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help=(
+            "JSON object merged into every request extra_body. Useful for model-specific "
+            "fields such as guidance_scale, negative_prompt, frame_rate, or audio_sample_rate."
         ),
     )
     parser.add_argument(

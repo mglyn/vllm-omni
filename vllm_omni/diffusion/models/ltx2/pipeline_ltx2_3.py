@@ -31,6 +31,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
 from torch import nn
+from torch.profiler import record_function
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -62,6 +63,21 @@ from .pipeline_ltx2 import (
 )
 
 logger = init_logger(__name__)
+
+
+def _record_profile_call(name: str, func, *args, **kwargs):
+    with record_function(name):
+        return func(*args, **kwargs)
+
+
+def _start_profile_range(name: str):
+    scope = record_function(name)
+    scope.__enter__()
+    return scope
+
+
+def _end_profile_range(scope) -> None:
+    scope.__exit__(None, None, None)
 
 
 LTX23_ASYNC_VIDEO_POSTPROCESS_ENV = "VLLM_OMNI_LTX23_ASYNC_VIDEO_POSTPROCESS"
@@ -117,22 +133,26 @@ class _LTX23VideoPostprocessor:
         self._get_host_buffer(shape, torch.float32)
 
     def submit(self, video: torch.Tensor) -> _LTX23VideoPostprocessResult:
-        current_omni_platform.set_device(video.device)
-        ready_event = current_omni_platform.Event()
-        ready_event.record(current_omni_platform.current_stream(video.device))
-        stream = current_omni_platform.Stream(device=video.device)
-        done_event = current_omni_platform.Event()
+        with record_function("ltx23.stream_video_postprocess.enqueue"):
+            current_omni_platform.set_device(video.device)
+            ready_event = current_omni_platform.Event()
+            ready_event.record(current_omni_platform.current_stream(video.device))
+            stream = current_omni_platform.Stream(device=video.device)
+            done_event = current_omni_platform.Event()
 
-        with torch.inference_mode(), current_omni_platform.stream(stream):
-            stream.wait_event(ready_event)
-            if getattr(getattr(self.video_processor, "config", None), "do_normalize", True):
-                video.mul_(0.5).add_(0.5).clamp_(0, 1)
-            video = video.permute(0, 2, 3, 4, 1)
-            device_buffer = self._get_device_buffer(video.shape, torch.float32, video.device)
-            device_buffer.copy_(video)
-            host_video = self._get_host_buffer(video.shape, torch.float32)
-            host_video.copy_(device_buffer, non_blocking=True)
-            done_event.record(stream)
+            with torch.inference_mode(), current_omni_platform.stream(stream):
+                stream.wait_event(ready_event)
+                if getattr(getattr(self.video_processor, "config", None), "do_normalize", True):
+                    with record_function("ltx23.video_postprocess.denormalize"):
+                        video.mul_(0.5).add_(0.5).clamp_(0, 1)
+                video = video.permute(0, 2, 3, 4, 1)
+                with record_function("ltx23.video_postprocess.gpu_convert"):
+                    device_buffer = self._get_device_buffer(video.shape, torch.float32, video.device)
+                    device_buffer.copy_(video)
+                host_video = self._get_host_buffer(video.shape, torch.float32)
+                with record_function("ltx23.video_postprocess.dtoh"):
+                    host_video.copy_(device_buffer, non_blocking=True)
+                done_event.record(stream)
 
         return _LTX23VideoPostprocessResult(done_event, host_video)
 
@@ -147,12 +167,13 @@ class _LTX23VideoPostprocessor:
         required_numel = self._numel(shape)
         host_buffer = self._host_buffer
         if host_buffer is None or host_buffer.numel() < required_numel or host_buffer.dtype != dtype:
-            host_buffer = torch.empty(
-                (required_numel,),
-                dtype=dtype,
-                device="cpu",
-                pin_memory=True,
-            )
+            with record_function("ltx23.video_postprocess.host_alloc"):
+                host_buffer = torch.empty(
+                    (required_numel,),
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
             self._host_buffer = host_buffer
         return host_buffer[:required_numel].view(shape)
 
@@ -170,7 +191,8 @@ class _LTX23VideoPostprocessor:
             or device_buffer.dtype != dtype
             or device_buffer.device != device
         ):
-            device_buffer = torch.empty((required_numel,), dtype=dtype, device=device)
+            with record_function("ltx23.video_postprocess.device_alloc"):
+                device_buffer = torch.empty((required_numel,), dtype=dtype, device=device)
             self._device_buffer = device_buffer
         return device_buffer[:required_numel].view(shape)
 
@@ -1082,7 +1104,9 @@ class LTX23Pipeline(
             prompt_attention_mask,
             negative_prompt_embeds,
             negative_prompt_attention_mask,
-        ) = self.encode_prompt(
+        ) = _record_profile_call(
+            "ltx23.text_encoding",
+            self.encode_prompt,
             prompt=prompt,
             negative_prompt=negative_prompt,
             do_classifier_free_guidance=self.do_classifier_free_guidance,
@@ -1104,8 +1128,12 @@ class LTX23Pipeline(
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
         tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
-        connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
-            prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
+        connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = _record_profile_call(
+            "ltx23.connector",
+            self.connectors,
+            prompt_embeds,
+            prompt_attention_mask,
+            padding_side=tokenizer_padding_side,
         )
 
         positive_connector_prompt_embeds = connector_prompt_embeds
@@ -1220,6 +1248,7 @@ class LTX23Pipeline(
                 if self.interrupt:
                     continue
 
+                step_profile_scope = _start_profile_range(f"ltx23.denoising_step.{i}")
                 self._current_timestep = t
 
                 if cfg_parallel_ready:
@@ -1330,8 +1359,10 @@ class LTX23Pipeline(
                     audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
 
                 pbar.update()
+                _end_profile_range(step_profile_scope)
 
         # ---- Unpack and denormalize ----
+        unpack_profile_scope = _start_profile_range("ltx23.unpack_and_denormalize")
         latents = self._unpack_latents(
             latents,
             latent_num_frames,
@@ -1358,6 +1389,7 @@ class LTX23Pipeline(
             original_audio_num_frames,
             num_mel_bins=latent_mel_bins,
         )
+        _end_profile_range(unpack_profile_scope)
 
         # ---- Decode ----
         if output_type == "latent":
@@ -1366,6 +1398,7 @@ class LTX23Pipeline(
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
+        decode_profile_scope = _start_profile_range("ltx23.decode")
         latents = latents.to(connector_prompt_embeds.dtype)
 
         if not self.vae.config.timestep_conditioning:
@@ -1386,6 +1419,7 @@ class LTX23Pipeline(
 
         latents = latents.to(self.vae.dtype)
         video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
+        _end_profile_range(decode_profile_scope)
 
         # ---- Postprocess video ----
         video_future = None
@@ -1393,13 +1427,19 @@ class LTX23Pipeline(
             if self._video_postprocessor.can_run(video, output_type):
                 video_future = self._video_postprocessor.submit(video)
             else:
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
+                video = _record_profile_call(
+                    "ltx23.video_postprocess.task",
+                    self.video_processor.postprocess_video,
+                    video,
+                    output_type=output_type,
+                )
 
         # ---- Decode audio ----
-        audio = self._decode_audio(audio_latents)
+        audio = _record_profile_call("ltx23.audio_decode", self._decode_audio, audio_latents)
 
         if video_future is not None:
-            video = video_future.result()
+            _record_profile_call("ltx23.video_postprocess.wait", video_future.wait)
+            video = _record_profile_call("ltx23.video_postprocess.cpu_copy", video_future.result)
 
         return DiffusionOutput(
             output=(video, audio),

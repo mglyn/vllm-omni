@@ -75,6 +75,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=1,
+        help="Number of generation requests to run on the same Omni instance.",
+    )
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help=(
+            "Number of warmup runs before the measured runs. Warmup runs are not"
+            " traced and not counted in --num-runs; use them to trigger"
+            " compilation / cudagraph capture so traces only cover steady-state"
+            " runs. Use --warmup-runs 0 to capture the first run (including"
+            " compile / cudagraph capture overhead) in the trace."
+        ),
+    )
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
         "--guidance-scale-high", type=float, default=None, help="Separate CFG for high-noise stage (Wan2.2 only)."
@@ -267,7 +285,9 @@ def main():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
 
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    if args.num_runs < 1:
+        raise ValueError("--num-runs must be >= 1")
+
     # Cache-dit config (Wan2.2 only)
     cache_config = None
     if args.cache_backend == "cache_dit":
@@ -324,6 +344,37 @@ def main():
 
     omni = Omni(**omni_kwargs)
 
+    prompt_dict = {"prompt": args.prompt}
+    if args.negative_prompt:
+        prompt_dict["negative_prompt"] = args.negative_prompt
+
+    sampling_kwargs = dict(
+        height=args.height,
+        width=args.width,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.num_inference_steps,
+        num_frames=args.num_frames,
+    )
+    if args.guidance_scale_high is not None:
+        sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+
+    # Warmup runs run before the profiler starts, so traces only cover the
+    # measured runs. Use --warmup-runs 0 to capture the first run (including
+    # torch.compile / cudagraph capture overhead) in the trace.
+    if args.warmup_runs > 0:
+        print(f"Running {args.warmup_runs} warmup run(s) (not traced)...")
+        for warmup_idx in range(args.warmup_runs):
+            generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+            warmup_start = time.perf_counter()
+            omni.generate(
+                prompt_dict,
+                OmniDiffusionSamplingParams(**dict(sampling_kwargs, generator=generator)),
+            )
+            print(
+                f"  Warmup run {warmup_idx + 1}/{args.warmup_runs}: "
+                f"{time.perf_counter() - warmup_start:.4f} seconds"
+            )
+
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
         omni.start_profile()
@@ -334,6 +385,9 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
+    print(f"  Runs: {args.num_runs}")
+    if args.warmup_runs > 0:
+        print(f"  Warmup runs: {args.warmup_runs}")
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
@@ -343,35 +397,28 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
-    prompt_dict = {"prompt": args.prompt}
-    if args.negative_prompt:
-        prompt_dict["negative_prompt"] = args.negative_prompt
+    frames = None
+    for run_idx in range(args.num_runs):
+        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+        run_sampling_kwargs = dict(sampling_kwargs, generator=generator)
 
-    sampling_kwargs = dict(
-        height=args.height,
-        width=args.width,
-        generator=generator,
-        guidance_scale=args.guidance_scale,
-        num_inference_steps=args.num_inference_steps,
-        num_frames=args.num_frames,
-    )
-    if args.guidance_scale_high is not None:
-        sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+        generation_start = time.perf_counter()
+        frames = omni.generate(
+            prompt_dict,
+            OmniDiffusionSamplingParams(**run_sampling_kwargs),
+        )
+        generation_end = time.perf_counter()
+        generation_time = generation_end - generation_start
+        run_suffix = f" [run {run_idx + 1}/{args.num_runs}]" if args.num_runs > 1 else ""
 
-    generation_start = time.perf_counter()
-    frames = omni.generate(
-        prompt_dict,
-        OmniDiffusionSamplingParams(**sampling_kwargs),
-    )
-    generation_end = time.perf_counter()
-    generation_time = generation_end - generation_start
+        print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms){run_suffix}")
 
-    # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+        peak_mb = _extract_peak_memory_mb(frames)
+        if peak_mb:
+            print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB){run_suffix}")
 
-    peak_mb = _extract_peak_memory_mb(frames)
-    if peak_mb:
-        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
+    if frames is None:
+        raise ValueError("No generation runs were executed.")
 
     audio = None
     if isinstance(frames, list):
