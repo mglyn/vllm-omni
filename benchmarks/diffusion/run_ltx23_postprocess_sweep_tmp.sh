@@ -11,7 +11,7 @@ set -euo pipefail
 #   after:  VLLM_OMNI_LTX23_ASYNC_DTOH=1
 # It runs both base and USP4 profiles by default:
 #   base: no extra parallel args
-#   usp4: --usp 4
+#   usp4: --ulysses-degree 4
 #
 # Example:
 #   MODEL=/data/models/Lightricks/LTX-2.3-Diffusers \
@@ -204,7 +204,7 @@ start_server() {
     base)
       ;;
     usp4)
-      profile_args+=(--usp 4)
+      profile_args+=(--ulysses-degree 4)
       ;;
     *)
       echo "Unknown profile: ${profile}" >&2
