@@ -6,22 +6,18 @@ set -euo pipefail
 # This script uses tests/dfx/perf/scripts/run_diffusion_benchmark.py, which
 # starts a vLLM-Omni server and calls benchmarks/diffusion/diffusion_benchmark_serving.py.
 #
-# Expected setup:
-#   BEFORE_REPO points at a worktree/checkout before the DtoH overlap change.
-#   AFTER_REPO points at a worktree/checkout after the DtoH overlap change.
+# It runs before/after in the same checkout using VLLM_OMNI_LTX23_ASYNC_DTOH:
+#   before: VLLM_OMNI_LTX23_ASYNC_DTOH=0
+#   after:  VLLM_OMNI_LTX23_ASYNC_DTOH=1
 #
 # Example:
-#   BEFORE_REPO=/root/vllm-omni-before-postprocess \
-#   AFTER_REPO=/root/vllm-omni \
 #   MODEL=/data/models/Lightricks/LTX-2.3-Diffusers \
 #   NUM_INFERENCE_STEPS=10 \
 #   bash benchmarks/diffusion/run_ltx23_postprocess_sweep_tmp.sh
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_AFTER_REPO="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+REPO="${REPO:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
 
-BEFORE_REPO="${BEFORE_REPO:-/root/vllm-omni-before-postprocess}"
-AFTER_REPO="${AFTER_REPO:-${DEFAULT_AFTER_REPO}}"
 MODEL="${MODEL:-/data/models/Lightricks/LTX-2.3-Diffusers}"
 MODEL_CLASS_NAME="${MODEL_CLASS_NAME:-LTX23Pipeline}"
 OUT_ROOT="${OUT_ROOT:-/root/results/ltx23_postprocess_benchmark_sweep}"
@@ -67,8 +63,6 @@ python_for_repo() {
     printf '%s\n' "${PYTHON}"
   elif [[ -x "${repo}/.venv/bin/python" ]]; then
     printf '%s\n' "${repo}/.venv/bin/python"
-  elif [[ -x "${AFTER_REPO}/.venv/bin/python" ]]; then
-    printf '%s\n' "${AFTER_REPO}/.venv/bin/python"
   else
     printf '%s\n' "python"
   fi
@@ -162,6 +156,7 @@ PY
 run_side() {
   local label="$1"
   local repo="$2"
+  local async_dtoh="$3"
 
   if [[ ! -d "${repo}" ]]; then
     echo "[Skip] ${label}: repo does not exist: ${repo}" >&2
@@ -187,11 +182,13 @@ run_side() {
   echo "python:  ${py}"
   echo "config:  ${config}"
   echo "results: ${result_dir}"
+  echo "async DtoH env: VLLM_OMNI_LTX23_ASYNC_DTOH=${async_dtoh}"
   echo
 
   (
     cd "${repo}"
     DIFFUSION_BENCHMARK_DIR="${result_dir}" \
+    VLLM_OMNI_LTX23_ASYNC_DTOH="${async_dtoh}" \
       "${py}" -m pytest -s tests/dfx/perf/scripts/run_diffusion_benchmark.py \
         --test-config-file "${config}" \
         --tb=short \
@@ -254,13 +251,14 @@ PY
 
 echo "Output root: ${OUT_ROOT}"
 echo "Model:       ${MODEL}"
+echo "Repo:        ${REPO}"
 echo "Cases:       ${SMALL_WIDTH}x${SMALL_HEIGHT}x${SMALL_FRAMES}f, ${LARGE_WIDTH}x${LARGE_HEIGHT}x${LARGE_FRAMES}f"
 echo "Runs/cell:   warmup=${WARMUP_REQUESTS}, measured=${NUM_PROMPTS}, steps=${NUM_INFERENCE_STEPS}"
 
 if [[ "${RUN_BEFORE}" == "1" ]]; then
-  run_side before "${BEFORE_REPO}"
+  run_side before "${REPO}" 0
 fi
 
 if [[ "${RUN_AFTER}" == "1" ]]; then
-  run_side after "${AFTER_REPO}"
+  run_side after "${REPO}" 1
 fi

@@ -252,6 +252,23 @@ class TestPipelineIndependence:
 
         assert _can_async_video_dtoh(video, output_type) is expected
 
+    def test_ltx23_async_video_dtoh_env_can_disable(self, mocker, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _can_async_video_dtoh
+
+        current_platform = SimpleNamespace(
+            device_type="cuda",
+            is_cuda=lambda: True,
+            is_rocm=lambda: False,
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            current_platform,
+        )
+        monkeypatch.setenv("VLLM_OMNI_LTX23_ASYNC_DTOH", "0")
+        video = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+
+        assert _can_async_video_dtoh(video, "np") is False
+
 
 class TestLTX23VaeDecodeParallel:
     """Test LTX-2.3 video VAE tiled parallel helpers without loading weights."""

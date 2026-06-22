@@ -63,6 +63,9 @@ from .pipeline_ltx2 import (
 
 logger = init_logger(__name__)
 
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_LTX23_ASYNC_DTOH_ENV = "VLLM_OMNI_LTX23_ASYNC_DTOH"
+
 
 class _VideoDtoHResult:
     def __init__(self, done_event, host_video: torch.Tensor, device_video: torch.Tensor) -> None:
@@ -83,6 +86,8 @@ class _VideoDtoHResult:
 
 
 def _can_async_video_dtoh(video: torch.Tensor, output_type: str) -> bool:
+    if os.getenv(_LTX23_ASYNC_DTOH_ENV, "1").strip().lower() in _FALSE_ENV_VALUES:
+        return False
     if not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm()):
         return False
     return output_type == "np" and video.device.type == current_omni_platform.device_type
