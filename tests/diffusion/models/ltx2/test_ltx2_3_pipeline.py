@@ -269,6 +269,27 @@ class TestPipelineIndependence:
 
         assert _can_async_video_dtoh(video, "np") is False
 
+    def test_ltx23_output_rank_matches_engine_reply_rank(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _is_output_rank
+
+        is_initialized = mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.distributed.is_initialized",
+            return_value=False,
+        )
+        get_rank = mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.distributed.get_rank",
+        )
+
+        assert _is_output_rank() is True
+        get_rank.assert_not_called()
+
+        is_initialized.return_value = True
+        get_rank.return_value = 0
+        assert _is_output_rank() is True
+
+        get_rank.return_value = 1
+        assert _is_output_rank() is False
+
 
 class TestLTX23VaeDecodeParallel:
     """Test LTX-2.3 video VAE tiled parallel helpers without loading weights."""

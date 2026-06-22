@@ -93,6 +93,10 @@ def _can_async_video_dtoh(video: torch.Tensor, output_type: str) -> bool:
     return output_type == "np" and video.device.type == current_omni_platform.device_type
 
 
+def _is_output_rank() -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
 def _submit_video_dtoh(video: torch.Tensor, video_processor: VideoProcessor) -> _VideoDtoHResult:
     current_omni_platform.set_device(video.device)
     ready_event = current_omni_platform.Event()
@@ -1317,6 +1321,16 @@ class LTX23Pipeline(
 
         latents = latents.to(self.vae.dtype)
         video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
+
+        # Non-output ranks have participated in all collectives; only rank0 replies.
+        if not _is_output_rank():
+            return DiffusionOutput(
+                output=(
+                    torch.empty(0, device=video.device, dtype=video.dtype),
+                    torch.empty(0, device=audio_latents.device, dtype=audio_latents.dtype),
+                ),
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
 
         # ---- Postprocess video ----
         video_dtoh = None
