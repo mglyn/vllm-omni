@@ -712,6 +712,8 @@ class RandomDataset(BaseDataset):
         self.num_prompts = args.num_prompts
         self.enable_negative_prompt = enable_negative_prompt
         self.num_input_images = max(1, args.num_input_images)
+        self.fixed_prompt = getattr(args, "fixed_prompt", None)
+        self.fixed_negative_prompt = getattr(args, "fixed_negative_prompt", None)
         self.random_request_config = getattr(args, "random_request_config", None)
         if self.random_request_config:
             self.random_request_config = json.loads(self.random_request_config)
@@ -743,8 +745,10 @@ class RandomDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> RequestFuncInput:
         extra_body = {}
-        if self.enable_negative_prompt:
-            extra_body["negative_prompt"] = f"Negative prompt {idx} for benchmarking diffusion models"
+        if self.enable_negative_prompt or self.fixed_negative_prompt is not None:
+            extra_body["negative_prompt"] = self.fixed_negative_prompt or (
+                f"Negative prompt {idx} for benchmarking diffusion models"
+            )
 
         params = {
             "width": self.args.width,
@@ -757,7 +761,7 @@ class RandomDataset(BaseDataset):
             profile = self._sampled_requests[idx]
             params.update(profile)
         return RequestFuncInput(
-            prompt=f"Random prompt {idx} for benchmarking diffusion models",
+            prompt=self.fixed_prompt or f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
             seed=self.args.seed,
@@ -1429,6 +1433,18 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Generate negative prompts when using the random dataset.",
+    )
+    parser.add_argument(
+        "--fixed-prompt",
+        type=str,
+        default=None,
+        help="Use this prompt for every request when using the random dataset.",
+    )
+    parser.add_argument(
+        "--fixed-negative-prompt",
+        type=str,
+        default=None,
+        help="Use this negative prompt for every request when using the random dataset.",
     )
     parser.add_argument(
         "--random-request-config",

@@ -195,6 +195,21 @@ def parse_args() -> argparse.Namespace:
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=1,
+        help="Number of measured generation runs on the same Omni instance.",
+    )
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help=(
+            "Number of warmup generation runs before measured runs. Warmup runs "
+            "are not profiled and are not counted in --num-runs."
+        ),
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
         default=None,
@@ -295,6 +310,11 @@ def _extract_peak_memory_mb(result: Any) -> float:
 
 def main():
     args = parse_args()
+    if args.num_runs < 1:
+        raise ValueError("--num-runs must be >= 1")
+    if args.warmup_runs < 0:
+        raise ValueError("--warmup-runs must be >= 0")
+
     model_class_name = args.model_class_name
 
     preset = _detect_preset(args.model)
@@ -302,7 +322,6 @@ def main():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
 
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     # Cache-dit config (Wan2.2 only)
     cache_config = None
     if args.cache_backend == "cache_dit":
@@ -359,10 +378,6 @@ def main():
 
     omni = Omni(**omni_kwargs)
 
-    if profiler_enabled:
-        print("[Profiler] Starting profiling...")
-        omni.start_profile()
-
     # Print generation configuration
     print(f"\n{'=' * 60}")
     print("Generation Configuration:")
@@ -376,40 +391,72 @@ def main():
         f" enable_expert_parallel={args.enable_expert_parallel}"
     )
     print(f"  Video size: {args.width}x{args.height}")
+    print(f"  Warmup runs: {args.warmup_runs}")
+    print(f"  Measured runs: {args.num_runs}")
     print(f"{'=' * 60}\n")
 
     prompt_dict = {"prompt": args.prompt}
     if args.negative_prompt:
         prompt_dict["negative_prompt"] = args.negative_prompt
 
-    sampling_kwargs = dict(
+    base_sampling_kwargs = dict(
         height=args.height,
         width=args.width,
-        generator=generator,
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
     )
     if args.guidance_scale_high is not None:
-        sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+        base_sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
     if args.extra_body:
         # Model-specific knobs (declared in vllm_omni/model_extras/) routed via extra_args.
-        sampling_kwargs["extra_args"] = dict(args.extra_body)
+        base_sampling_kwargs["extra_args"] = dict(args.extra_body)
 
-    generation_start = time.perf_counter()
-    frames = omni.generate(
-        prompt_dict,
-        OmniDiffusionSamplingParams(**sampling_kwargs),
-    )
-    generation_end = time.perf_counter()
-    generation_time = generation_end - generation_start
+    def run_generation(run_label: str, run_idx: int, seed: int):
+        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
+        sampling_kwargs = dict(base_sampling_kwargs, generator=generator)
 
-    # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+        print(f"[{run_label}] Run {run_idx + 1}: seed={seed}")
+        generation_start = time.perf_counter()
+        result = omni.generate(
+            prompt_dict,
+            OmniDiffusionSamplingParams(**sampling_kwargs),
+        )
+        generation_end = time.perf_counter()
+        generation_time = generation_end - generation_start
 
-    peak_mb = _extract_peak_memory_mb(frames)
-    if peak_mb:
-        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
+        print(f"{run_label} generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+        peak_mb = _extract_peak_memory_mb(result)
+        if peak_mb:
+            print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
+        return result, generation_time
+
+    for warmup_idx in range(args.warmup_runs):
+        run_generation("Warmup", warmup_idx, args.seed + warmup_idx)
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
+
+    frames = None
+    generation_times = []
+    for run_idx in range(args.num_runs):
+        frames, generation_time = run_generation("Measured", run_idx, args.seed + run_idx)
+        generation_times.append(generation_time)
+
+    if args.num_runs == 1:
+        print(f"Total generation time: {generation_times[0]:.4f} seconds ({generation_times[0] * 1000:.2f} ms)")
+    else:
+        mean_generation_time = sum(generation_times) / len(generation_times)
+        print(
+            f"Mean generation time over {args.num_runs} measured runs: "
+            f"{mean_generation_time:.4f} seconds ({mean_generation_time * 1000:.2f} ms)"
+        )
+
+    profile_results = None
+    if profiler_enabled:
+        print("\n[Profiler] Stopping profiler and collecting results...")
+        profile_results = omni.stop_profile()
 
     audio = None
     if isinstance(frames, list):
@@ -577,8 +624,6 @@ def main():
     print(f"Saved generated video to {output_path}")
 
     if profiler_enabled:
-        print("\n[Profiler] Stopping profiler and collecting results...")
-        profile_results = omni.stop_profile()
         if profile_results and isinstance(profile_results, dict):
             traces = profile_results.get("traces", [])
             print("\n" + "=" * 60)
