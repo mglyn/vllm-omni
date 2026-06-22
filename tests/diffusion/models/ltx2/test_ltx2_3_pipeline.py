@@ -15,8 +15,10 @@ These tests verify:
 import json
 import os
 import tempfile
+from contextlib import nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -103,6 +105,152 @@ class TestPipelineIndependence:
         from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 
         assert issubclass(LTX23Pipeline, DiffusionPipelineProfilerMixin)
+
+    def test_ltx23_video_dtoh_enqueues_stream_task(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _submit_video_dtoh
+
+        ready_event = mocker.Mock()
+        done_event = mocker.Mock()
+        current_stream = mocker.Mock()
+        stream = mocker.Mock()
+        platform = SimpleNamespace(
+            set_device=mocker.Mock(),
+            Event=mocker.Mock(side_effect=[ready_event, done_event]),
+            current_stream=mocker.Mock(return_value=current_stream),
+            Stream=mocker.Mock(return_value=stream),
+            stream=lambda _: nullcontext(),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            platform,
+        )
+        original_empty = torch.empty
+
+        def empty_without_pinning(*args, **kwargs):
+            kwargs.pop("pin_memory", None)
+            return original_empty(*args, **kwargs)
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.empty",
+            side_effect=empty_without_pinning,
+        )
+
+        video = torch.zeros(1, 3, 1, 1, 1)
+
+        result = _submit_video_dtoh(video, SimpleNamespace())
+
+        assert result._done_event is done_event
+        platform.set_device.assert_called_once_with(video.device)
+        assert platform.Event.call_count == 2
+        platform.current_stream.assert_called_once_with(video.device)
+        ready_event.record.assert_called_once_with(current_stream)
+        platform.Stream.assert_called_once_with(device=video.device)
+        stream.wait_event.assert_called_once_with(ready_event)
+        done_event.record.assert_called_once_with(stream)
+
+    def test_ltx23_video_dtoh_matches_diffusers(self, mocker):
+        from diffusers.video_processor import VideoProcessor
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _submit_video_dtoh
+
+        stream = mocker.Mock()
+        ready_event = mocker.Mock()
+        done_event = mocker.Mock()
+        current_stream = mocker.Mock()
+        platform = SimpleNamespace(
+            set_device=mocker.Mock(),
+            Event=mocker.Mock(side_effect=[ready_event, done_event]),
+            current_stream=mocker.Mock(return_value=current_stream),
+            Stream=mocker.Mock(return_value=stream),
+            stream=lambda _: nullcontext(),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            platform,
+        )
+        original_empty = torch.empty
+
+        def empty_without_pinning(*args, **kwargs):
+            if "pin_memory" in kwargs:
+                assert kwargs.pop("pin_memory") is True
+            return original_empty(*args, **kwargs)
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.torch.empty",
+            side_effect=empty_without_pinning,
+        )
+
+        video_processor = VideoProcessor(vae_scale_factor=32)
+        video = torch.linspace(-1, 1, 2 * 3 * 2 * 4 * 4).reshape(2, 3, 2, 4, 4)
+        expected = video_processor.postprocess_video(video, output_type="np")
+
+        handle = _submit_video_dtoh(video, video_processor)
+        actual = handle.result()
+
+        np.testing.assert_array_equal(actual, expected)
+        platform.set_device.assert_called_once_with(video.device)
+        ready_event.record.assert_called_once()
+        stream.wait_event.assert_called_once_with(ready_event)
+        done_event = handle._done_event
+        done_event.record.assert_called_once_with(stream)
+        done_event.synchronize.assert_called_once_with()
+
+    def test_ltx23_load_weights_delegates_to_loader(self, mocker):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        loader = mocker.Mock()
+        loader.load_weights.return_value = {"transformer.weight"}
+        loader_cls = mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.AutoWeightsLoader",
+            return_value=loader,
+        )
+
+        pipe = object.__new__(LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        weights = [("transformer.weight", torch.empty(0))]
+
+        assert pipe.load_weights(weights) == {"transformer.weight"}
+        loader_cls.assert_called_once_with(pipe)
+        loader.load_weights.assert_called_once_with(weights)
+
+    @pytest.mark.parametrize(
+        (
+            "platform",
+            "output_type",
+            "device_type",
+            "expected",
+        ),
+        [
+            ("cuda", "np", "cuda", True),
+            ("rocm", "np", "cuda", True),
+            ("xpu", "np", "xpu", False),
+            ("npu", "np", "npu", False),
+            ("cuda", "np", "cpu", False),
+            ("cuda", "pt", "cuda", False),
+        ],
+    )
+    def test_ltx23_async_video_dtoh_conditions(
+        self,
+        mocker,
+        platform,
+        output_type,
+        device_type,
+        expected,
+    ):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _can_async_video_dtoh
+
+        current_platform = SimpleNamespace(
+            device_type="cuda" if platform == "rocm" else platform,
+            is_cuda=lambda: platform == "cuda",
+            is_rocm=lambda: platform == "rocm",
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3.current_omni_platform",
+            current_platform,
+        )
+        video = SimpleNamespace(device=SimpleNamespace(type=device_type))
+
+        assert _can_async_video_dtoh(video, output_type) is expected
 
 
 class TestLTX23VaeDecodeParallel:
