@@ -9,17 +9,17 @@ set -euo pipefail
 # It runs before/after in the same checkout using VLLM_OMNI_LTX23_ASYNC_DTOH:
 #   before: VLLM_OMNI_LTX23_ASYNC_DTOH=0
 #   after:  VLLM_OMNI_LTX23_ASYNC_DTOH=1
-# It runs both base and CFG2 profiles by default:
+# It runs both base and USP4 profiles by default:
 #   base: no extra parallel args
-#   cfg2: --cfg-parallel-size 2
+#   usp4: --ulysses-degree 4
 #
 # Example:
 #   MODEL=/data/models/Lightricks/LTX-2.3-Diffusers \
 #   NUM_INFERENCE_STEPS=10 \
 #   bash benchmarks/diffusion/run_ltx23_postprocess_sweep_tmp.sh
 #
-# To run only CFG2:
-#   PROFILES=cfg2 bash benchmarks/diffusion/run_ltx23_postprocess_sweep_tmp.sh
+# To run only USP4:
+#   PROFILES=usp4 bash benchmarks/diffusion/run_ltx23_postprocess_sweep_tmp.sh
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
@@ -56,7 +56,7 @@ BENCHMARK_EXTRA_PARAMS_JSON="${BENCHMARK_EXTRA_PARAMS_JSON:-{}}"
 # Set RUN_BEFORE=0 or RUN_AFTER=0 to skip one side.
 RUN_BEFORE="${RUN_BEFORE:-1}"
 RUN_AFTER="${RUN_AFTER:-1}"
-PROFILES="${PROFILES:-base cfg2}"
+PROFILES="${PROFILES:-base usp4}"
 
 mkdir -p "${OUT_ROOT}/logs" "${OUT_ROOT}/raw"
 
@@ -203,8 +203,8 @@ start_server() {
   case "${profile}" in
     base)
       ;;
-    cfg2)
-      profile_args+=(--cfg-parallel-size 2)
+    usp4)
+      profile_args+=(--ulysses-degree 4)
       ;;
     *)
       echo "Unknown profile: ${profile}" >&2
