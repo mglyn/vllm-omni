@@ -9,17 +9,11 @@ set -euo pipefail
 # It runs before/after in the same checkout using VLLM_OMNI_LTX23_ASYNC_DTOH:
 #   before: VLLM_OMNI_LTX23_ASYNC_DTOH=0
 #   after:  VLLM_OMNI_LTX23_ASYNC_DTOH=1
-# It runs both base and USP4 profiles by default:
-#   base: no extra parallel args
-#   usp4: --usp 4
 #
 # Example:
 #   MODEL=/data/models/Lightricks/LTX-2.3-Diffusers \
 #   NUM_INFERENCE_STEPS=10 \
 #   bash benchmarks/diffusion/run_ltx23_postprocess_sweep_tmp.sh
-#
-# To run only USP4:
-#   PROFILES=usp4 bash benchmarks/diffusion/run_ltx23_postprocess_sweep_tmp.sh
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
@@ -29,15 +23,13 @@ MODEL_CLASS_NAME="${MODEL_CLASS_NAME:-LTX23Pipeline}"
 OUT_ROOT="${OUT_ROOT:-/root/results/ltx23_postprocess_benchmark_sweep}"
 HOST="${HOST:-127.0.0.1}"
 
-NUM_PROMPTS="${NUM_PROMPTS:-5}"
+NUM_PROMPTS="${NUM_PROMPTS:-10}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-1}"
 WARMUP_CONCURRENCY="${WARMUP_CONCURRENCY:-1}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-3}"
 FPS="${FPS:-16}"
 SEED="${SEED:-42}"
-PROMPT="${PROMPT:-Floating crystal islands in cosmic starry sky, glowing nebula, soft luminous particles flowing around, slow camera rotation}"
-NEG_PROMPT="${NEG_PROMPT:-low quality, blurry, noise, watermark, text, deformed figures, cartoon style, over-saturated color, frame jump}"
 
 SMALL_WIDTH="${SMALL_WIDTH:-512}"
 SMALL_HEIGHT="${SMALL_HEIGHT:-384}"
@@ -56,7 +48,6 @@ BENCHMARK_EXTRA_PARAMS_JSON="${BENCHMARK_EXTRA_PARAMS_JSON:-{}}"
 # Set RUN_BEFORE=0 or RUN_AFTER=0 to skip one side.
 RUN_BEFORE="${RUN_BEFORE:-1}"
 RUN_AFTER="${RUN_AFTER:-1}"
-PROFILES="${PROFILES:-base usp4}"
 
 mkdir -p "${OUT_ROOT}/logs" "${OUT_ROOT}/raw"
 
@@ -192,25 +183,12 @@ trap stop_server EXIT
 start_server() {
   local label="$1"
   local mode="$2"
-  local profile="$3"
-  local async_dtoh="$4"
-  local port="$5"
-  local log_file="$6"
+  local async_dtoh="$3"
+  local port="$4"
+  local log_file="$5"
 
   local -a server_extra_args=()
   mapfile -t server_extra_args < <(json_to_cli_args "${SERVER_EXTRA_ARGS_JSON}")
-  local -a profile_args=()
-  case "${profile}" in
-    base)
-      ;;
-    usp4)
-      profile_args+=(--usp 4)
-      ;;
-    *)
-      echo "Unknown profile: ${profile}" >&2
-      exit 1
-      ;;
-  esac
 
   local -a server_args=(
     "${PYTHON_BIN}" -m vllm_omni.entrypoints.cli.main serve "${MODEL}"
@@ -223,10 +201,9 @@ start_server() {
   if [[ "${mode}" == "eager" ]]; then
     server_args+=(--enforce-eager)
   fi
-  server_args+=("${profile_args[@]}")
   server_args+=("${server_extra_args[@]}")
 
-  echo "[Server] ${label}/${mode}/${profile}: ${server_args[*]}"
+  echo "[Server] ${label}/${mode}: ${server_args[*]}"
   echo "[Server] log: ${log_file}"
   (
     cd "${REPO}"
@@ -242,15 +219,14 @@ start_server() {
 run_case() {
   local label="$1"
   local mode="$2"
-  local profile="$3"
-  local port="$4"
-  local case_name="$5"
-  local width="$6"
-  local height="$7"
-  local frames="$8"
+  local port="$3"
+  local case_name="$4"
+  local width="$5"
+  local height="$6"
+  local frames="$7"
 
-  local result_json="${OUT_ROOT}/raw/${label}_${mode}_${profile}_${case_name}.json"
-  local log_file="${OUT_ROOT}/logs/${label}_${mode}_${profile}_${case_name}.log"
+  local result_json="${OUT_ROOT}/raw/${label}_${mode}_${case_name}.json"
+  local log_file="${OUT_ROOT}/logs/${label}_${mode}_${case_name}.log"
 
   local -a benchmark_extra_args=()
   mapfile -t benchmark_extra_args < <(json_to_cli_args "${BENCHMARK_EXTRA_PARAMS_JSON}")
@@ -275,13 +251,11 @@ run_case() {
     --warmup-concurrency "${WARMUP_CONCURRENCY}"
     --warmup-num-inference-steps "${NUM_INFERENCE_STEPS}"
     --enable-negative-prompt
-    --fixed-prompt "${PROMPT}"
-    --fixed-negative-prompt "${NEG_PROMPT}"
     --output-file "${result_json}"
   )
   bench_args+=("${benchmark_extra_args[@]}")
 
-  echo "[Benchmark] ${label}/${mode}/${profile}/${case_name}: ${bench_args[*]}"
+  echo "[Benchmark] ${label}/${mode}/${case_name}: ${bench_args[*]}"
   (
     cd "${REPO}"
     "${bench_args[@]}"
@@ -292,23 +266,21 @@ run_mode() {
   local label="$1"
   local async_dtoh="$2"
   local mode="$3"
-  local profile="$4"
   local port
   port="$(get_free_port)"
-  local server_log="${OUT_ROOT}/logs/server_${label}_${mode}_${profile}.log"
+  local server_log="${OUT_ROOT}/logs/server_${label}_${mode}.log"
 
   echo
-  echo "===== ${label}/${mode}/${profile} ====="
+  echo "===== ${label}/${mode} ====="
   echo "repo:    ${REPO}"
   echo "python:  ${PYTHON_BIN}"
   echo "results: ${OUT_ROOT}"
-  echo "profile: ${profile}"
   echo "async DtoH env: VLLM_OMNI_LTX23_ASYNC_DTOH=${async_dtoh}"
   echo
 
-  start_server "${label}" "${mode}" "${profile}" "${async_dtoh}" "${port}" "${server_log}"
-  run_case "${label}" "${mode}" "${profile}" "${port}" "${SMALL_WIDTH}x${SMALL_HEIGHT}_${SMALL_FRAMES}f" "${SMALL_WIDTH}" "${SMALL_HEIGHT}" "${SMALL_FRAMES}"
-  run_case "${label}" "${mode}" "${profile}" "${port}" "${LARGE_WIDTH}x${LARGE_HEIGHT}_${LARGE_FRAMES}f" "${LARGE_WIDTH}" "${LARGE_HEIGHT}" "${LARGE_FRAMES}"
+  start_server "${label}" "${mode}" "${async_dtoh}" "${port}" "${server_log}"
+  run_case "${label}" "${mode}" "${port}" "${SMALL_WIDTH}x${SMALL_HEIGHT}_${SMALL_FRAMES}f" "${SMALL_WIDTH}" "${SMALL_HEIGHT}" "${SMALL_FRAMES}"
+  run_case "${label}" "${mode}" "${port}" "${LARGE_WIDTH}x${LARGE_HEIGHT}_${LARGE_FRAMES}f" "${LARGE_WIDTH}" "${LARGE_HEIGHT}" "${LARGE_FRAMES}"
   stop_server
 }
 
@@ -323,39 +295,23 @@ out_root = sys.argv[1]
 rows = []
 for path in sorted(glob.glob(os.path.join(out_root, "raw", "*.json"))):
     name = os.path.basename(path)[:-5]
-    # label_mode_profile_case, where case itself contains underscores.
-    parts = name.split("_", 3)
-    if len(parts) == 4:
-        label, mode, profile, case = parts
-    else:
-        label, mode, case = name.split("_", 2)
-        profile = "base"
+    # label_mode_case, where case itself contains underscores.
+    label, mode, case = name.split("_", 2)
     with open(path, encoding="utf-8") as f:
         result = json.load(f)
-    rows.append((label, mode, profile, case, result, path))
+    rows.append((label, mode, case, result, path))
 
 summary_path = os.path.join(out_root, "summary.tsv")
 with open(summary_path, "w", encoding="utf-8") as out:
-    out.write(
-        "label\tmode\tprofile\tcase\tstage_0_gen_ms_mean\tstage_0_gen_ms_p50\t"
-        "stage_0_gen_ms_p99\tthroughput_qps\tlatency_mean\tlatency_p50\t"
-        "latency_p99\tpeak_memory_mb_mean\tcompleted\tfailed\tjson\n"
-    )
-    for label, mode, profile, case, result, path in rows:
-        stage_mean = result.get("stage_durations_mean") or {}
-        stage_p50 = result.get("stage_durations_p50") or {}
-        stage_p99 = result.get("stage_durations_p99") or {}
+    out.write("label\tmode\tcase\tthroughput_qps\tlatency_mean\tlatency_p50\tlatency_p99\tpeak_memory_mb_mean\tcompleted\tfailed\tjson\n")
+    for label, mode, case, result, path in rows:
         out.write(
             "\t".join(
                 str(x)
                 for x in [
                     label,
                     mode,
-                    profile,
                     case,
-                    stage_mean.get("stage_0_gen_ms", ""),
-                    stage_p50.get("stage_0_gen_ms", ""),
-                    stage_p99.get("stage_0_gen_ms", ""),
                     result.get("throughput_qps", ""),
                     result.get("latency_mean", ""),
                     result.get("latency_p50", ""),
@@ -382,23 +338,16 @@ echo "Output root: ${OUT_ROOT}"
 echo "Model:       ${MODEL}"
 echo "Repo:        ${REPO}"
 echo "Cases:       ${SMALL_WIDTH}x${SMALL_HEIGHT}x${SMALL_FRAMES}f, ${LARGE_WIDTH}x${LARGE_HEIGHT}x${LARGE_FRAMES}f"
-echo "Profiles:    ${PROFILES}"
 echo "Runs/cell:   warmup=${WARMUP_REQUESTS}, measured=${NUM_PROMPTS}, steps=${NUM_INFERENCE_STEPS}"
-echo "Prompt:      ${PROMPT}"
-echo "Neg prompt:  ${NEG_PROMPT}"
 
 if [[ "${RUN_BEFORE}" == "1" ]]; then
-  for profile in ${PROFILES}; do
-    run_mode before 0 eager "${profile}"
-    run_mode before 0 compile "${profile}"
-  done
+  run_mode before 0 eager
+  run_mode before 0 compile
 fi
 
 if [[ "${RUN_AFTER}" == "1" ]]; then
-  for profile in ${PROFILES}; do
-    run_mode after 1 eager "${profile}"
-    run_mode after 1 compile "${profile}"
-  done
+  run_mode after 1 eager
+  run_mode after 1 compile
 fi
 
 summarize_results
