@@ -82,37 +82,26 @@ class _VideoDtoHResult:
         return self._host_video.numpy()
 
 
-class _VideoDtoHStager:
-    def __init__(self) -> None:
-        self._stream = None
-        self._stream_device: torch.device | None = None
+def _submit_video_dtoh(video: torch.Tensor, video_processor: VideoProcessor) -> _VideoDtoHResult:
+    current_omni_platform.set_device(video.device)
+    ready_event = current_omni_platform.Event()
+    ready_event.record(current_omni_platform.current_stream(video.device))
+    stream = current_omni_platform.Stream(device=video.device)
+    done_event = current_omni_platform.Event()
 
-    def _get_stream(self, device: torch.device):
-        if self._stream is None or self._stream_device != device:
-            self._stream = current_omni_platform.Stream(device=device)
-            self._stream_device = device
-        return self._stream
+    output_shape = torch.Size((video.shape[0], video.shape[2], video.shape[3], video.shape[4], video.shape[1]))
+    device_video = torch.empty(output_shape, dtype=torch.float32, device=video.device)
+    host_video = torch.empty(output_shape, dtype=torch.float32, device="cpu", pin_memory=True)
 
-    def submit(self, video: torch.Tensor, video_processor: VideoProcessor) -> _VideoDtoHResult:
-        current_omni_platform.set_device(video.device)
-        ready_event = current_omni_platform.Event()
-        ready_event.record(current_omni_platform.current_stream(video.device))
-        stream = self._get_stream(video.device)
-        done_event = current_omni_platform.Event()
+    with torch.inference_mode(), current_omni_platform.stream(stream):
+        stream.wait_event(ready_event)
+        if getattr(getattr(video_processor, "config", None), "do_normalize", True):
+            video.mul_(0.5).add_(0.5).clamp_(0, 1)
+        device_video.copy_(video.permute(0, 2, 3, 4, 1), non_blocking=True)
+        host_video.copy_(device_video, non_blocking=True)
+        done_event.record(stream)
 
-        output_shape = torch.Size((video.shape[0], video.shape[2], video.shape[3], video.shape[4], video.shape[1]))
-        device_video = torch.empty(output_shape, dtype=torch.float32, device=video.device)
-        host_video = torch.empty(output_shape, dtype=torch.float32, device="cpu", pin_memory=True)
-
-        with torch.inference_mode(), current_omni_platform.stream(stream):
-            stream.wait_event(ready_event)
-            if getattr(getattr(video_processor, "config", None), "do_normalize", True):
-                video.mul_(0.5).add_(0.5).clamp_(0, 1)
-            device_video.copy_(video.permute(0, 2, 3, 4, 1), non_blocking=True)
-            host_video.copy_(device_video, non_blocking=True)
-            done_event.record(stream)
-
-        return _VideoDtoHResult(done_event, host_video, device_video)
+    return _VideoDtoHResult(done_event, host_video, device_video)
 
 
 def _can_async_video_dtoh(video: torch.Tensor, output_type: str) -> bool:
@@ -336,7 +325,6 @@ class LTX23Pipeline(
         self._interrupt = False
         self._num_timesteps = None
         self._current_timestep = None
-        self._video_dtoh_stager = _VideoDtoHStager()
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -1346,7 +1334,7 @@ class LTX23Pipeline(
         video_dtoh = None
         if video.numel() > 0:
             if _can_async_video_dtoh(video, output_type):
-                video_dtoh = self._video_dtoh_stager.submit(video, self.video_processor)
+                video_dtoh = _submit_video_dtoh(video, self.video_processor)
             else:
                 video = self.video_processor.postprocess_video(video, output_type=output_type)
 
