@@ -252,6 +252,7 @@ class TestPipelineIndependence:
 
         assert _can_async_video_dtoh(video, output_type) is expected
 
+
 class TestLTX23VaeDecodeParallel:
     """Test LTX-2.3 video VAE tiled parallel helpers without loading weights."""
 
