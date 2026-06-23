@@ -82,7 +82,7 @@ class _VideoDtoHResult:
 
     def result(self) -> np.ndarray:
         self.wait()
-        return self._host_video.numpy().copy()
+        return self._host_video.numpy()
 
 
 class _VideoDtoHStager:
@@ -90,7 +90,6 @@ class _VideoDtoHStager:
         self._stream = None
         self._stream_device: torch.device | None = None
         self._device_buffer: torch.Tensor | None = None
-        self._host_buffer: torch.Tensor | None = None
 
     def _get_stream(self, device: torch.device):
         if self._stream is None or self._stream_device != device:
@@ -109,16 +108,6 @@ class _VideoDtoHStager:
             self._device_buffer = torch.empty(numel, dtype=torch.float32, device=device)
         return self._device_buffer[:numel].view(shape)
 
-    def _get_host_buffer(self, shape: torch.Size) -> torch.Tensor:
-        numel = int(np.prod(shape))
-        if (
-            self._host_buffer is None
-            or self._host_buffer.dtype != torch.float32
-            or self._host_buffer.numel() < numel
-        ):
-            self._host_buffer = torch.empty(numel, dtype=torch.float32, device="cpu", pin_memory=True)
-        return self._host_buffer[:numel].view(shape)
-
     def submit(self, video: torch.Tensor, video_processor: VideoProcessor) -> _VideoDtoHResult:
         current_omni_platform.set_device(video.device)
         ready_event = current_omni_platform.Event()
@@ -128,7 +117,7 @@ class _VideoDtoHStager:
 
         output_shape = torch.Size((video.shape[0], video.shape[2], video.shape[3], video.shape[4], video.shape[1]))
         device_video = self._get_device_buffer(output_shape, video.device)
-        host_video = self._get_host_buffer(output_shape)
+        host_video = torch.empty(output_shape, dtype=torch.float32, device="cpu", pin_memory=True)
 
         with torch.inference_mode(), current_omni_platform.stream(stream):
             stream.wait_event(ready_event)
