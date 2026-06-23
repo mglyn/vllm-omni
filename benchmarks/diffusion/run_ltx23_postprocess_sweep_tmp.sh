@@ -274,7 +274,6 @@ run_case() {
     --warmup-requests "${WARMUP_REQUESTS}"
     --warmup-concurrency "${WARMUP_CONCURRENCY}"
     --warmup-num-inference-steps "${NUM_INFERENCE_STEPS}"
-    --warmup-num-frames "${frames}"
     --enable-negative-prompt
     --fixed-prompt "${PROMPT}"
     --fixed-negative-prompt "${NEG_PROMPT}"

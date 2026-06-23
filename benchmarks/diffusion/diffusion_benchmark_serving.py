@@ -919,8 +919,8 @@ def _make_warmup_request(
             warm_req,
             num_inference_steps=args.warmup_num_inference_steps,
         )
-    if args.task == "t2v" and args.warmup_num_frames is not None:
-        warm_req = replace(warm_req, num_frames=args.warmup_num_frames)
+    if args.task == "t2v":
+        warm_req = replace(warm_req, num_frames=1)
     return warm_req
 
 
@@ -1380,15 +1380,6 @@ if __name__ == "__main__":
         default=2,
         help="Number of inference steps used for warmup requests. "
         "Default is 2 to ensure at least one denoising step is executed.",
-    )
-    parser.add_argument(
-        "--warmup-num-frames",
-        type=int,
-        default=1,
-        help=(
-            "Number of frames used for t2v warmup requests. Set this to match "
-            "the measured request shape when warming shape-dependent paths."
-        ),
     )
     parser.add_argument(
         "--warmup-concurrency",
