@@ -52,6 +52,7 @@ LARGE_FRAMES="${LARGE_FRAMES:-81}"
 #   BENCHMARK_EXTRA_PARAMS_JSON='{"request-rate":"inf","disable-tqdm":true}'
 SERVER_EXTRA_ARGS_JSON="${SERVER_EXTRA_ARGS_JSON:-{}}"
 BENCHMARK_EXTRA_PARAMS_JSON="${BENCHMARK_EXTRA_PARAMS_JSON:-{}}"
+ENABLE_DIFFUSION_PIPELINE_PROFILER="${ENABLE_DIFFUSION_PIPELINE_PROFILER:-0}"
 
 # Set RUN_BEFORE=0 or RUN_AFTER=0 to skip one side.
 RUN_BEFORE="${RUN_BEFORE:-1}"
@@ -218,8 +219,10 @@ start_server() {
     --host "${HOST}"
     --port "${port}"
     --model-class-name "${MODEL_CLASS_NAME}"
-    --enable-diffusion-pipeline-profiler
   )
+  if [[ "${ENABLE_DIFFUSION_PIPELINE_PROFILER}" == "1" ]]; then
+    server_args+=(--enable-diffusion-pipeline-profiler)
+  fi
   if [[ "${mode}" == "eager" ]]; then
     server_args+=(--enforce-eager)
   fi
