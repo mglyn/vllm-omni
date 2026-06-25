@@ -38,6 +38,155 @@ def _make_ltx23_pipeline(sequence_parallel_size: int = 1):
     return pipeline
 
 
+def _make_ltx23_request_pipe(cls):
+    pipe = object.__new__(cls)
+    torch.nn.Module.__init__(pipe)
+    pipe.device = torch.device("cpu")
+    pipe.tokenizer_max_length = 99
+    return pipe
+
+
+def _resolve_request_inputs_for_test(pipe, req):
+    return pipe._resolve_request_inputs(
+        req,
+        prompt=None,
+        negative_prompt=None,
+        height=None,
+        width=None,
+        num_frames=None,
+        frame_rate=None,
+        num_inference_steps=None,
+        timesteps=None,
+        guidance_scale=4.0,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=None,
+    )
+
+
+class TestLTX23RequestParsing:
+    def test_t2v_and_i2v_share_request_input_resolution(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline, LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        prompt_embeds = torch.tensor([[1.0, 2.0]])
+        negative_prompt_embeds = torch.tensor([[3.0, 4.0]])
+        prompt_attention_mask = torch.tensor([True, False])
+        negative_attention_mask = torch.tensor([False, True])
+        video_latents = torch.ones(1, 2, 3)
+        audio_latents = torch.zeros(1, 2, 3)
+
+        req = OmniDiffusionRequest(
+            prompts=[
+                {
+                    "prompt": "shared prompt",
+                    "negative_prompt": "shared negative",
+                    "additional_information": {
+                        "prompt_embeds": prompt_embeds,
+                        "negative_prompt_embeds": negative_prompt_embeds,
+                        "attention_mask": prompt_attention_mask,
+                        "negative_attention_mask": negative_attention_mask,
+                    },
+                }
+            ],
+            sampling_params=OmniDiffusionSamplingParams(
+                height=384,
+                width=512,
+                num_frames=25,
+                frame_rate=12.5,
+                num_inference_steps=1,
+                num_outputs_per_prompt=2,
+                guidance_scale=6.0,
+                seed=123,
+                latents=video_latents,
+                extra_args={"audio_latents": audio_latents},
+                decode_timestep=[0.1],
+                decode_noise_scale=[0.2],
+                output_type="latent",
+                max_sequence_length=17,
+            ),
+            request_id="ltx23-shared-request-inputs",
+        )
+
+        resolved_t2v = _resolve_request_inputs_for_test(
+            _make_ltx23_request_pipe(LTX23Pipeline),
+            req,
+        )
+        resolved_i2v = _resolve_request_inputs_for_test(
+            _make_ltx23_request_pipe(LTX23ImageToVideoPipeline),
+            req,
+        )
+
+        assert resolved_i2v.prompt == resolved_t2v.prompt is None
+        assert resolved_i2v.negative_prompt == resolved_t2v.negative_prompt is None
+        assert resolved_i2v.height == resolved_t2v.height == 384
+        assert resolved_i2v.width == resolved_t2v.width == 512
+        assert resolved_i2v.num_frames == resolved_t2v.num_frames == 25
+        assert resolved_i2v.frame_rate == resolved_t2v.frame_rate == 12.5
+        assert resolved_i2v.num_inference_steps == resolved_t2v.num_inference_steps == 2
+        assert resolved_i2v.guidance_scale == resolved_t2v.guidance_scale == 6.0
+        assert resolved_i2v.num_videos_per_prompt == resolved_t2v.num_videos_per_prompt == 2
+        assert resolved_i2v.generator.initial_seed() == resolved_t2v.generator.initial_seed() == 123
+        assert resolved_i2v.decode_timestep == resolved_t2v.decode_timestep == [0.1]
+        assert resolved_i2v.decode_noise_scale == resolved_t2v.decode_noise_scale == [0.2]
+        assert resolved_i2v.output_type == resolved_t2v.output_type == "latent"
+        assert resolved_i2v.max_sequence_length == resolved_t2v.max_sequence_length == 17
+        torch.testing.assert_close(resolved_i2v.latents, video_latents)
+        torch.testing.assert_close(resolved_t2v.latents, video_latents)
+        torch.testing.assert_close(resolved_i2v.audio_latents, audio_latents)
+        torch.testing.assert_close(resolved_t2v.audio_latents, audio_latents)
+        torch.testing.assert_close(resolved_i2v.prompt_embeds, torch.stack([prompt_embeds]))
+        torch.testing.assert_close(resolved_t2v.prompt_embeds, torch.stack([prompt_embeds]))
+        torch.testing.assert_close(resolved_i2v.negative_prompt_embeds, torch.stack([negative_prompt_embeds]))
+        torch.testing.assert_close(resolved_t2v.negative_prompt_embeds, torch.stack([negative_prompt_embeds]))
+        torch.testing.assert_close(resolved_i2v.prompt_attention_mask, torch.stack([prompt_attention_mask]))
+        torch.testing.assert_close(resolved_t2v.prompt_attention_mask, torch.stack([prompt_attention_mask]))
+        torch.testing.assert_close(
+            resolved_i2v.negative_prompt_attention_mask,
+            torch.stack([negative_attention_mask]),
+        )
+        torch.testing.assert_close(
+            resolved_t2v.negative_prompt_attention_mask,
+            torch.stack([negative_attention_mask]),
+        )
+
+    def test_request_input_resolution_rejects_mixed_precomputed_prompt_fields(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        req = OmniDiffusionRequest(
+            prompts=[
+                {
+                    "prompt": "with embeds",
+                    "additional_information": {"prompt_embeds": torch.tensor([[1.0]])},
+                },
+                {"prompt": "without embeds"},
+            ],
+            sampling_params=OmniDiffusionSamplingParams(
+                height=384,
+                width=512,
+                num_frames=25,
+                num_inference_steps=2,
+            ),
+            request_id="ltx23-mixed-precomputed-fields",
+        )
+
+        with pytest.raises(ValueError, match="prompt_embeds.*every prompt"):
+            _resolve_request_inputs_for_test(pipe, req)
+
+
 class TestPipelineIndependence:
     """Verify LTX23Pipeline is fully independent from LTX2Pipeline."""
 
@@ -103,6 +252,193 @@ class TestPipelineIndependence:
         from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 
         assert issubclass(LTX23Pipeline, DiffusionPipelineProfilerMixin)
+
+
+class TestLTX23ImageToVideoPipeline:
+    def test_ltx23_i2v_pipeline_reuses_ltx23_semantics(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline, LTX23Pipeline
+
+        assert issubclass(LTX23ImageToVideoPipeline, LTX23Pipeline)
+        assert LTX23ImageToVideoPipeline.support_image_input is True
+
+    def test_ltx23_i2v_rejects_multi_image_prompt_list(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        image = object()
+
+        assert LTX23ImageToVideoPipeline._resolve_single_prompt_image([image]) is image
+        with pytest.raises(ValueError, match="exactly one image per prompt"):
+            LTX23ImageToVideoPipeline._resolve_single_prompt_image([object(), object()])
+
+    def test_ltx23_i2v_additional_image_resolution_is_tensor_safe(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        image = torch.zeros(1, 3, 4, 4)
+        additional = {
+            "preprocessed_image": None,
+            "pixel_values": image,
+            "image": torch.ones_like(image),
+        }
+
+        assert LTX23ImageToVideoPipeline._resolve_additional_image(additional) is image
+
+    def test_ltx23_i2v_packed_latents_are_not_noised(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 1
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+
+        def fake_randn_tensor(shape, generator=None, device=None, dtype=None):
+            raise AssertionError("packed I2V latents should not be noised")
+
+        monkeypatch.setattr(ltx23, "randn_tensor", fake_randn_tensor)
+
+        latents = torch.tensor([[[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]])
+
+        out, conditioning_mask = pipe.prepare_latents(
+            image=None,
+            batch_size=1,
+            num_channels_latents=2,
+            height=1,
+            width=1,
+            num_frames=3,
+            noise_scale=1.0,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            latents=latents,
+        )
+
+        torch.testing.assert_close(conditioning_mask, torch.tensor([[1.0, 0.0, 0.0]]))
+        torch.testing.assert_close(out, latents)
+
+    def test_ltx23_i2v_5d_latents_noise_preserves_conditioning_frame(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2 as ltx2
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 1
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+        pipe.vae = SimpleNamespace(
+            latents_mean=torch.zeros(2),
+            latents_std=torch.ones(2),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+
+        def fake_randn_tensor(shape, generator=None, device=None, dtype=None):
+            return torch.ones(shape, device=device, dtype=dtype)
+
+        monkeypatch.setattr(ltx23, "randn_tensor", fake_randn_tensor)
+        monkeypatch.setattr(ltx2, "randn_tensor", fake_randn_tensor)
+
+        latents = torch.tensor([[[[[10.0]], [[20.0]], [[30.0]]], [[[11.0]], [[21.0]], [[31.0]]]]])
+
+        out, conditioning_mask = pipe.prepare_latents(
+            image=None,
+            batch_size=1,
+            num_channels_latents=2,
+            height=1,
+            width=1,
+            num_frames=3,
+            noise_scale=1.0,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            latents=latents,
+        )
+
+        torch.testing.assert_close(conditioning_mask, torch.tensor([[1.0, 0.0, 0.0]]))
+        torch.testing.assert_close(out, torch.tensor([[[10.0, 11.0], [1.0, 1.0], [1.0, 1.0]]]))
+
+    def test_ltx23_i2v_video_step_preserves_conditioning_frame(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+
+        class FakeScheduler:
+            def step(self, noise_pred, t, latents, return_dict=False):
+                return (latents + noise_pred + t,)
+
+        pipe.scheduler = FakeScheduler()
+        latents = torch.tensor([[[1.0], [2.0], [3.0]]])
+        noise_pred = torch.full_like(latents, 10.0)
+
+        out = pipe._step_video_latents_i2v(
+            noise_pred,
+            latents,
+            torch.tensor(0.5),
+            latent_num_frames=3,
+            latent_height=1,
+            latent_width=1,
+        )
+
+        torch.testing.assert_close(out[:, :1], latents[:, :1])
+        torch.testing.assert_close(out[:, 1:], latents[:, 1:] + noise_pred[:, 1:] + 0.5)
+
+
+class TestLTX23DecodeConditioning:
+    def test_decode_conditioning_expands_per_prompt_values_to_effective_batch(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _expand_per_prompt_decode_value
+
+        assert _expand_per_prompt_decode_value(
+            [0.1, 0.2],
+            prompt_batch_size=2,
+            effective_batch_size=4,
+            field_name="decode_timestep",
+        ) == [0.1, 0.1, 0.2, 0.2]
+        assert _expand_per_prompt_decode_value(
+            [0.3],
+            prompt_batch_size=2,
+            effective_batch_size=4,
+            field_name="decode_timestep",
+        ) == [0.3, 0.3, 0.3, 0.3]
+        assert _expand_per_prompt_decode_value(
+            [0.1, 0.2, 0.3, 0.4],
+            prompt_batch_size=2,
+            effective_batch_size=4,
+            field_name="decode_timestep",
+        ) == [0.1, 0.2, 0.3, 0.4]
+
+    def test_decode_conditioning_rejects_ambiguous_lengths(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _expand_per_prompt_decode_value
+
+        with pytest.raises(ValueError, match="decode_timestep"):
+            _expand_per_prompt_decode_value(
+                [0.1, 0.2, 0.3],
+                prompt_batch_size=2,
+                effective_batch_size=4,
+                field_name="decode_timestep",
+            )
+
+
+class TestLTX23OutputRank:
+    def test_single_process_rank_is_output_rank(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+
+        monkeypatch.setattr(ltx23.torch.distributed, "is_initialized", lambda: False)
+
+        assert ltx23._is_output_rank() is True
+        assert ltx23._should_decode_video_on_rank(SimpleNamespace(is_distributed_enabled=lambda: False)) is True
+
+    def test_non_output_rank_skips_decode_unless_vae_decode_is_distributed(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+
+        monkeypatch.setattr(ltx23.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx23.torch.distributed, "get_rank", lambda: 1)
+
+        assert ltx23._is_output_rank() is False
+        assert ltx23._should_decode_video_on_rank(SimpleNamespace(is_distributed_enabled=lambda: False)) is False
+        assert ltx23._should_decode_video_on_rank(SimpleNamespace(is_distributed_enabled=lambda: True)) is True
 
 
 class TestLTX23VaeDecodeParallel:
