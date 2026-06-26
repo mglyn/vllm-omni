@@ -603,20 +603,29 @@ class CustomDataset(BaseDataset):
 
     def load_data(self) -> None:
         """Load data from JSONL file."""
-        import pandas as pd
-
         if not self.dataset_path.endswith(".jsonl"):
             raise ValueError("Custom dataset must be a JSONL file")
 
+        data: list[dict[str, Any]] = []
         try:
-            df = pd.read_json(path_or_buf=self.dataset_path, lines=True)
+            with open(self.dataset_path, encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        raise ValueError(f"line {line_no} is not a JSON object")
+                    data.append(item)
         except Exception as e:
             raise ValueError(f"Failed to load JSONL file {self.dataset_path}: {e}")
 
-        if "prompt" not in df.columns:
-            raise ValueError("JSONL file must contain a 'prompt' column")
+        if not data:
+            raise ValueError("Custom dataset JSONL is empty")
+        if any("prompt" not in item for item in data):
+            raise ValueError("Each JSONL row must contain a 'prompt' field")
 
-        self.data = df.to_dict("records")
+        self.data = data
         print(f"Loaded {len(self.data)} requests from {self.dataset_path}")
 
     def _resolve_image_paths(self, item: dict) -> list[str] | None:

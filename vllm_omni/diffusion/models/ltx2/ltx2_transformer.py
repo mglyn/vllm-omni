@@ -768,6 +768,8 @@ class LTX2Attention(torch.nn.Module):
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
         disable_kv_quant: bool = False,
+        role: str = "self",
+        role_category: str | None = None,
     ):
         super().__init__()
         # LTX-2 uses "rms_norm_across_heads", LTX-2.3 uses "rms_norm" -- both
@@ -892,6 +894,8 @@ class LTX2Attention(torch.nn.Module):
             causal=False,
             prefix=prefix,
             disable_kv_quant=disable_kv_quant,
+            role=role,
+            role_category=role_category,
         )
 
         # LTX-2.3: per-head gated attention
@@ -1037,6 +1041,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             apply_gated_attention=video_gated_attn,
             quant_config=quant_config,
             prefix=f"{prefix}.attn1" if prefix else "attn1",
+            role="ltx2.video_self",
+            role_category="self",
         )
 
         self.audio_norm1 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -1053,6 +1059,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             apply_gated_attention=audio_gated_attn,
             quant_config=quant_config,
             prefix=f"{prefix}.audio_attn1" if prefix else "audio_attn1",
+            role="ltx2.audio_self",
+            role_category="self",
         )
 
         # 2. Prompt Cross-Attention
@@ -1071,6 +1079,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn2" if prefix else "attn2",
             disable_kv_quant=True,
+            role="ltx2.video_text_cross",
+            role_category="cross",
         )
 
         self.audio_norm2 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -1088,6 +1098,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.audio_attn2" if prefix else "audio_attn2",
             disable_kv_quant=True,
+            role="ltx2.audio_text_cross",
+            role_category="cross",
         )
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
@@ -1107,6 +1119,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             apply_gated_attention=video_gated_attn,
             quant_config=quant_config,
             prefix=f"{prefix}.audio_to_video_attn" if prefix else "audio_to_video_attn",
+            role="ltx2.audio_to_video_cross",
+            role_category="cross",
         )
 
         self.video_to_audio_norm = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -1123,6 +1137,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             apply_gated_attention=audio_gated_attn,
             quant_config=quant_config,
             prefix=f"{prefix}.video_to_audio_attn" if prefix else "video_to_audio_attn",
+            role="ltx2.video_to_audio_cross",
+            role_category="cross",
         )
 
         # 4. Feedforward layers
