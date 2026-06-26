@@ -200,11 +200,18 @@ def _load_model_chat_template_json(model: str) -> str | None:
     return template
 
 
-def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
+def _profiler_config_enables_endpoints(profiler_config: Any) -> bool:
+    profiler = (
+        profiler_config.get("profiler")
+        if isinstance(profiler_config, dict)
+        else getattr(profiler_config, "profiler", None)
+    )
+    return profiler is not None
+
+
+def _should_enable_profiler_endpoints(stage_configs: list | None, args: Any | None = None) -> bool:
     """Check if any stage has profiler_config set in its engine_args."""
-    if not stage_configs:
-        return False
-    for stage in stage_configs:
+    for stage in stage_configs or []:
         engine_args = stage.get("engine_args") if isinstance(stage, dict) else getattr(stage, "engine_args", None)
         if engine_args is None:
             continue
@@ -213,14 +220,23 @@ def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
             if isinstance(engine_args, dict)
             else getattr(engine_args, "profiler_config", None)
         )
-        if profiler_config is not None:
-            profiler = (
-                profiler_config.get("profiler")
-                if isinstance(profiler_config, dict)
-                else getattr(profiler_config, "profiler", None)
-            )
-            if profiler is not None:
-                return True
+        if profiler_config is not None and _profiler_config_enables_endpoints(profiler_config):
+            return True
+
+    stage_overrides = getattr(args, "stage_overrides", None)
+    if stage_overrides:
+        if isinstance(stage_overrides, str):
+            try:
+                stage_overrides = json.loads(stage_overrides)
+            except json.JSONDecodeError:
+                return False
+        if isinstance(stage_overrides, dict):
+            for override in stage_overrides.values():
+                if not isinstance(override, dict):
+                    continue
+                profiler_config = override.get("profiler_config")
+                if profiler_config is not None and _profiler_config_enables_endpoints(profiler_config):
+                    return True
     return False
 
 
@@ -513,7 +529,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        if _should_enable_profiler_endpoints(stage_configs):
+        if _should_enable_profiler_endpoints(stage_configs, args):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
             app.include_router(profiler_router)
 
