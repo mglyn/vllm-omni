@@ -11,8 +11,8 @@ set -euo pipefail
 # Each cell:
 #   1. starts a fresh vLLM-Omni server,
 #   2. runs one same-shape benchmark request as warmup,
-#   3. starts torch profiler,
-#   4. runs measured benchmark request(s),
+#   3. runs measured benchmark request(s) without torch profiler,
+#   4. optionally starts torch profiler and runs a separate trace request,
 #   5. stops profiler and gzips the trace via OmniTorchProfilerWrapper.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +24,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/root/results/ltx23_attn_backend_sweep}"
 
 NUM_PROMPTS="${NUM_PROMPTS:-1}"
 WARMUP_PROMPTS="${WARMUP_PROMPTS:-1}"
+TRACE_PROMPTS="${TRACE_PROMPTS:-1}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 FPS="${FPS:-24}"
 SEED="${SEED:-42}"
@@ -35,9 +36,10 @@ ATTN_MODES="${ATTN_MODES:-baseline text_cross_sdpa all_sdpa}"
 EXEC_MODES="${EXEC_MODES:-eager compile}"
 CASES="${CASES:-512x384x25 1024x576x81}"
 
-# Keep this off by default: the diffusion pipeline profiler adds synchronizes
-# and can distort the timeline. Enable only if stage_0_gen_ms is required.
-ENABLE_PIPELINE_PROFILER="${ENABLE_PIPELINE_PROFILER:-0}"
+# Required for stage_0_gen_ms. Torch profiler is started only after the measured
+# benchmark so summary timings are not polluted by full-stack trace overhead.
+ENABLE_PIPELINE_PROFILER="${ENABLE_PIPELINE_PROFILER:-1}"
+ENABLE_TORCH_TRACE="${ENABLE_TORCH_TRACE:-1}"
 
 PROMPT="${PROMPT:-Floating crystal islands in cosmic starry sky, glowing nebula, soft luminous particles flowing around, slow camera rotation}"
 NEG_PROMPT="${NEG_PROMPT:-low quality, blurry, noise, watermark, text, deformed figures, cartoon style, over-saturated color, frame jump}"
@@ -202,7 +204,7 @@ raw_dir = root / "raw"
 summary = root / "summary.tsv"
 rows = []
 for path in sorted(raw_dir.glob("*.json")):
-    if path.name.startswith("warmup_"):
+    if path.name.startswith(("warmup_", "trace_")):
         continue
     with path.open() as f:
         data = json.load(f)
@@ -218,15 +220,17 @@ for path in sorted(raw_dir.glob("*.json")):
             break
     if not attention:
         continue
+    stage_mean = data.get("stage_durations_mean", {}) or {}
+    stage_p50 = data.get("stage_durations_p50", {}) or {}
+    stage_p99 = data.get("stage_durations_p99", {}) or {}
     rows.append(
         {
             "attention": attention,
             "exec": exec_mode,
             "case": case,
-            "stage_0_gen_ms_mean": data.get("stage_0_gen_ms_mean", ""),
-            "stage_0_gen_ms_p50": data.get("stage_0_gen_ms_p50", ""),
-            "stage_0_gen_ms_p99": data.get("stage_0_gen_ms_p99", ""),
-            "serving_latency_mean_s": data.get("latency_mean", ""),
+            "stage_0_gen_ms_mean": stage_mean.get("stage_0_gen_ms", ""),
+            "stage_0_gen_ms_p50": stage_p50.get("stage_0_gen_ms", ""),
+            "stage_0_gen_ms_p99": stage_p99.get("stage_0_gen_ms", ""),
             "peak_memory_mb_mean": data.get("peak_memory_mb_mean", ""),
             "completed": data.get("completed_requests", ""),
             "failed": data.get("failed_requests", ""),
@@ -241,7 +245,6 @@ fieldnames = [
     "stage_0_gen_ms_mean",
     "stage_0_gen_ms_p50",
     "stage_0_gen_ms_p99",
-    "serving_latency_mean_s",
     "peak_memory_mb_mean",
     "completed",
     "failed",
@@ -340,16 +343,21 @@ run_cell() {
     echo "[Warmup] same shape, prompts=$WARMUP_PROMPTS"
     run_benchmark "$port" "$dataset_file" "$WARMUP_PROMPTS" "$warmup_json" "$warmup_log"
 
-    echo "[Profile] start"
-    post_profile "$port" start_profile
-
     local result_json="$raw_dir/${cell}.json"
     local result_log="$log_dir/bench_${cell}.log"
-    echo "[Benchmark] measured prompts=$NUM_PROMPTS"
+    echo "[Benchmark] measured prompts=$NUM_PROMPTS (torch profiler off)"
     run_benchmark "$port" "$dataset_file" "$NUM_PROMPTS" "$result_json" "$result_log"
 
-    echo "[Profile] stop"
-    post_profile "$port" stop_profile
+    if [[ "$ENABLE_TORCH_TRACE" == "1" ]]; then
+        local trace_json="$raw_dir/trace_${cell}.json"
+        local trace_log="$log_dir/trace_${cell}.log"
+        echo "[Profile] start"
+        post_profile "$port" start_profile
+        echo "[Trace] prompts=$TRACE_PROMPTS (excluded from summary)"
+        run_benchmark "$port" "$dataset_file" "$TRACE_PROMPTS" "$trace_json" "$trace_log"
+        echo "[Profile] stop"
+        post_profile "$port" stop_profile
+    fi
     cleanup_server
 }
 
@@ -363,8 +371,9 @@ main() {
     echo "Attention:   $ATTN_MODES"
     echo "Exec modes:  $EXEC_MODES"
     echo "Cases:       $CASES"
-    echo "Runs/cell:   warmup=$WARMUP_PROMPTS measured=$NUM_PROMPTS steps=$NUM_INFERENCE_STEPS"
-    echo "Profiler:    torch with stack, gzip, memory=false"
+    echo "Runs/cell:   warmup=$WARMUP_PROMPTS measured=$NUM_PROMPTS trace=$TRACE_PROMPTS steps=$NUM_INFERENCE_STEPS"
+    echo "Stage ms:    ENABLE_PIPELINE_PROFILER=$ENABLE_PIPELINE_PROFILER"
+    echo "Trace:       ENABLE_TORCH_TRACE=$ENABLE_TORCH_TRACE, torch with stack, gzip, memory=false"
     if [[ "$ENABLE_PIPELINE_PROFILER" != "1" ]]; then
         echo "Stage ms:    disabled; set ENABLE_PIPELINE_PROFILER=1 if stage_0_gen_ms is required"
     fi
