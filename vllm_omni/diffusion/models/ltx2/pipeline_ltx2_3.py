@@ -44,6 +44,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -1102,6 +1103,7 @@ class LTX23Pipeline(
                     continue
 
                 self._current_timestep = t
+                set_forward_context_denoise_step_idx(i)
 
                 if cfg_parallel_ready:
                     latent_model_input = latents.to(positive_connector_prompt_embeds.dtype)
@@ -1211,6 +1213,8 @@ class LTX23Pipeline(
                     audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
 
                 pbar.update()
+
+        set_forward_context_denoise_step_idx(None)
 
         # ---- Unpack and denormalize ----
         latents = self._unpack_latents(

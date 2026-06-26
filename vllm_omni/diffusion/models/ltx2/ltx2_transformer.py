@@ -14,8 +14,11 @@
 # limitations under the License.
 
 import inspect
+import json
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +56,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 logger = init_logger(__name__)
 
 _RMSNORM_INIT_PARAMS = inspect.signature(RMSNorm.__init__).parameters
+_LTX2_TRACE_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 
 def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) -> nn.Module:
@@ -75,6 +79,206 @@ def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) ->
         delattr(norm, "weight")
         norm.register_buffer("weight", weight, persistent=False)
     return norm
+
+
+def _ltx2_env_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in _LTX2_TRACE_FALSE_ENV_VALUES
+
+
+def _ltx2_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning_once("Invalid integer for %s=%r; using %d.", name, value, default)
+        return default
+
+
+def _ltx2_current_rank() -> str:
+    return os.getenv("RANK") or os.getenv("LOCAL_RANK") or "0"
+
+
+def _ltx2_trace_rank_matches() -> bool:
+    target_rank = os.getenv("VLLM_OMNI_LTX2_TRACE_RANK", "0").strip().lower()
+    if target_rank in {"*", "all"}:
+        return True
+    return _ltx2_current_rank() == target_rank
+
+
+def _ltx2_tensor_meta(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "stride": list(value.stride()),
+            "numel": value.numel(),
+            "storage_offset": value.storage_offset(),
+            "is_contiguous": value.is_contiguous(),
+            "requires_grad": value.requires_grad,
+        }
+    if isinstance(value, tuple):
+        return [_ltx2_tensor_meta(item) for item in value]
+    if isinstance(value, list):
+        return [_ltx2_tensor_meta(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _ltx2_tensor_meta(item) for key, item in value.items()}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return {"type": type(value).__name__, "repr": repr(value)[:200]}
+
+
+def _ltx2_forward_context_meta() -> dict[str, Any]:
+    meta: dict[str, Any] = {"available": is_forward_context_available()}
+    if not is_forward_context_available():
+        return meta
+
+    context = get_forward_context()
+    meta["denoise_step_idx"] = context.denoise_step_idx
+    try:
+        meta["sp_active"] = context.sp_active
+    except Exception as exc:
+        meta["sp_active_error"] = repr(exc)
+
+    diffusion_config = context.omni_diffusion_config
+    parallel_config = getattr(diffusion_config, "parallel_config", None)
+    if parallel_config is not None:
+        meta["parallel_config"] = {
+            "sequence_parallel_size": getattr(parallel_config, "sequence_parallel_size", None),
+            "tensor_parallel_size": getattr(parallel_config, "tensor_parallel_size", None),
+            "cfg_parallel_size": getattr(parallel_config, "cfg_parallel_size", None),
+            "ulysses_degree": getattr(parallel_config, "ulysses_degree", None),
+            "ring_degree": getattr(parallel_config, "ring_degree", None),
+        }
+    return meta
+
+
+def _ltx2_attention_backend_meta(block: nn.Module) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    for name in (
+        "attn1",
+        "audio_attn1",
+        "attn2",
+        "audio_attn2",
+        "audio_to_video_attn",
+        "video_to_audio_attn",
+    ):
+        module = getattr(block, name, None)
+        if module is None:
+            continue
+        module_meta: dict[str, Any] = {"type": type(module).__name__}
+        processor = getattr(module, "processor", None)
+        if processor is not None:
+            module_meta["processor"] = type(processor).__name__
+        attention = getattr(module, "attn", None)
+        backend = getattr(attention, "attn_backend", None)
+        if backend is not None:
+            try:
+                module_meta["backend"] = backend.get_name()
+            except Exception as exc:
+                module_meta["backend_error"] = repr(exc)
+        meta[name] = module_meta
+    return meta
+
+
+def _ltx2_should_trace_block(block_idx: int, forward_idx: int | None) -> bool:
+    if not _ltx2_env_enabled("VLLM_OMNI_LTX2_TRACE_BLOCK"):
+        return False
+    if not _ltx2_trace_rank_matches():
+        return False
+    if block_idx != _ltx2_env_int("VLLM_OMNI_LTX2_TRACE_BLOCK_INDEX", 0):
+        return False
+
+    target_forward = os.getenv("VLLM_OMNI_LTX2_TRACE_FORWARD_INDEX")
+    if target_forward is not None:
+        try:
+            target_forward_idx = int(target_forward)
+        except ValueError:
+            logger.warning_once("Invalid VLLM_OMNI_LTX2_TRACE_FORWARD_INDEX=%r; skipping trace.", target_forward)
+            return False
+        if forward_idx != target_forward_idx:
+            return False
+
+    target_step = os.getenv("VLLM_OMNI_LTX2_TRACE_DENOISE_STEP")
+    if target_step is not None:
+        if not is_forward_context_available():
+            return False
+        try:
+            target_step_idx = int(target_step)
+        except ValueError:
+            logger.warning_once("Invalid VLLM_OMNI_LTX2_TRACE_DENOISE_STEP=%r; skipping trace.", target_step)
+            return False
+        return get_forward_context().denoise_step_idx == target_step_idx
+
+    target_forward_idx = _ltx2_env_int("VLLM_OMNI_LTX2_TRACE_FORWARD_INDEX", 0)
+    return forward_idx == target_forward_idx
+
+
+def _ltx2_trace_block_call(
+    *,
+    module: nn.Module,
+    block: nn.Module,
+    block_idx: int,
+    forward_idx: int | None,
+    call_fn,
+    input_meta: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    trace_dir = Path(os.getenv("VLLM_OMNI_LTX2_TRACE_DIR", "/root/results/ltx2_real_block_trace"))
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    context_meta = _ltx2_forward_context_meta()
+    step_idx = context_meta.get("denoise_step_idx")
+    rank = _ltx2_current_rank()
+    stem = f"ltx2_real_block_f{forward_idx}_s{step_idx}_b{block_idx}_rank{rank}"
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    with profile(
+        activities=activities,
+        record_shapes=_ltx2_env_enabled("VLLM_OMNI_LTX2_TRACE_RECORD_SHAPES", True),
+        profile_memory=_ltx2_env_enabled("VLLM_OMNI_LTX2_TRACE_PROFILE_MEMORY", False),
+        with_stack=_ltx2_env_enabled("VLLM_OMNI_LTX2_TRACE_WITH_STACK", True),
+    ) as prof:
+        with record_function(f"ltx2.real_block.{block_idx}"):
+            output = call_fn()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    trace_path = trace_dir / f"{stem}.json"
+    meta_path = trace_dir / f"{stem}.meta.json"
+    prof.export_chrome_trace(str(trace_path))
+
+    metadata = {
+        "trace_path": str(trace_path),
+        "block_index": block_idx,
+        "forward_index": forward_idx,
+        "rank": rank,
+        "context": context_meta,
+        "block_type": type(block).__name__,
+        "forward_type": repr(getattr(block, "forward", None))[:400],
+        "attention": _ltx2_attention_backend_meta(block),
+        "inputs": input_meta,
+        "outputs": {
+            "hidden_states": _ltx2_tensor_meta(output[0]),
+            "audio_hidden_states": _ltx2_tensor_meta(output[1]),
+        },
+    }
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
+    setattr(module, "_ltx2_trace_block_captured", True)
+    print(f"LTX2 real block trace exported: {trace_path}", flush=True)
+    print(f"LTX2 real block metadata exported: {meta_path}", flush=True)
+    return output
 
 
 def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -1968,7 +2172,13 @@ class LTX2VideoTransformer3DModel(nn.Module):
             audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
         # 5. Run transformer blocks
-        for block in self.transformer_blocks:
+        ltx2_trace_forward_idx = None
+        ltx2_trace_enabled = _ltx2_env_enabled("VLLM_OMNI_LTX2_TRACE_BLOCK")
+        if ltx2_trace_enabled:
+            ltx2_trace_forward_idx = getattr(self, "_ltx2_trace_forward_idx", 0)
+            self._ltx2_trace_forward_idx = ltx2_trace_forward_idx + 1
+
+        for block_idx, block in enumerate(self.transformer_blocks):
             block_kwargs = {
                 "temb": temb,
                 "temb_audio": temb_audio,
@@ -1989,23 +2199,69 @@ class LTX2VideoTransformer3DModel(nn.Module):
             # because CacheDiT expects the first 2 args to be hidden_states
             # and encoder_hidden_states, so passing them as kwargs will cause
             # positional / keywords arg collisions.
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
-                    block,
+            if not ltx2_trace_enabled:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
+                        block,
+                        hidden_states,
+                        audio_hidden_states,
+                        encoder_hidden_states,
+                        audio_encoder_hidden_states,
+                        **block_kwargs,
+                    )
+                else:
+                    hidden_states, audio_hidden_states = block(
+                        hidden_states,
+                        audio_hidden_states,
+                        encoder_hidden_states,
+                        audio_encoder_hidden_states,
+                        **block_kwargs,
+                    )
+                continue
+
+            def call_block() -> tuple[torch.Tensor, torch.Tensor]:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    return self._gradient_checkpointing_func(
+                        block,
+                        hidden_states,
+                        audio_hidden_states,
+                        encoder_hidden_states,
+                        audio_encoder_hidden_states,
+                        **block_kwargs,
+                    )
+                return block(
                     hidden_states,
                     audio_hidden_states,
                     encoder_hidden_states,
                     audio_encoder_hidden_states,
                     **block_kwargs,
+                )
+
+            trace_already_captured = getattr(self, "_ltx2_trace_block_captured", False)
+            trace_once = _ltx2_env_enabled("VLLM_OMNI_LTX2_TRACE_ONCE", True)
+            should_trace_block = (
+                ltx2_trace_enabled
+                and not (trace_once and trace_already_captured)
+                and _ltx2_should_trace_block(block_idx, ltx2_trace_forward_idx)
+            )
+            if should_trace_block:
+                input_meta = {
+                    "hidden_states": _ltx2_tensor_meta(hidden_states),
+                    "audio_hidden_states": _ltx2_tensor_meta(audio_hidden_states),
+                    "encoder_hidden_states": _ltx2_tensor_meta(encoder_hidden_states),
+                    "audio_encoder_hidden_states": _ltx2_tensor_meta(audio_encoder_hidden_states),
+                    "block_kwargs": _ltx2_tensor_meta(block_kwargs),
+                }
+                hidden_states, audio_hidden_states = _ltx2_trace_block_call(
+                    module=self,
+                    block=block,
+                    block_idx=block_idx,
+                    forward_idx=ltx2_trace_forward_idx,
+                    call_fn=call_block,
+                    input_meta=input_meta,
                 )
             else:
-                hidden_states, audio_hidden_states = block(
-                    hidden_states,
-                    audio_hidden_states,
-                    encoder_hidden_states,
-                    audio_encoder_hidden_states,
-                    **block_kwargs,
-                )
+                hidden_states, audio_hidden_states = call_block()
         # 6. Output layers (including unpatchification)
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
