@@ -75,6 +75,27 @@ except ImportError:
     LTX2VocoderWithBWE = None
 
 
+def _setup_ltx23_regional_compile(pipeline: nn.Module) -> None:
+    # LTX-2.3 prompt cross-attention uses FlashAttention varlen unpadding.
+    # Capturing dynamic output shape ops keeps the repeated transformer block
+    # in one compiled region instead of splitting around nonzero()/item().
+    torch._dynamo.config.capture_dynamic_output_shape_ops = True
+    torch._dynamo.config.capture_scalar_outputs = True
+
+    from vllm_omni.diffusion.compile import regionally_compile
+
+    transformer = getattr(pipeline, "transformer", None)
+    if transformer is None:
+        return
+    for block in getattr(transformer, "transformer_blocks", []):
+        for attr in ("attn2", "audio_attn2"):
+            attention = getattr(block, attr, None)
+            if attention is not None:
+                attention.force_flash_varlen_mask = True
+    pipeline.transformer = regionally_compile(transformer, dynamic=True)
+    logger.info("LTX-2.3 transformer compiled with dynamic output shape capture.")
+
+
 def _detect_vocoder_output_sample_rate(model: str) -> int | None:
     """Detect the vocoder output sample rate from vocoder/config.json.
 
@@ -144,6 +165,9 @@ class LTX23Pipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "connectors"]
     _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
     _resident_modules: ClassVar[list[str]] = ["vocoder"]
+
+    def setup_compile(self) -> None:
+        _setup_ltx23_regional_compile(self)
 
     def __init__(
         self,

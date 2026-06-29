@@ -49,10 +49,12 @@ from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 _RMSNORM_INIT_PARAMS = inspect.signature(RMSNorm.__init__).parameters
+_LTX2_FORCE_VARLEN_MASK_KEY = "ltx2_force_varlen_mask"
 
 
 def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) -> nn.Module:
@@ -75,6 +77,27 @@ def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) ->
         delattr(norm, "weight")
         norm.register_buffer("weight", weight, persistent=False)
     return norm
+
+
+class LTX2AttentionLayer(Attention):
+    def _run_local_attention(self, query, key, value, attn_metadata):
+        if (
+            query.dtype != torch.float32
+            and attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and attn_metadata.extra.get(_LTX2_FORCE_VARLEN_MASK_KEY, False)
+            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and (
+                current_omni_platform.is_cuda()
+                or current_omni_platform.is_rocm()
+                or current_omni_platform.is_musa()
+                or current_omni_platform.is_xpu()
+            )
+            and hasattr(self.attention, "_forward_varlen_masked")
+        ):
+            return self.attention._forward_varlen_masked(query, key, value, attn_metadata.attn_mask)
+
+        return super()._run_local_attention(query, key, value, attn_metadata)
 
 
 def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -516,7 +539,12 @@ class LTX2AudioVideoAttnProcessor:
         key = key.unflatten(2, (attn.heads, attn.head_dim))
         value = value.unflatten(2, (attn.heads, attn.head_dim))
 
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = None
+        if attention_mask is not None:
+            extra = {}
+            if attn.force_flash_varlen_mask and torch.compiler.is_compiling():
+                extra[_LTX2_FORCE_VARLEN_MASK_KEY] = True
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask, extra=extra)
         hidden_states = attn.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -564,6 +592,7 @@ class LTX2Attention(torch.nn.Module):
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
         disable_kv_quant: bool = False,
+        force_flash_varlen_mask: bool = False,
     ):
         super().__init__()
         # LTX-2 uses "rms_norm_across_heads", LTX-2.3 uses "rms_norm" -- both
@@ -586,6 +615,7 @@ class LTX2Attention(torch.nn.Module):
         self.total_num_heads = heads
         self.total_num_kv_heads = kv_heads
         self.rope_type = rope_type
+        self.force_flash_varlen_mask = force_flash_varlen_mask
 
         self.to_qkv = None
         self.to_q = None
@@ -680,7 +710,7 @@ class LTX2Attention(torch.nn.Module):
                 torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity(),
             ]
         )
-        self.attn = Attention(
+        self.attn = LTX2AttentionLayer(
             num_heads=self.query_num_heads,
             head_size=dim_head,
             num_kv_heads=self.kv_num_heads,
