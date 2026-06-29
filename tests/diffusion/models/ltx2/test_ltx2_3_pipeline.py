@@ -105,6 +105,63 @@ class TestPipelineIndependence:
         assert issubclass(LTX23Pipeline, DiffusionPipelineProfilerMixin)
 
 
+class TestConnectorMaskElision:
+    """Test LTX-2.3 connector-mask handling without loading weights."""
+
+    @pytest.mark.parametrize(
+        "connectors",
+        [
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    video_connector_num_learnable_registers=128,
+                    audio_connector_num_learnable_registers=128,
+                )
+            ),
+            SimpleNamespace(
+                config={
+                    "video_connector_num_learnable_registers": 128,
+                    "audio_connector_num_learnable_registers": 128,
+                }
+            ),
+        ],
+    )
+    def test_elides_denoise_mask_when_connectors_use_learned_registers(self, connectors):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        pipe = object.__new__(LTX23Pipeline)
+        object.__setattr__(pipe, "connectors", connectors)
+        mask = torch.ones(2, 4, dtype=torch.int64)
+
+        assert pipe._get_denoise_connector_attention_mask(mask) is None
+
+    @pytest.mark.parametrize(
+        "connectors",
+        [
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    video_connector_num_learnable_registers=None,
+                    audio_connector_num_learnable_registers=128,
+                )
+            ),
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    video_connector_num_learnable_registers=128,
+                    audio_connector_num_learnable_registers=None,
+                )
+            ),
+            SimpleNamespace(config=SimpleNamespace()),
+        ],
+    )
+    def test_keeps_denoise_mask_without_learned_registers(self, connectors):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        pipe = object.__new__(LTX23Pipeline)
+        object.__setattr__(pipe, "connectors", connectors)
+        mask = torch.ones(2, 4, dtype=torch.int64)
+
+        assert pipe._get_denoise_connector_attention_mask(mask) is mask
+
+
 class TestLTX23VaeDecodeParallel:
     """Test LTX-2.3 video VAE tiled parallel helpers without loading weights."""
 
@@ -646,6 +703,11 @@ class TestCFGParallelForwardPath:
                 return (latents - noise_pred,)
 
         class FakeConnectors:
+            config = SimpleNamespace(
+                video_connector_num_learnable_registers=128,
+                audio_connector_num_learnable_registers=128,
+            )
+
             def to(self, device):
                 return self
 
@@ -676,6 +738,8 @@ class TestCFGParallelForwardPath:
                 expected_prompt = torch.full((1, 1, 1), expected_prompt_value)
                 torch.testing.assert_close(kwargs["encoder_hidden_states"], expected_prompt)
                 torch.testing.assert_close(kwargs["audio_encoder_hidden_states"], expected_prompt)
+                assert kwargs["encoder_attention_mask"] is None
+                assert kwargs["audio_encoder_attention_mask"] is None
                 assert kwargs["hidden_states"].shape == (1, 1, 2)
                 assert kwargs["audio_hidden_states"].shape == (1, 1, 2)
                 if cfg_rank == 0:

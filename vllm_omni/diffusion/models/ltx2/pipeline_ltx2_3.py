@@ -299,6 +299,44 @@ class LTX23Pipeline(
         for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):
             module.to(self.device)
 
+    @staticmethod
+    def _connectors_use_learned_registers(connectors: Any) -> bool:
+        """Return whether both LTX-2.3 connectors replace padding with registers."""
+
+        def has_registers(value: Any) -> bool:
+            if isinstance(value, int):
+                return value > 0
+            return value is not None
+
+        def get_config_value(config: Any, key: str) -> Any:
+            if config is None:
+                return None
+            if isinstance(config, dict):
+                return config.get(key)
+            return getattr(config, key, None)
+
+        config = getattr(connectors, "config", None)
+        video_registers = get_config_value(config, "video_connector_num_learnable_registers")
+        audio_registers = get_config_value(config, "audio_connector_num_learnable_registers")
+        if video_registers is not None or audio_registers is not None:
+            return has_registers(video_registers) and has_registers(audio_registers)
+
+        video_connector = getattr(connectors, "video_connector", None)
+        audio_connector = getattr(connectors, "audio_connector", None)
+        return (
+            getattr(video_connector, "learnable_registers", None) is not None
+            and getattr(audio_connector, "learnable_registers", None) is not None
+        )
+
+    def _get_denoise_connector_attention_mask(
+        self, connector_attention_mask: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        if connector_attention_mask is None:
+            return None
+        if self._connectors_use_learned_registers(self.connectors):
+            return None
+        return connector_attention_mask
+
     # ------------------------------------------------------------------
     # Text Encoding (LTX-2.3 specific)
     # ------------------------------------------------------------------
@@ -999,10 +1037,11 @@ class LTX23Pipeline(
         connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
             prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
         )
+        denoise_connector_attention_mask = self._get_denoise_connector_attention_mask(connector_attention_mask)
 
         positive_connector_prompt_embeds = connector_prompt_embeds
         positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds
-        positive_connector_attention_mask = connector_attention_mask
+        positive_connector_attention_mask = denoise_connector_attention_mask
         negative_connector_prompt_embeds = None
         negative_connector_audio_prompt_embeds = None
         negative_connector_attention_mask = None
@@ -1012,8 +1051,9 @@ class LTX23Pipeline(
             positive_connector_prompt_embeds = connector_prompt_embeds[split_batch:]
             negative_connector_audio_prompt_embeds = connector_audio_prompt_embeds[:split_batch]
             positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds[split_batch:]
-            negative_connector_attention_mask = connector_attention_mask[:split_batch]
-            positive_connector_attention_mask = connector_attention_mask[split_batch:]
+            if denoise_connector_attention_mask is not None:
+                negative_connector_attention_mask = denoise_connector_attention_mask[:split_batch]
+                positive_connector_attention_mask = denoise_connector_attention_mask[split_batch:]
 
         # ---- Prepare latents ----
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
@@ -1183,8 +1223,8 @@ class LTX23Pipeline(
                             audio_encoder_hidden_states=connector_audio_prompt_embeds,
                             timestep=ts,
                             sigma=ts,  # LTX-2.3: sigma for prompt_adaln
-                            encoder_attention_mask=connector_attention_mask,
-                            audio_encoder_attention_mask=connector_attention_mask,
+                            encoder_attention_mask=denoise_connector_attention_mask,
+                            audio_encoder_attention_mask=denoise_connector_attention_mask,
                             num_frames=latent_num_frames,
                             height=latent_height,
                             width=latent_width,
