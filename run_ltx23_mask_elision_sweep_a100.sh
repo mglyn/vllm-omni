@@ -28,7 +28,6 @@ PROFILES="${PROFILES:-base cfg2}"
 
 NUM_PROMPTS="${NUM_PROMPTS:-10}"
 WARMUP_PROMPTS="${WARMUP_PROMPTS:-1}"
-TRACE_PROMPTS="${TRACE_PROMPTS:-1}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-4.0}"
 FPS="${FPS:-24}"
@@ -43,10 +42,6 @@ EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 # Required if you want stage_0_gen_ms in benchmark JSON.
 # Disable only when measuring serving wall latency without the pipeline profiler.
 ENABLE_PIPELINE_PROFILER="${ENABLE_PIPELINE_PROFILER:-1}"
-
-# Optional separate trace request after measured runs. This is intentionally not
-# part of the measured benchmark because full stack traces perturb timings.
-ENABLE_TORCH_TRACE="${ENABLE_TORCH_TRACE:-0}"
 
 PROMPT="${PROMPT:-Floating crystal islands in cosmic starry sky, glowing nebula, soft luminous particles flowing around, slow camera rotation}"
 NEG_PROMPT="${NEG_PROMPT:-low quality, blurry, noise, watermark, text, deformed figures, cartoon style, over-saturated color, frame jump}"
@@ -87,30 +82,6 @@ s.close()
 PY
 }
 
-json_stage_overrides() {
-    local trace_dir="$1"
-    "$PYTHON" - "$trace_dir" <<'PY'
-import json
-import sys
-
-trace_dir = sys.argv[1]
-cfg = {
-    "0": {
-        "profiler_config": {
-            "profiler": "torch",
-            "torch_profiler_dir": trace_dir,
-            "torch_profiler_record_shapes": True,
-            "torch_profiler_with_stack": True,
-            "torch_profiler_with_memory": False,
-            "torch_profiler_with_flops": False,
-            "torch_profiler_use_gzip": True,
-        }
-    }
-}
-print(json.dumps(cfg, separators=(",", ":")))
-PY
-}
-
 wait_for_server() {
     local port="$1"
     local log_file="$2"
@@ -131,16 +102,6 @@ wait_for_server() {
     echo "Timed out waiting for server. Log: $log_file" >&2
     tail -n 200 "$log_file" >&2 || true
     return 1
-}
-
-post_profile() {
-    local port="$1"
-    local action="$2"
-    curl -fsS \
-        -X POST \
-        -H "Content-Type: application/json" \
-        -d '{"stages":[0]}' \
-        "http://$HOST:$port/$action" >/dev/null
 }
 
 make_dataset() {
@@ -263,6 +224,10 @@ def stage_value(data, stat):
         if key in data and data[key] is not None:
             return data[key]
 
+    stage_durations = data.get(f"stage_durations_{stat}") or {}
+    if isinstance(stage_durations, dict) and stage_durations.get("stage_0_gen_ms") is not None:
+        return stage_durations["stage_0_gen_ms"]
+
     stage_stats = data.get("stage_stats") or data.get("stage_metrics") or {}
     for stage_key in ("0", 0, "stage_0"):
         stage = stage_stats.get(stage_key) if isinstance(stage_stats, dict) else None
@@ -290,7 +255,7 @@ def to_float(value):
 
 rows = []
 for path in sorted(raw_dir.glob("*.json")):
-    if path.name.startswith(("warmup__", "trace__")):
+    if path.name.startswith("warmup__"):
         continue
     parts = path.stem.split("__", 3)
     if len(parts) != 4:
@@ -403,7 +368,6 @@ start_server() {
     local profile="$2"
     local port="$3"
     local log_file="$4"
-    local trace_dir="$5"
 
     SERVER_CMD=(
         "$PYTHON" -m vllm_omni.entrypoints.cli.main serve "$MODEL"
@@ -424,9 +388,6 @@ start_server() {
     fi
     if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
         SERVER_CMD+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
-    fi
-    if [[ "$ENABLE_TORCH_TRACE" == "1" ]]; then
-        SERVER_CMD+=(--stage-overrides "$(json_stage_overrides "$trace_dir")")
     fi
 
     append_profile_server_args "$profile"
@@ -452,23 +413,18 @@ run_cell() {
     local dataset_file="$OUTPUT_ROOT/datasets/${case_label}.jsonl"
     local warmup_json="$OUTPUT_ROOT/raw/warmup__${cell}.json"
     local measured_json="$OUTPUT_ROOT/raw/${cell}.json"
-    local trace_json="$OUTPUT_ROOT/raw/trace__${cell}.json"
     local warmup_log="$OUTPUT_ROOT/logs/warmup__${cell}.log"
     local measured_log="$OUTPUT_ROOT/logs/${cell}.log"
-    local trace_log="$OUTPUT_ROOT/logs/trace__${cell}.log"
     local server_log="$OUTPUT_ROOT/logs/server__${cell}.log"
-    local trace_dir="$OUTPUT_ROOT/traces/${cell}"
 
     make_dataset "$dataset_file" "$width" "$height" "$frames"
-    rm -rf "$trace_dir"
-    mkdir -p "$trace_dir"
 
     echo
     echo "===== $cell ====="
     echo "dataset: $dataset_file"
     echo "raw json: $measured_json"
 
-    start_server "$exec_mode" "$profile" "$port" "$server_log" "$trace_dir"
+    start_server "$exec_mode" "$profile" "$port" "$server_log"
     wait_for_server "$port" "$server_log"
 
     if (( WARMUP_PROMPTS > 0 )); then
@@ -479,20 +435,18 @@ run_cell() {
     echo "[Measured] prompts=$NUM_PROMPTS"
     run_benchmark "$port" "$dataset_file" "$NUM_PROMPTS" "$measured_json" "$measured_log"
 
-    if [[ "$ENABLE_TORCH_TRACE" == "1" ]]; then
-        echo "[Trace] prompts=$TRACE_PROMPTS dir=$trace_dir"
-        post_profile "$port" start_profile
-        run_benchmark "$port" "$dataset_file" "$TRACE_PROMPTS" "$trace_json" "$trace_log"
-        post_profile "$port" stop_profile
-    fi
-
     cleanup_server
     summarize_results
 }
 
 main() {
     require_python
-    mkdir -p "$OUTPUT_ROOT"/{datasets,logs,raw,traces}
+    mkdir -p "$OUTPUT_ROOT"/{datasets,logs,raw}
+
+    if [[ "${1:-}" == "--summarize-only" ]]; then
+        summarize_results
+        return 0
+    fi
 
     echo "Output root: $OUTPUT_ROOT"
     echo "Label:       $LABEL"
@@ -503,7 +457,6 @@ main() {
     echo "Exec modes:  $EXEC_MODES"
     echo "Profiles:    $PROFILES"
     echo "Runs/cell:   warmup=$WARMUP_PROMPTS measured=$NUM_PROMPTS steps=$NUM_INFERENCE_STEPS"
-    echo "Trace:       $ENABLE_TORCH_TRACE"
     echo
 
     local exec_mode profile case_spec
