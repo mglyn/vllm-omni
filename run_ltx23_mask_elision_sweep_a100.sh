@@ -11,8 +11,9 @@ set -euo pipefail
 #   LABEL=after bash ./run_ltx23_mask_elision_sweep_a100.sh
 #
 # The script does not switch git branches. It measures the current checkout.
-# Use stage_0_gen_ms as the primary metric. End-to-end serving latency includes
-# polling / response overhead and is kept only as supporting context.
+# Default scope is the small single-GPU compile A/B cell. Use stage_0_gen_ms as
+# the primary metric. End-to-end serving latency includes polling / response
+# overhead and is kept only as supporting context.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
@@ -22,9 +23,9 @@ HOST="${HOST:-127.0.0.1}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/results/ltx23_mask_elision_sweep}"
 LABEL="${LABEL:-$(git -C "$ROOT_DIR" branch --show-current 2>/dev/null || git -C "$ROOT_DIR" rev-parse --short HEAD)}"
 
-CASES="${CASES:-512x384x25 1024x576x81}"
-EXEC_MODES="${EXEC_MODES:-compile eager}"
-PROFILES="${PROFILES:-base cfg2}"
+CASES="${CASES:-512x384x25}"
+EXEC_MODES="${EXEC_MODES:-compile}"
+PROFILES="${PROFILES:-base}"
 
 NUM_PROMPTS="${NUM_PROMPTS:-10}"
 WARMUP_PROMPTS="${WARMUP_PROMPTS:-1}"
@@ -39,9 +40,9 @@ SERVER_TIMEOUT_S="${SERVER_TIMEOUT_S:-1800}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 
-# Required if you want stage_0_gen_ms in benchmark JSON.
-# Disable only when measuring serving wall latency without the pipeline profiler.
-ENABLE_PIPELINE_PROFILER="${ENABLE_PIPELINE_PROFILER:-1}"
+# Keep pipeline sub-stage profiling disabled by default. stage_0_gen_ms comes
+# from stage metrics; the pipeline profiler adds per-module synchronization.
+ENABLE_PIPELINE_PROFILER="${ENABLE_PIPELINE_PROFILER:-0}"
 
 PROMPT="${PROMPT:-Floating crystal islands in cosmic starry sky, glowing nebula, soft luminous particles flowing around, slow camera rotation}"
 NEG_PROMPT="${NEG_PROMPT:-low quality, blurry, noise, watermark, text, deformed figures, cartoon style, over-saturated color, frame jump}"
