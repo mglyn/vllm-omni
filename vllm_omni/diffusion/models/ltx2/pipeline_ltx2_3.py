@@ -61,6 +61,9 @@ from .pipeline_ltx2 import (
 
 logger = init_logger(__name__)
 
+LTX23_DISABLE_MASK_ELISION_ENV = "VLLM_OMNI_LTX23_DISABLE_MASK_ELISION"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
 
 def _get_audio_latents_from_sampling(sampling: Any) -> torch.Tensor | None:
     if sampling.audio_latents is not None:
@@ -333,6 +336,8 @@ class LTX23Pipeline(
     ) -> torch.Tensor | None:
         if connector_attention_mask is None:
             return None
+        if os.getenv(LTX23_DISABLE_MASK_ELISION_ENV, "").strip().lower() in _TRUE_ENV_VALUES:
+            return connector_attention_mask
         if self._connectors_use_learned_registers(self.connectors):
             return None
         return connector_attention_mask

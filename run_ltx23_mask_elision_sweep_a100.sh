@@ -43,6 +43,21 @@ EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 # Keep pipeline sub-stage profiling disabled by default. stage_0_gen_ms comes
 # from stage metrics; the pipeline profiler adds per-module synchronization.
 ENABLE_PIPELINE_PROFILER="${ENABLE_PIPELINE_PROFILER:-0}"
+LTX23_DISABLE_MASK_ELISION="${VLLM_OMNI_LTX23_DISABLE_MASK_ELISION:-}"
+if [[ -z "$LTX23_DISABLE_MASK_ELISION" ]]; then
+    case "$LABEL" in
+        before)
+            LTX23_DISABLE_MASK_ELISION=1
+            ;;
+        after)
+            LTX23_DISABLE_MASK_ELISION=0
+            ;;
+        *)
+            LTX23_DISABLE_MASK_ELISION=0
+            ;;
+    esac
+fi
+export VLLM_OMNI_LTX23_DISABLE_MASK_ELISION="$LTX23_DISABLE_MASK_ELISION"
 
 PROMPT="${PROMPT:-Floating crystal islands in cosmic starry sky, glowing nebula, soft luminous particles flowing around, slow camera rotation}"
 NEG_PROMPT="${NEG_PROMPT:-low quality, blurry, noise, watermark, text, deformed figures, cartoon style, over-saturated color, frame jump}"
@@ -458,6 +473,7 @@ main() {
     echo "Exec modes:  $EXEC_MODES"
     echo "Profiles:    $PROFILES"
     echo "Runs/cell:   warmup=$WARMUP_PROMPTS measured=$NUM_PROMPTS steps=$NUM_INFERENCE_STEPS"
+    echo "Mask elision disabled: $VLLM_OMNI_LTX23_DISABLE_MASK_ELISION"
     echo
 
     local exec_mode profile case_spec
