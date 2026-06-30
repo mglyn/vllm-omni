@@ -77,6 +77,7 @@ class TestLTX23RequestParsing:
     def test_t2v_and_i2v_share_request_input_resolution(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline, LTX23Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         prompt_embeds = torch.tensor([[1.0, 2.0]])
@@ -85,37 +86,40 @@ class TestLTX23RequestParsing:
         negative_attention_mask = torch.tensor([False, True])
         video_latents = torch.ones(1, 2, 3)
         audio_latents = torch.zeros(1, 2, 3)
+        generator = torch.Generator().manual_seed(123)
 
-        req = OmniDiffusionRequest(
-            prompts=[
-                {
-                    "prompt": "shared prompt",
-                    "negative_prompt": "shared negative",
-                    "additional_information": {
-                        "prompt_embeds": prompt_embeds,
-                        "negative_prompt_embeds": negative_prompt_embeds,
-                        "attention_mask": prompt_attention_mask,
-                        "negative_attention_mask": negative_attention_mask,
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={
+                        "prompt": "shared prompt",
+                        "negative_prompt": "shared negative",
+                        "additional_information": {
+                            "prompt_embeds": prompt_embeds,
+                            "negative_prompt_embeds": negative_prompt_embeds,
+                            "attention_mask": prompt_attention_mask,
+                            "negative_attention_mask": negative_attention_mask,
+                        },
                     },
-                }
-            ],
-            sampling_params=OmniDiffusionSamplingParams(
-                height=384,
-                width=512,
-                num_frames=25,
-                frame_rate=12.5,
-                num_inference_steps=1,
-                num_outputs_per_prompt=2,
-                guidance_scale=6.0,
-                seed=123,
-                latents=video_latents,
-                extra_args={"audio_latents": audio_latents},
-                decode_timestep=[0.1],
-                decode_noise_scale=[0.2],
-                output_type="latent",
-                max_sequence_length=17,
-            ),
-            request_id="ltx23-shared-request-inputs",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=384,
+                        width=512,
+                        num_frames=25,
+                        frame_rate=12.5,
+                        num_inference_steps=1,
+                        num_outputs_per_prompt=2,
+                        guidance_scale=6.0,
+                        generator=generator,
+                        latents=video_latents,
+                        extra_args={"audio_latents": audio_latents},
+                        decode_timestep=[0.1],
+                        decode_noise_scale=[0.2],
+                        output_type="latent",
+                        max_sequence_length=17,
+                    ),
+                    request_id="ltx23-shared-request-inputs",
+                )
+            ]
         )
 
         resolved_t2v = _resolve_request_inputs_for_test(
@@ -136,7 +140,10 @@ class TestLTX23RequestParsing:
         assert resolved_i2v.num_inference_steps == resolved_t2v.num_inference_steps == 2
         assert resolved_i2v.guidance_scale == resolved_t2v.guidance_scale == 6.0
         assert resolved_i2v.num_videos_per_prompt == resolved_t2v.num_videos_per_prompt == 2
-        assert resolved_i2v.generator.initial_seed() == resolved_t2v.generator.initial_seed() == 123
+        assert isinstance(resolved_i2v.generator, list)
+        assert isinstance(resolved_t2v.generator, list)
+        assert [gen.initial_seed() for gen in resolved_i2v.generator] == [123, 123]
+        assert [gen.initial_seed() for gen in resolved_t2v.generator] == [123, 123]
         assert resolved_i2v.decode_timestep == resolved_t2v.decode_timestep == [0.1]
         assert resolved_i2v.decode_noise_scale == resolved_t2v.decode_noise_scale == [0.2]
         assert resolved_i2v.output_type == resolved_t2v.output_type == "latent"
@@ -163,27 +170,39 @@ class TestLTX23RequestParsing:
     def test_request_input_resolution_rejects_mixed_precomputed_prompt_fields(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         pipe = _make_ltx23_request_pipe(LTX23Pipeline)
-        req = OmniDiffusionRequest(
-            prompts=[
-                {
-                    "prompt": "with embeds",
-                    "additional_information": {"prompt_embeds": torch.tensor([[1.0]])},
-                },
-                {"prompt": "without embeds"},
-            ],
-            sampling_params=OmniDiffusionSamplingParams(
-                height=384,
-                width=512,
-                num_frames=25,
-                num_inference_steps=2,
-            ),
-            request_id="ltx23-mixed-precomputed-fields",
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={
+                        "prompt": "with embeds",
+                        "additional_information": {"prompt_embeds": torch.tensor([[1.0]])},
+                    },
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=384,
+                        width=512,
+                        num_frames=25,
+                        num_inference_steps=2,
+                    ),
+                    request_id="ltx23-mixed-precomputed-fields-0",
+                ),
+                OmniDiffusionRequest(
+                    prompt={"prompt": "without embeds"},
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=384,
+                        width=512,
+                        num_frames=25,
+                        num_inference_steps=2,
+                    ),
+                    request_id="ltx23-mixed-precomputed-fields-1",
+                ),
+            ]
         )
 
-        with pytest.raises(ValueError, match="prompt_embeds.*every prompt"):
+        with pytest.raises(ValueError, match="mix of provided and missing prompt_embeds"):
             _resolve_request_inputs_for_test(pipe, req)
 
 
