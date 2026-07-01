@@ -121,7 +121,7 @@ ensure_image() {
     mkdir -p "$(dirname "$IMAGE_PATH")"
     echo "[Image] $IMAGE_PATH not found; downloading $IMAGE_URL"
     if command -v curl >/dev/null 2>&1; then
-        curl -LfsS "$IMAGE_URL" -o "$IMAGE_PATH"
+        curl -kLfsS "$IMAGE_URL" -o "$IMAGE_PATH"
     elif command -v wget >/dev/null 2>&1; then
         wget -O "$IMAGE_PATH" "$IMAGE_URL"
     else
