@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# LTX-2.3 I2V feature sweep for A100.
+# LTX-2.3 T2V/I2V feature sweep for A100.
 #
 # This is a feature-support / feature-performance sweep, not a before/after A/B
 # script. It measures the current checkout under the feature row:
 #
-#   LTX-2.3 I2V:
+#   LTX-2.3 T2V / I2V:
 #     TeaCache: no
 #     Cache-DiT: yes
 #     SP Ulysses/Ring: yes
@@ -24,7 +24,8 @@ set -euo pipefail
 #
 # Useful overrides:
 #   NUM_PROMPTS=10 bash ./run_ltx23_i2v_feature_sweep_a100.sh
-#   PROFILES="base cfg2 tp4 usp4" bash ./run_ltx23_i2v_feature_sweep_a100.sh
+#   TASKS="t2v i2v" PROFILES="base cfg2 tp4 usp4" bash ./run_ltx23_i2v_feature_sweep_a100.sh
+#   TASK=i2v bash ./run_ltx23_i2v_feature_sweep_a100.sh
 #   CASES="512x384x25 1024x576x81" bash ./run_ltx23_i2v_feature_sweep_a100.sh
 #   bash ./run_ltx23_i2v_feature_sweep_a100.sh --summarize-only
 
@@ -45,10 +46,16 @@ else
 fi
 
 MODEL="${MODEL:-$DEFAULT_MODEL}"
-MODEL_CLASS="${MODEL_CLASS:-LTX23ImageToVideoPipeline}"
-TASK="${TASK:-i2v}"
+MODEL_CLASS_OVERRIDE="${MODEL_CLASS:-}"
+MODEL_CLASS_T2V="${MODEL_CLASS_T2V:-LTX23Pipeline}"
+MODEL_CLASS_I2V="${MODEL_CLASS_I2V:-LTX23ImageToVideoPipeline}"
+if [[ -n "${TASK:-}" && -z "${TASKS:-}" ]]; then
+    TASKS="$TASK"
+else
+    TASKS="${TASKS:-t2v i2v}"
+fi
 HOST="${HOST:-127.0.0.1}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/root/results/ltx23_i2v_feature_sweep_a100}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/root/results/ltx23_feature_sweep_a100}"
 IMAGE_PATH="${IMAGE_PATH:-$ROOT_DIR/tmp/cherry_blossom.jpg}"
 IMAGE_URL="${IMAGE_URL:-https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg}"
 
@@ -77,6 +84,8 @@ NEG_PROMPT="${NEG_PROMPT:-worst quality, inconsistent motion, blurry, jittery, d
 export PROMPT NEG_PROMPT NUM_INFERENCE_STEPS GUIDANCE_SCALE FPS FRAME_RATE AUDIO_SAMPLE_RATE SEED
 
 SERVER_PID=""
+TASK=""
+MODEL_CLASS=""
 
 cleanup_server() {
     if [[ -n "${SERVER_PID:-}" ]]; then
@@ -105,9 +114,6 @@ require_python() {
 }
 
 ensure_image() {
-    if [[ "$TASK" != "i2v" && "$TASK" != "ti2v" ]]; then
-        return 0
-    fi
     if [[ -f "$IMAGE_PATH" ]]; then
         return 0
     fi
@@ -122,6 +128,47 @@ ensure_image() {
         echo "Neither curl nor wget is available; provide IMAGE_PATH manually." >&2
         exit 1
     fi
+}
+
+task_requires_image() {
+    case "$1" in
+        i2v|ti2v)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_images_if_needed() {
+    local task
+    for task in $TASKS; do
+        if task_requires_image "$task"; then
+            ensure_image
+            return 0
+        fi
+    done
+}
+
+model_class_for_task() {
+    local task="$1"
+    if [[ -n "$MODEL_CLASS_OVERRIDE" ]]; then
+        echo "$MODEL_CLASS_OVERRIDE"
+        return 0
+    fi
+
+    case "$task" in
+        t2v)
+            echo "$MODEL_CLASS_T2V"
+            ;;
+        i2v|ti2v)
+            echo "$MODEL_CLASS_I2V"
+            ;;
+        *)
+            echo "$MODEL_CLASS_T2V"
+            ;;
+    esac
 }
 
 open_port() {
@@ -470,7 +517,7 @@ run_cell() {
 
 main() {
     require_python
-    ensure_image
+    ensure_images_if_needed
     mkdir -p "$OUTPUT_ROOT"/{datasets,logs,raw,media}
 
     if [[ "${1:-}" == "--summarize-only" ]]; then
@@ -479,9 +526,14 @@ main() {
     fi
 
     echo "Output root: $OUTPUT_ROOT"
-    echo "Task:        $TASK"
+    echo "Tasks:       $TASKS"
     echo "Model:       $MODEL"
-    echo "Model class: $MODEL_CLASS"
+    if [[ -n "$MODEL_CLASS_OVERRIDE" ]]; then
+        echo "Model class: $MODEL_CLASS_OVERRIDE"
+    else
+        echo "T2V class:   $MODEL_CLASS_T2V"
+        echo "I2V class:   $MODEL_CLASS_I2V"
+    fi
     echo "Repo:        $ROOT_DIR"
     echo "Commit:      $(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
     echo "Image:       $IMAGE_PATH"
@@ -491,10 +543,16 @@ main() {
     echo "Mode:        $([[ "$ENFORCE_EAGER" == "1" ]] && echo eager || echo compile/default)"
     echo
 
-    local profile case_spec
-    for profile in $PROFILES; do
-        for case_spec in $CASES; do
-            run_cell "$profile" "$case_spec"
+    local task profile case_spec
+    for task in $TASKS; do
+        TASK="$task"
+        MODEL_CLASS="$(model_class_for_task "$TASK")"
+        echo
+        echo "### Task=$TASK model_class=$MODEL_CLASS ###"
+        for profile in $PROFILES; do
+            for case_spec in $CASES; do
+                run_cell "$profile" "$case_spec"
+            done
         done
     done
 
