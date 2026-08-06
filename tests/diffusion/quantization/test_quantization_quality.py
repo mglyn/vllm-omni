@@ -213,11 +213,11 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2v",
         prompt="A serene lakeside sunrise with mist over the water",
-        max_lpips=0.10,
+        max_lpips=0.20,
         height=384,
         width=512,
         num_frames=73,
-        num_inference_steps=8,
+        num_inference_steps=10,
         # Do not override the recipe's negative conditioning, guidance, or
         # scheduler trajectory: this gate follows the supported LTX default.
         negative_prompt=None,
@@ -494,7 +494,8 @@ def test_generate_video_forwards_sigmas(monkeypatch):
 def test_ltx_quality_gate_uses_official_eager_defaults():
     config = next(config for config in QUALITY_CONFIGS if config.id == "fp8_ltx2")
 
-    assert (config.width, config.height, config.num_frames) == (512, 384, 73)
+    assert (config.width, config.height, config.num_frames, config.num_inference_steps) == (512, 384, 73, 10)
+    assert config.max_lpips == 0.20
     assert config.sigmas is None
     assert config.guidance_scale is None
     assert config.negative_prompt is None
