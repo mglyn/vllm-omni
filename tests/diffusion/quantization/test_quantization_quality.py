@@ -80,10 +80,11 @@ class QualityTestConfig:
     num_frames: int = 5  # only for t2v
     seed: int = 42
     gpu: str = "H100"  # minimum GPU requirement
-    negative_prompt: str = ""
+    negative_prompt: str | None = ""
     guidance_scale: float | None = None
     sigmas: list[float] | None = None
     enable_cpu_offload: bool = False
+    enforce_eager: bool = False
 
     def baseline_ref(self) -> str:
         return self.baseline_model or self.model or ""
@@ -212,23 +213,14 @@ QUALITY_CONFIGS = [
         task="t2v",
         prompt="A serene lakeside sunrise with mist over the water",
         max_lpips=0.10,
-        height=256,
-        width=256,
-        num_frames=25,
+        height=384,
+        width=512,
+        num_frames=73,
         num_inference_steps=8,
-        # Preserve the final scheduler trajectory used when this FP8 quality
-        # gate was established. Explicit LTX sigmas bypass dynamic shifting.
-        sigmas=[
-            1.0,
-            0.92185378074646,
-            0.8327768445014954,
-            0.7303033471107483,
-            0.6111654043197632,
-            0.4709382653236389,
-            0.30347853899002075,
-            0.10000002384185791,
-            0.0,
-        ],
+        # Do not override the recipe's negative conditioning, guidance, or
+        # scheduler trajectory: this gate follows the supported LTX default.
+        negative_prompt=None,
+        enforce_eager=True,
     ),
 ]
 
@@ -295,8 +287,11 @@ def _generate_image(omni, config: QualityTestConfig):
     ).manual_seed(config.seed)
     torch.accelerator.reset_peak_memory_stats()
 
+    prompt = {"prompt": config.prompt}
+    if config.negative_prompt is not None:
+        prompt["negative_prompt"] = config.negative_prompt
     outputs = omni.generate(
-        {"prompt": config.prompt, "negative_prompt": config.negative_prompt},
+        prompt,
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
@@ -327,8 +322,11 @@ def _generate_video(omni, config: QualityTestConfig):
     ).manual_seed(config.seed)
     torch.accelerator.reset_peak_memory_stats()
 
+    prompt = {"prompt": config.prompt}
+    if config.negative_prompt is not None:
+        prompt["negative_prompt"] = config.negative_prompt
     outputs = omni.generate(
-        {"prompt": config.prompt, "negative_prompt": config.negative_prompt},
+        prompt,
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
@@ -490,6 +488,18 @@ def test_generate_video_forwards_sigmas(monkeypatch):
     assert captured.sampling.sigmas == [1.0, 0.5]
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_quality_gate_uses_official_eager_defaults():
+    config = next(config for config in QUALITY_CONFIGS if config.id == "fp8_ltx2")
+
+    assert (config.width, config.height, config.num_frames) == (512, 384, 73)
+    assert config.sigmas is None
+    assert config.guidance_scale is None
+    assert config.negative_prompt is None
+    assert config.enforce_eager
+
+
 _marks = hardware_marks(res={"cuda": "H100"})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
@@ -519,6 +529,8 @@ def test_quantization_quality(config: QualityTestConfig):
     bl_kwargs: dict = {"model": config.baseline_ref()}
     if config.enable_cpu_offload:
         bl_kwargs["enable_cpu_offload"] = True
+    if config.enforce_eager:
+        bl_kwargs["enforce_eager"] = True
     omni_bl = Omni(**bl_kwargs)
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     omni_bl.shutdown()
@@ -531,6 +543,8 @@ def test_quantization_quality(config: QualityTestConfig):
     qt_kwargs: dict = {"model": config.quantized_ref()}
     if config.enable_cpu_offload:
         qt_kwargs["enable_cpu_offload"] = True
+    if config.enforce_eager:
+        qt_kwargs["enforce_eager"] = True
     if quantization is None:
         omni_qt = Omni(**qt_kwargs)
     else:
