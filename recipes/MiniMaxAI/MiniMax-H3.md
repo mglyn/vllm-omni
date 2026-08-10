@@ -70,6 +70,57 @@ reference-video preparation and MP4 output.
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
 and shared components, and loads the second DiT from `Ref2VA/transformer`.
 
+### Four-step Turbo LoRA
+
+The Turbo adapter accelerates the FL2VA partition. Loading the adapter and
+selecting its four-step sampling plan are explicit, independent settings:
+
+```bash
+vllm serve MiniMaxAI/MiniMax-H3 \
+  --omni \
+  --trust-remote-code \
+  --task-type fl2va \
+  --dynamic-lora lightx2v/Minimax-h3-Turbo=1.0 \
+  --default-sampling-params '{"0":{"num_inference_steps":5}}'
+```
+
+`--dynamic-lora` installs and enables the adapter before compilation. A
+request-level `num_inference_steps` still overrides the deployment default;
+the LoRA backend never changes the pipeline's sampling plan. Use
+`--prefused-lora` instead to merge the adapter into dense startup weights.
+Prefusion cannot be combined with quantized weights, while dynamic LoRA can.
+MiniMax-H3 counts sigma grid points, including terminal zero, so `5` produces
+the four Transformer evaluations used by the official Turbo recipe.
+
+Repeat either startup option to form a weighted composition, for example:
+
+```bash
+  --dynamic-lora lightx2v/Minimax-h3-Turbo=1.0 \
+  --dynamic-lora /path/to/H3_krea_style_test1_rank128.safetensors=0.6 \
+  --max-cpu-loras 2
+```
+
+Requests may replace that deployment default with one adapter or a weighted
+list. For the synchronous video endpoint, pass the list as multipart JSON:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  -F 'model=MiniMaxAI/MiniMax-H3' \
+  -F 'prompt=A cinematic wide shot of a singer on an open-air stage.' \
+  -F 'num_inference_steps=5' \
+  -F 'lora=[{"name":"turbo","path":"lightx2v/Minimax-h3-Turbo","scale":1.0},{"name":"style","path":"/path/to/H3_krea_style_test1_rank128.safetensors","scale":0.6}]'
+```
+
+With compile or offload enabled, preload adapters that establish every target
+layer and the maximum composed rank before the graph is fixed. A request may
+then select, disable (`lora=[]`), or reweight the installed composition without
+changing its sampling step count.
+
+Do not specify the same adapter in both prefused and dynamic sets unless
+applying its weight delta twice is intentional. MiniMax-H3 LoRAs target only
+the FL2VA transformer; a Ref2VA-only service rejects the supported raw H3
+adapter formats.
+
 ### Memory and storage requirements
 
 Treat GPU HBM, host RAM, and checkpoint storage as separate requirements. Each
