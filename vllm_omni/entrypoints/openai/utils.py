@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.types import (
+    LoRARequestInput,
+    LoRAScaleInput,
+    normalize_lora_composition,
+    split_lora_composition,
+)
 from vllm_omni.lora.utils import stable_lora_int_id
 
 
@@ -20,17 +26,9 @@ def get_stage_type(stage_cfg: Any) -> str:
     return getattr(stage_cfg, "stage_type", "llm")
 
 
-def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None]:
-    """Parse a request-level LoRA object into a LoRARequest and optional scale.
-
-    Raises:
-        ValueError: If the object shape is invalid or required fields are missing.
-    """
-    if lora_body is None:
-        return None, None
-
+def _parse_single_lora_request(lora_body: Any) -> tuple[LoRARequest, float | None]:
     if not isinstance(lora_body, dict):
-        raise ValueError("Invalid lora field: expected an object.")
+        raise ValueError("Invalid lora field: expected an object or an array of objects.")
 
     lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
     lora_path = (
@@ -53,6 +51,27 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
 
     scale = float(lora_scale) if lora_scale is not None else None
     return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
+
+
+def parse_lora_request(lora_body: Any) -> tuple[LoRARequestInput, LoRAScaleInput | None]:
+    """Parse one or more request-level LoRAs and their mixing coefficients.
+
+    Raises:
+        ValueError: If the object shape is invalid or required fields are missing.
+    """
+    if lora_body is None:
+        return None, None
+    bodies = lora_body if isinstance(lora_body, list) else [lora_body]
+    if not bodies:
+        return (), ()
+    parsed = tuple(_parse_single_lora_request(body) for body in bodies)
+    if len(parsed) == 1:
+        return parsed[0]
+    composition = normalize_lora_composition(
+        tuple(request for request, _ in parsed),
+        tuple(1.0 if scale is None else scale for _, scale in parsed),
+    )
+    return split_lora_composition(composition)
 
 
 def get_supported_speakers_from_hf_config(hf_config: Any) -> set[str]:

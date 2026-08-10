@@ -37,6 +37,32 @@ class _DummyLoRALayer:
         self.reset_calls += 1
 
 
+class _FusableLoRALayer:
+    def __init__(self, in_features: int, out_features: int, max_rank: int):
+        self.n_slices = 1
+        self.output_slices = (out_features,)
+        self.base_layer = torch.nn.Linear(in_features, out_features, bias=False)
+        torch.nn.init.zeros_(self.base_layer.weight)
+        self.lora_a_stacked = [torch.zeros(1, 1, max_rank, in_features)]
+        self.lora_b_stacked = [torch.zeros(1, 1, out_features, max_rank)]
+        self._diffusion_lora_active_slices = (False,)
+
+    def set_lora(self, index: int, lora_a: torch.Tensor, lora_b: torch.Tensor):
+        assert index == 0
+        rank = lora_a.shape[0]
+        self.lora_a_stacked[0].zero_()
+        self.lora_b_stacked[0].zero_()
+        self.lora_a_stacked[0][0, 0, :rank].copy_(lora_a)
+        self.lora_b_stacked[0][0, 0, :, :rank].copy_(lora_b)
+        self._diffusion_lora_active_slices = (True,)
+
+    def reset_lora(self, index: int):
+        assert index == 0
+        self.lora_a_stacked[0].zero_()
+        self.lora_b_stacked[0].zero_()
+        self._diffusion_lora_active_slices = (False,)
+
+
 # Aliases for backward compatibility within this file
 _FakeLinearBase = FakeLinearBase
 _DummyBaseLayerWithLoRA = DummyBaseLayerWithLoRA
@@ -217,6 +243,7 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
             },
         )()
     }
+    manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
     manager._activate_adapter(7, 0.5)
 
@@ -232,6 +259,51 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
     b0, b1, b2 = lora_b_list
     assert b0.shape[0] == 2 and b1.shape[0] == 1 and b2.shape[0] == 1
     assert torch.allclose(torch.cat([b0, b1, b2], dim=0), B * 0.5)
+
+
+def test_lora_manager_splits_fused_checkpoint_with_global_tp_sizes():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    # Runtime buffers are rank-local, while the checkpoint B tensor is global.
+    packed_layer = _DummyLoRALayer(n_slices=2, output_slices=(2, 2))
+    packed_layer.output_sizes = (8, 8)
+    manager._lora_modules = {"transformer.blocks.0.mlp.fc1": packed_layer}
+
+    rank = 2
+    a = torch.ones((rank, 4))
+    b = torch.arange(16 * rank, dtype=torch.bfloat16).view(16, rank)
+    lora = LoRALayerWeights(
+        module_name="transformer.blocks.0.mlp.fc1",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=a,
+        lora_b=b,
+    )
+    manager._registered_adapters = {
+        7: type(
+            "LM",
+            (),
+            {
+                "id": 7,
+                "loras": {"transformer.blocks.0.mlp.fc1": lora},
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+    }
+    manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
+
+    manager._activate_adapter(7, 1.0)
+
+    lora_a, lora_b = packed_layer.set_calls[-1]
+    assert isinstance(lora_a, list)
+    assert isinstance(lora_b, list)
+    assert [tensor.shape for tensor in lora_b] == [(8, rank), (8, rank)]
+    torch.testing.assert_close(torch.cat(lora_b), b)
 
 
 def test_lora_manager_activates_packed_lora_from_sublayers():
@@ -265,6 +337,7 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     manager._registered_adapters = {
         1: type("LM", (), {"id": 1, "loras": loras, "get_lora": lambda self, k: self.loras.get(k)})()
     }
+    manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
     manager._activate_adapter(1, scale=2.0)
 
@@ -279,6 +352,111 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     assert torch.allclose(lora_b_list[0], torch.ones((2, rank)) * 3 * 2.0)
     assert torch.allclose(lora_b_list[1], torch.ones((1, rank)) * 4 * 2.0)
     assert torch.allclose(lora_b_list[2], torch.ones((1, rank)) * 4 * 2.0)
+
+
+def test_lora_manager_composes_multiple_adapters_with_exact_math():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=2,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.proj": layer}
+
+    a_1 = torch.tensor([[1.0, 2.0]])
+    b_1 = torch.tensor([[3.0], [4.0]])
+    a_2 = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+    b_2 = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    def _model(adapter_id: int, a: torch.Tensor, b: torch.Tensor):
+        weights = LoRALayerWeights(
+            module_name="transformer.proj",
+            rank=a.shape[0],
+            lora_alpha=a.shape[0],
+            lora_a=a,
+            lora_b=b,
+        )
+        return type(
+            "LM",
+            (),
+            {
+                "id": adapter_id,
+                "loras": {"transformer.proj": weights},
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+
+    manager._registered_adapters = {
+        1: _model(1, a_1, b_1),
+        2: _model(2, a_2, b_2),
+    }
+    manager._max_lora_rank = manager._get_smallest_valid_max_rank(3)
+    requests = (_dummy_lora_request(1), _dummy_lora_request(2))
+    scales = (0.25, 0.75)
+
+    manager.set_active_adapter(requests, scales)
+
+    composed_a, composed_b = layer.set_calls[-1]
+    x = torch.tensor([[2.0, -1.0]])
+    actual = (x @ composed_a.T) @ composed_b.T
+    expected = 0.25 * ((x @ a_1.T) @ b_1.T) + 0.75 * ((x @ a_2.T) @ b_2.T)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_prefused_and_dynamic_routes_share_the_same_delta_math():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=2,
+    )
+    layer = _FusableLoRALayer(in_features=2, out_features=2, max_rank=8)
+    manager._lora_modules = {"transformer.proj": layer}
+    manager._max_lora_rank = 8
+
+    a_1 = torch.tensor([[1.0, 2.0]])
+    b_1 = torch.tensor([[3.0], [4.0]])
+    a_2 = torch.tensor([[2.0, -1.0]])
+    b_2 = torch.tensor([[5.0], [6.0]])
+
+    def _model(adapter_id: int, a: torch.Tensor, b: torch.Tensor):
+        weights = LoRALayerWeights(
+            module_name="transformer.proj",
+            rank=a.shape[0],
+            lora_alpha=a.shape[0],
+            lora_a=a,
+            lora_b=b,
+        )
+        return type(
+            "LM",
+            (),
+            {
+                "id": adapter_id,
+                "loras": {"transformer.proj": weights},
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+
+    manager._registered_adapters = {
+        1: _model(1, a_1, b_1),
+        2: _model(2, a_2, b_2),
+    }
+    manager._adapter_requests = {
+        1: _dummy_lora_request(1),
+        2: _dummy_lora_request(2),
+    }
+
+    manager._activate_adapter(1, scale=0.25)
+    manager._fuse_active_composition()
+    torch.testing.assert_close(layer.base_layer.weight, 0.25 * (b_1 @ a_1), rtol=0, atol=0)
+
+    manager._activate_adapter(2, scale=0.75)
+    dynamic_a = layer.lora_a_stacked[0][0, 0]
+    dynamic_b = layer.lora_b_stacked[0][0, 0]
+    effective_weight = layer.base_layer.weight + dynamic_b @ dynamic_a
+    expected = 0.25 * (b_1 @ a_1) + 0.75 * (b_2 @ a_2)
+    torch.testing.assert_close(effective_weight, expected, rtol=0, atol=0)
 
 
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:
@@ -347,7 +525,7 @@ def test_lora_manager_does_not_evict_pinned_adapter(monkeypatch):
     assert set(manager.list_adapters()) == {1, 3}
 
 
-def test_lora_manager_warns_when_all_adapters_pinned(monkeypatch):
+def test_lora_manager_rejects_when_all_adapters_pinned(monkeypatch):
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),
         device=torch.device("cpu"),
@@ -371,7 +549,8 @@ def test_lora_manager_warns_when_all_adapters_pinned(monkeypatch):
     assert manager.pin_adapter(2)
 
     manager.max_cached_adapters = 1
-    manager._evict_for_new_adapter()
+    with pytest.raises(ValueError, match="all adapters are pinned"):
+        manager._evict_for_new_adapter()
 
     assert set(manager.list_adapters()) == {1, 2}
 
@@ -406,6 +585,7 @@ def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
         adapter_id: lora_model,
     }
     manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+    manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
     # After the first scale, all B values should go from 1 -> scale_1
     manager.set_active_adapter(req1, lora_scale=scale_1)
@@ -452,6 +632,7 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
         adapter_id: lora_model,
     }
     manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+    manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
     # Activate adapter with initial scale
     manager.set_active_adapter(req1, lora_scale=initial_scale)
@@ -462,7 +643,8 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
     assert torch.all(lora_b == initial_scale)
 
     # Increase the rank; this resets the buffers, so the adapter is activated again
-    manager._ensure_max_lora_rank(8)
+    expanded_rank = next(valid_rank for valid_rank in manager._VALID_MAX_RANKS if valid_rank > manager._max_lora_rank)
+    manager._ensure_max_lora_rank(expanded_rank)
 
     # Ensure we actually took the rank expansion path, which recreates
     # and sets the weight buffets, but that the scale didn't change
@@ -473,19 +655,15 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
     assert torch.all(lora_b == initial_scale)
 
 
-def test_scale_keys_are_rounded():
-    """Ensure that added adapter scales are rounded to avoid lookup
-    issues due to precision differences, e.g., computed scales.
-    """
+def test_scale_keys_preserve_exact_value():
     manager = DiffusionLoRAManager(
         pipeline=_DummyPipeline(),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
     )
     adapter_id = 1
-    # Currently we round keys to 3 decimal places
     manager._update_adapter_scale(adapter_id, 0.0031)
-    assert manager._adapter_scales[adapter_id] == 0.003
+    assert manager._adapter_scales[adapter_id] == 0.0031
 
 
 def test_lora_manager_uses_valid_max_rank(monkeypatch):

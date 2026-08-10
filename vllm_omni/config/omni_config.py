@@ -685,9 +685,10 @@ class _DiffusionConfigProjection:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
-    lora_path: str | list[str] | None = None
+    lora_path: str | None = None
     lora_scale: float = 1.0
-    lora_backend: str = "peft"
+    prefused_lora: list[str] | None = None
+    dynamic_lora: list[str] | None = None
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     enable_cpu_offload: bool = False
@@ -751,6 +752,7 @@ class _DiffusionConfigProjection:
             DiffusionCacheConfig,
             TransformerConfig,
             build_attention_config,
+            normalize_deployment_lora_specs,
             parse_kv_cache_skip_selector,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
@@ -760,6 +762,9 @@ class _DiffusionConfigProjection:
             self.tf_model_config = TransformerConfig()
         elif isinstance(self.tf_model_config, Mapping):
             self.tf_model_config = TransformerConfig.from_dict(dict(self.tf_model_config))
+
+        self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
+        self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
 
         if self.additional_config is None:
             self.additional_config = {}
@@ -823,6 +828,8 @@ class _DiffusionConfigProjection:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+        if self.prefused_lora and self.quantization_config is not None:
+            raise ValueError("prefused_lora is not supported with quantized diffusion weights; use dynamic_lora")
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(

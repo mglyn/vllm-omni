@@ -1994,6 +1994,28 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
     assert engine.captured_prompt["modalities"] == ["video"]
 
 
+def test_sync_accepts_weighted_lora_list(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker, b"fake-video-bytes")
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "weighted adapters",
+            "lora": json.dumps(
+                [
+                    {"name": "turbo", "path": "/tmp/turbo", "scale": 0.8, "int_id": 8},
+                    {"name": "style", "path": "/tmp/style", "scale": 0.2, "int_id": 2},
+                ]
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    sampling = engine.captured_sampling_params_list[0]
+    assert tuple(request.lora_int_id for request in sampling.lora_request) == (2, 8)
+    assert sampling.lora_scale == (0.2, 0.8)
+
+
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 

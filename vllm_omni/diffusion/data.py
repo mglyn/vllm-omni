@@ -5,7 +5,7 @@ import copy
 import math
 import os
 import random
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -27,7 +27,6 @@ from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
 )
-from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -42,9 +41,24 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def normalize_deployment_lora_specs(value: Any, field_name: str) -> list[str] | None:
+    """Normalize repeatable startup LoRA specs from CLI, YAML, or Python."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise TypeError(f"{field_name} must be a string, a sequence of strings, or None")
+
+
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
+    for field_name in ("prefused_lora", "dynamic_lora"):
+        if field_name in normalized:
+            normalized[field_name] = normalize_deployment_lora_specs(normalized[field_name], field_name)
 
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
@@ -732,9 +746,10 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    lora_path: str | list[str] | None = None
-    lora_scale: float | list[float] = 1.0
-    lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
+    lora_path: str | None = None
+    lora_scale: float = 1.0
+    prefused_lora: list[str] | None = None
+    dynamic_lora: list[str] | None = None
     max_cpu_loras: int | None = None
 
     output_type: str = "pil"
@@ -982,6 +997,8 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
+        self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1121,6 +1138,8 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+        if self.prefused_lora and self.quantization_config is not None:
+            raise ValueError("prefused_lora is not supported with quantized diffusion weights; use dynamic_lora")
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(

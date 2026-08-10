@@ -1059,9 +1059,9 @@ class AsyncOmniEngine:
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
-            "lora_path": kwargs.get("lora_path", None),
-            "lora_scale": kwargs.get("lora_scale", 1.0),
-            "lora_backend": kwargs.get("lora_backend", "peft"),
+            "prefused_lora": kwargs.get("prefused_lora"),
+            "dynamic_lora": kwargs.get("dynamic_lora"),
+            "max_cpu_loras": kwargs.get("max_cpu_loras"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
@@ -1212,6 +1212,12 @@ class AsyncOmniEngine:
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]
+                for field_name in ("prefused_lora", "dynamic_lora", "max_cpu_loras"):
+                    field_value = kwargs.get(field_name)
+                    if field_value is not None:
+                        current_value = getattr(cfg.engine_args, field_name, None)
+                        if current_value is None:
+                            setattr(cfg.engine_args, field_name, field_value)
                 lora_scale = kwargs.get("lora_scale")
                 if lora_scale is None:
                     # Backwards compatibility for older callers.
@@ -1219,9 +1225,6 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
-                if kwargs.get("lora_backend") is not None:
-                    if not hasattr(cfg.engine_args, "lora_backend") or cfg.engine_args.lora_backend is None:
-                        cfg.engine_args.lora_backend = kwargs["lora_backend"]
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None

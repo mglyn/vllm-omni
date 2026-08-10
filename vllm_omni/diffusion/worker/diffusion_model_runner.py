@@ -35,6 +35,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsPromptUpdate,
@@ -66,6 +67,7 @@ from vllm_omni.diffusion.worker.utils import (
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.types import parse_lora_adapter_specs
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -139,6 +141,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.od_config = od_config
         self.device = device
         self.pipeline: Any | None = None
+        self.lora_manager: DiffusionLoRAManager | None = None
         self.cache_backend: Any | None = None
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
@@ -220,6 +223,34 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             compile_dynamic,
         )
 
+    def init_lora_manager(self) -> DiffusionLoRAManager | None:
+        """Install startup LoRAs before offload, compilation, and caching."""
+
+        if not isinstance(self.pipeline, torch.nn.Module):
+            self.lora_manager = None
+            return None
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipeline,
+            device=self.device,
+            dtype=getattr(self.od_config, "dtype", torch.bfloat16),
+            max_cached_adapters=getattr(self.od_config, "max_cpu_loras", None) or 1,
+            lora_path=getattr(self.od_config, "lora_path", None),
+            lora_scale=getattr(self.od_config, "lora_scale", 1.0),
+            prefused_loras=parse_lora_adapter_specs(getattr(self.od_config, "prefused_lora", None)),
+            dynamic_loras=parse_lora_adapter_specs(getattr(self.od_config, "dynamic_lora", None)),
+            quantized=getattr(self.od_config, "quantization_config", None) is not None,
+        )
+        graph_is_fixed = (
+            not self.od_config.enforce_eager
+            or self.od_config.enable_cpu_offload
+            or self.od_config.enable_layerwise_offload
+            or getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            or getattr(self.od_config, "cache_backend", None) not in (None, "none")
+        )
+        if graph_is_fixed:
+            self.lora_manager.freeze()
+        return self.lora_manager
+
     def load_model(
         self,
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
@@ -300,6 +331,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
+
+        self.init_lora_manager()
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(

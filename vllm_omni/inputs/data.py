@@ -9,7 +9,7 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.types import LoRARequestInput, LoRAScaleInput
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
@@ -317,8 +317,8 @@ class OmniDiffusionSamplingParams:
     return_frames: bool = False
 
     # LoRA
-    lora_request: LoRARequest | None = None
-    lora_scale: float = 1.0
+    lora_request: LoRARequestInput = None
+    lora_scale: LoRAScaleInput = 1.0
 
     # STA parameters
     STA_param: list | None = None

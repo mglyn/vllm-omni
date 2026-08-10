@@ -28,6 +28,7 @@ from vllm_omni.diffusion.sched.interface import (
     _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.lora.types import normalize_lora_composition, split_lora_composition
 
 logger = init_logger(__name__)
 
@@ -421,10 +422,27 @@ class BaseScheduler(ABC):
         """Build a step-batch compatibility key from sampling parameters."""
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
-        lora_request = getattr(sampling, "lora_request", None)
+        raw_lora_request = getattr(sampling, "lora_request", None)
+        composition = normalize_lora_composition(
+            raw_lora_request,
+            getattr(sampling, "lora_scale", 1.0),
+        )
+        _, canonical_scales = split_lora_composition(composition)
+        explicit_empty = raw_lora_request is not None and not composition
         return StepBatchSamplingParamsKey(
-            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+            lora_int_id=(
+                ()
+                if explicit_empty
+                else None
+                if not composition
+                else composition[0].adapter_id
+                if len(composition) == 1
+                else tuple(adapter.adapter_id for adapter in composition)
+            ),
+            **{
+                name: (() if explicit_empty else canonical_scales) if name == "lora_scale" else getattr(sampling, name)
+                for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES
+            },
         )
 
 
