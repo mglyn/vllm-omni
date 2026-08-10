@@ -28,6 +28,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
 )
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_world_group,
@@ -780,6 +781,27 @@ class MiniMaxH3Pipeline(
             ) from exc
         if not math.isclose(audio_shift, MINIMAX_H3_TURBO_AUDIO_SHIFT):
             raise OmniClientError(f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}")
+
+    def setup_compile(self) -> None:
+        """Compile the DiTs and repeated video-VAE transformer blocks."""
+        dynamic = self.od_config.diffusion_compile_dynamic
+        granularity = self.od_config.diffusion_compile_granularity
+        for attr_name in self._dit_modules:
+            model = getattr(self, attr_name, None)
+            if model is None:
+                continue
+            if granularity == "full":
+                model.compile(dynamic=dynamic)
+            else:
+                regionally_compile(model, dynamic=dynamic)
+
+        decoder = self.video_vae.model.decoder
+        decoder._repeated_blocks = ["TransformerBlock"]
+        regionally_compile(decoder, dynamic=dynamic)
+        logger.info(
+            "MiniMax H3 regional torch.compile enabled for video VAE decoder TransformerBlock modules (dynamic=%s)",
+            dynamic,
+        )
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""

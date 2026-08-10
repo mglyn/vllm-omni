@@ -24,6 +24,57 @@ def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _
     return result
 
 
+class _CompileTrackingModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.compile_calls = []
+
+    def compile(self, *args, **kwargs):
+        self.compile_calls.append((args, kwargs))
+
+
+@pytest.mark.parametrize("granularity", ["full", "regional"])
+def test_h3_setup_compile_adds_video_vae_regions(monkeypatch, granularity):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    pipeline = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_compile_dynamic=False,
+        diffusion_compile_granularity=granularity,
+    )
+    pipeline._dit_modules = ["transformer"]
+    pipeline.transformer = _CompileTrackingModule()
+    decoder = nn.Module()
+    pipeline.video_vae = SimpleNamespace(
+        model=SimpleNamespace(decoder=decoder),
+    )
+    regional_calls = []
+
+    def fake_regional_compile(model, **kwargs):
+        regional_calls.append((model, kwargs))
+        return model
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "regionally_compile",
+        fake_regional_compile,
+    )
+
+    pipeline.setup_compile()
+
+    if granularity == "full":
+        assert pipeline.transformer.compile_calls == [((), {"dynamic": False})]
+        assert regional_calls == [(decoder, {"dynamic": False})]
+    else:
+        assert pipeline.transformer.compile_calls == []
+        assert regional_calls == [
+            (pipeline.transformer, {"dynamic": False}),
+            (decoder, {"dynamic": False}),
+        ]
+    assert decoder._repeated_blocks == ["TransformerBlock"]
+
+
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
