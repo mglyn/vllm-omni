@@ -246,8 +246,13 @@ vllm serve "${MODEL}" \
 
 Do not add `--enforce-eager` to this performance configuration. The first
 request includes regional compilation; warm the server once before measuring
-steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
-1. The H3 VAE supports its native `tile` mode, not
+steady-state latency. H3 also regionally compiles the repeated
+`TransformerBlock` modules in the video VAE decoder. It does not compile the
+audio VAE or the VAE tiling control flow. Dynamic shapes let supported frame
+and resolution changes reuse the compiled graphs after the first request.
+
+H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1. The H3 VAE
+supports its native `tile` mode, not
 `spatial_shard_height` or `spatial_shard_width`.
 
 ### Attention Backends
