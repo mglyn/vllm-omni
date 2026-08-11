@@ -70,10 +70,11 @@ reference-video preparation and MP4 output.
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
 and shared components, and loads the second DiT from `Ref2VA/transformer`.
 
-### Four-step Turbo LoRA
+### Four-step Turbo with dynamic LoRA
 
-The Turbo adapter accelerates the FL2VA partition. Loading the adapter and
-selecting its four-step sampling plan are explicit, independent settings:
+The recommended H3 Turbo serving path installs the adapter dynamically on the
+FL2VA partition. Loading the adapter and selecting its four-step sampling plan
+are explicit, independent settings:
 
 ```bash
 vllm serve MiniMaxAI/MiniMax-H3 \
@@ -84,42 +85,36 @@ vllm serve MiniMaxAI/MiniMax-H3 \
   --default-sampling-params '{"0":{"num_inference_steps":5}}'
 ```
 
-`--dynamic-lora` installs and enables the adapter before compilation. A
-request-level `num_inference_steps` still overrides the deployment default;
-the LoRA backend never changes the pipeline's sampling plan. Use
-`--prefused-lora` instead to merge the adapter into dense startup weights.
-Prefusion cannot be combined with quantized weights, while dynamic LoRA can.
-MiniMax-H3 counts sigma grid points, including terminal zero, so `5` produces
-the four Transformer evaluations used by the official Turbo recipe.
+`--dynamic-lora` installs and enables the adapter before compilation without
+mutating the dense checkpoint. It supports request-scoped selection and
+reweighting, weighted composition, and quantized base weights. A request-level
+`num_inference_steps` still overrides the deployment default; the LoRA backend
+never changes the pipeline's sampling plan. MiniMax-H3 counts sigma grid
+points, including terminal zero, so `5` produces the four Transformer
+evaluations used by the published Turbo recipe.
 
-Repeat either startup option to form a weighted composition, for example:
-
-```bash
-  --dynamic-lora lightx2v/Minimax-h3-Turbo=1.0 \
-  --dynamic-lora /path/to/H3_krea_style_test1_rank128.safetensors=0.6 \
-  --max-cpu-loras 2
-```
-
-Requests may replace that deployment default with one adapter or a weighted
-list. For the synchronous video endpoint, pass the list as multipart JSON:
+Omitting `lora` uses the startup dynamic composition. Requests may disable it
+with `lora=[]`, or explicitly select and reweight Turbo. For the synchronous
+video endpoint, pass the selection as multipart JSON:
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8000/v1/videos/sync" \
   -F 'model=MiniMaxAI/MiniMax-H3' \
   -F 'prompt=A cinematic wide shot of a singer on an open-air stage.' \
   -F 'num_inference_steps=5' \
-  -F 'lora=[{"name":"turbo","path":"lightx2v/Minimax-h3-Turbo","scale":1.0},{"name":"style","path":"/path/to/H3_krea_style_test1_rank128.safetensors","scale":0.6}]'
+  -F 'lora={"name":"turbo","path":"lightx2v/Minimax-h3-Turbo","scale":1.0}'
 ```
 
-With compile or offload enabled, preload adapters that establish every target
-layer and the maximum composed rank before the graph is fixed. A request may
-then select, disable (`lora=[]`), or reweight the installed composition without
-changing its sampling step count.
+With compile or offload enabled, preload the adapter before the graph is fixed.
+A request may then select, disable (`lora=[]`), or reweight it without changing
+its sampling step count.
 
-Do not specify the same adapter in both prefused and dynamic sets unless
-applying its weight delta twice is intentional. MiniMax-H3 LoRAs target only
-the FL2VA transformer; a Ref2VA-only service rejects the supported raw H3
-adapter formats.
+The H3 integration formally supports the raw
+`lightx2v/Minimax-h3-Turbo` checkpoint layout only. Other H3 LoRA publication
+formats require their own model-side normalization plan and are not part of
+this recipe's compatibility contract. Do not specify Turbo in both prefused
+and dynamic sets unless applying its weight delta twice is intentional. Turbo
+targets only the FL2VA transformer; a Ref2VA-only service rejects it.
 
 ### Memory and storage requirements
 

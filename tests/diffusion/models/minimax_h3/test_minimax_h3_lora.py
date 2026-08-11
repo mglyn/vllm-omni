@@ -9,7 +9,7 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def test_minimax_h3_turbo_lora_plan_maps_official_keys() -> None:
+def test_minimax_h3_turbo_lora_plan_maps_lightx2v_keys() -> None:
     from vllm_omni.diffusion.models.minimax_h3.lora import (
         minimax_h3_lora_load_plan,
     )
@@ -46,30 +46,6 @@ def test_minimax_h3_turbo_lora_plan_maps_official_keys() -> None:
     }
 
 
-def test_minimax_h3_krea_lora_plan_converts_kohya_keys_and_alpha() -> None:
-    from vllm_omni.diffusion.models.minimax_h3.lora import (
-        minimax_h3_lora_load_plan,
-    )
-
-    a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    b = torch.ones(12, 2)
-    tensors = {
-        "lora_unet_blocks_7_attn_qkv_proj.lora_down.weight": a,
-        "lora_unet_blocks_7_attn_qkv_proj.lora_up.weight": b,
-        "lora_unet_blocks_7_attn_qkv_proj.alpha": torch.tensor(1.0),
-    }
-
-    plan = minimax_h3_lora_load_plan("style.safetensors", tuple(tensors))
-
-    assert plan is not None
-    assert plan.weights_mapper is None
-    assert plan.peft_config["lora_alpha"] is None
-    assert plan.state_dict_converter is not None
-    converted = plan.state_dict_converter(tensors)
-    assert torch.equal(converted["blocks.7.attn.qkv_proj.lora_A.weight"], a)
-    assert torch.equal(converted["blocks.7.attn.qkv_proj.lora_B.weight"], b * 0.5)
-
-
 def test_minimax_h3_lora_apply_plan_is_fl2va_only() -> None:
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -101,7 +77,13 @@ def test_minimax_h3_unknown_raw_lora_is_not_claimed() -> None:
         minimax_h3_lora_load_plan,
     )
 
-    assert minimax_h3_lora_load_plan("unknown.safetensors", ("unknown.lora_A.weight",)) is None
+    unsupported_layouts = (
+        "unknown.lora_A.weight",
+        "diffusion_model.blocks.3.attn.qkv_proj.lora_A.weight",
+        "lora_unet_blocks_7_attn_qkv_proj.lora_down.weight",
+    )
+    for tensor_key in unsupported_layouts:
+        assert minimax_h3_lora_load_plan("unknown.safetensors", (tensor_key,)) is None
 
 
 def test_minimax_h3_turbo_four_nfe_uses_five_sigma_grid_points() -> None:

@@ -14,6 +14,10 @@ from tests.diffusion.lora.helpers import (
     fake_replace_submodule,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.plan import (
+    DiffusionLoRAApplyPlan,
+    DiffusionLoRALoadPlan,
+)
 from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,6 +79,42 @@ class _DummyPipeline(torch.nn.Module):
         self.transformer.foo = _FakeLinearBase()
 
 
+class _CustomPlanPipeline(torch.nn.Module):
+    """Test-only model extension for a synthetic raw adapter format."""
+
+    def __init__(self):
+        super().__init__()
+        self.custom_dit = torch.nn.Module()
+        self.custom_dit.proj = _FakeLinearBase()
+
+    def get_lora_apply_plan(self) -> DiffusionLoRAApplyPlan:
+        return DiffusionLoRAApplyPlan(
+            component_names=("custom_dit",),
+            target_modules=("proj",),
+            packed_modules_mapping={"proj": ("query", "key")},
+        )
+
+    def get_lora_load_plan(
+        self,
+        adapter_path: str,
+        tensor_keys: tuple[str, ...],
+    ) -> DiffusionLoRALoadPlan | None:
+        del adapter_path
+        if "vendor.proj.down" not in tensor_keys:
+            return None
+
+        def convert(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return {
+                "proj.lora_A.weight": tensors["vendor.proj.down"],
+                "proj.lora_B.weight": tensors["vendor.proj.up"],
+            }
+
+        return DiffusionLoRALoadPlan(
+            peft_config={"lora_alpha": None, "target_modules": ["proj"]},
+            state_dict_converter=convert,
+        )
+
+
 class _DummyLM(torch.nn.Module):
     """LoRA enabled wrapper for _DummyPipeline."""
 
@@ -103,6 +143,32 @@ class _DummyLM(torch.nn.Module):
             lora_a=A,
             lora_b=B,
         )
+
+
+def test_model_owned_plans_describe_custom_loading_and_application() -> None:
+    manager = DiffusionLoRAManager(
+        pipeline=_CustomPlanPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    tensors = {
+        "vendor.proj.down": torch.ones(2, 4),
+        "vendor.proj.up": torch.ones(4, 2),
+    }
+
+    assert manager._component_names() == ("custom_dit",)
+    assert manager._packed_modules_mapping == {"proj": ["query", "key"]}
+
+    load_plan = manager._get_single_file_load_plan("custom.safetensors", tuple(tensors))
+    assert load_plan.peft_config == {
+        "lora_alpha": None,
+        "target_modules": ["proj"],
+    }
+    assert load_plan.state_dict_converter is not None
+    converted = load_plan.state_dict_converter(tensors)
+    assert set(converted) == {"proj.lora_A.weight", "proj.lora_B.weight"}
+    assert torch.equal(converted["proj.lora_A.weight"], tensors["vendor.proj.down"])
+    assert torch.equal(converted["proj.lora_B.weight"], tensors["vendor.proj.up"])
 
 
 def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypatch):
