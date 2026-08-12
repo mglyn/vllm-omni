@@ -1,157 +1,200 @@
-# LoRA (Low-Rank Adaptation) Guide
+# Diffusion LoRA
 
-LoRA (Low-Rank Adaptation) enables fine-tuning diffusion models by adding trainable low-rank matrices to existing model weights. vLLM-Omni supports two LoRA backends: **PEFT** for PEFT-style adapters, and **Distill** usually for few-steps inference. **PEFT** backend allows you to customize model behavior without modifying the base model weights. **Distill** backend fuses LoRA weights into the base model at initialization.
+vLLM-Omni provides a shared LoRA backend for diffusion pipelines. It supports
+startup fusion, dynamic execution, request-scoped adapter selection, weighted
+multi-adapter composition, and common adapter lifecycle management.
 
-## Overview
+For a linear layer with base weight $W$, adapter matrices $A_i$ and $B_i$, and
+user scales $s_i$, both execution modes implement:
 
-LoRA adapters are lightweight, model-specific fine-tuning weights that can be applied to diffusion models in two ways:
+$$
+y = \left(W + \sum_i s_i B_i A_i\right)x
+$$
 
-- **PEFT backend** (`--lora-backend peft`, default): Loads a PEFT-format adapter folder via `DiffusionLoRAManager`. Adapters are cached (LRU) and activated per request via `LoRARequest`. It uses a unified LoRA handling mechanisms similar to vLLM with LRU cache management.
-- **Distill backend** (`--lora-backend distill`): Calls `pipeline.load_lora_weights` once at initialization to fuse one or more concrete checkpoint files directly into the base weights. Typically used for distilled few-step LoRAs (e.g. Lightning, LightX2V).
+The modes differ in when this expression is evaluated:
 
-## LoRA Adapter Format
+| Mode | Startup option | Weight lifecycle | Request switching | Quantized base weights |
+|---|---|---|---|---|
+| Dynamic | `--dynamic-lora PATH=SCALE` | Keeps $W$ unchanged and evaluates the low-rank branch during each forward | Yes | Yes |
+| Prefused | `--prefused-lora PATH=SCALE` | Merges the delta into dense weights once at startup | No | No |
 
-### PEFT (Parameter-Efficient Fine-Tuning) format (default)
-A typical PEFT-format LoRA adapter directory structure:
+Dynamic LoRA is the recommended default for serving. Prefusion is useful only
+when permanent dense weights are required and its output quality has been
+validated for the model and dtype.
 
-```
+## Adapter formats
+
+The generic loader accepts a PEFT directory containing `adapter_config.json`
+and adapter weights:
+
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
 ```
 
-The `adapter_config.json` file contains metadata about the LoRA adapter, including:
-- `r`: LoRA rank
-- `lora_alpha`: LoRA alpha scaling factor
-- `target_modules`: List of module names to apply LoRA to
+The PEFT configuration describes the rank, alpha, and target modules. A local
+path or Hugging Face repository ID may be used at startup or in a request.
+Paths in API requests are resolved by the server, not uploaded by the client.
 
-## Quick Start
+Single-file `.safetensors` adapters are also supported when their checkpoint
+layout is compatible with the selected pipeline. Check the corresponding
+recipe for supported adapter repositories and formats.
 
-### Offline Inference
+## Dynamic serving
 
-#### PEFT backend: pre-loaded LoRA
+Install one adapter at startup and make it the deployment default:
 
-Load a PEFT-format LoRA adapter at initialization. The adapter is pre-loaded into the cache and can be activated per request:
+```bash
+vllm serve BASE_MODEL \
+  --omni \
+  --dynamic-lora /path/to/adapter=1.0 \
+  --max-cpu-loras 1
+```
+
+Repeat `--dynamic-lora` to install a weighted default composition. The cache
+must have room for every adapter that must remain resident:
+
+```bash
+vllm serve BASE_MODEL \
+  --omni \
+  --dynamic-lora /path/to/accelerator.safetensors=1.0 \
+  --dynamic-lora org/style-adapter=0.6 \
+  --max-cpu-loras 2
+```
+
+Startup specifications accept `PATH` or `PATH=SCALE`. When a path itself ends
+in text that cannot be parsed as a number, the whole value remains the path.
+
+### Request selection
+
+The Images and Videos APIs accept a `lora` object or list. Each entry requires
+`name` and `path`; `scale` defaults to `1.0`, and `int_id` is optional:
+
+```json
+{
+  "lora": [
+    {"name": "accelerator", "path": "/path/to/accelerator.safetensors", "scale": 1.0},
+    {"name": "style", "path": "org/style-adapter", "scale": 0.6}
+  ]
+}
+```
+
+Request behavior is explicit:
+
+| Request `lora` value | Dynamic adapters used by the request |
+|---|---|
+| Field omitted or `null` | Startup `--dynamic-lora` composition |
+| `[]` | None |
+| One object | That adapter only |
+| List of objects | That weighted composition; it replaces the startup default |
+
+For example, a synchronous video request can reweight the startup adapter:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/v1/videos/sync \
+  -F 'model=BASE_MODEL' \
+  -F 'prompt=A cinematic wide shot of a singer on an open-air stage.' \
+  -F 'lora={"name":"accelerator","path":"/path/to/accelerator.safetensors","scale":0.8}'
+```
+
+The same object or list can be passed as the `lora` field of an Images API
+JSON request. Adapter names are labels; the path-derived stable integer ID is
+the default cache identity. If `int_id` is supplied explicitly, do not reuse
+that ID for a different path.
+
+Duplicate adapter IDs in one composition have their scales added, zero-scale
+results are removed, and non-finite scales are rejected. Requests with
+different adapter compositions are scheduled in separate diffusion batches.
+
+## Prefusion
+
+Use `--prefused-lora` to merge one or more weighted adapters into the dense
+weights at startup:
+
+```bash
+vllm serve BASE_MODEL \
+  --omni \
+  --prefused-lora /path/to/accelerator.safetensors=1.0 \
+  --prefused-lora /path/to/style-adapter=0.6
+```
+
+The backend accumulates each dense delta in FP32 and copies the merged result
+to the base dtype once. The fused contribution is permanent for the lifetime
+of the process: request-level `lora=[]` disables only dynamic adapters and
+cannot remove a prefused delta.
+
+Prefused and dynamic adapters may be used together. The resulting weight is:
+
+$$
+W' = W + \sum_{i \in P} s_i B_i A_i
+$$
+
+and a request evaluates:
+
+$$
+y = W'x + \sum_{j \in D} s_j B_j A_j x
+$$
+
+Do not specify the same adapter in both sets unless applying its delta twice
+is intentional. Prefusion is rejected for quantized diffusion weights because
+their serialized or runtime representation is not a dense floating-point
+weight that can safely receive an in-place LoRA delta.
+
+## Compile, offload, and cache capacity
+
+Dynamic adapters are installed before compilation, CPU/layerwise offload, and
+diffusion cache wrapping. These features fix the module graph, so preload an
+adapter that covers every target layer and enough total rank for later request
+compositions. After the graph is fixed, requests may select, disable, or
+reweight installed-compatible adapters, but they cannot introduce a new
+target layer or expand the allocated rank.
+
+`--max-cpu-loras` controls the per-worker adapter cache. Startup dynamic
+adapters are pinned, while request-loaded adapters use LRU eviction. Set the
+value to at least the number of pinned startup adapters plus the largest
+request-only composition that must coexist with them.
+
+Dynamic LoRA executes the dense base layer through its configured quantization
+method and adds the low-rank branch separately, so it can be combined with a
+quantized base model. This does not imply bitwise equality with an unquantized
+reference.
+
+## Sampling remains model-owned
+
+Loading an acceleration or distilled LoRA does not change timesteps, guidance,
+the scheduler, or the number of denoising steps. Set those independently
+through deployment defaults or request sampling parameters according to the
+adapter's published usage instructions.
+
+## Offline inference
+
+The same request types are available through the Python API:
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
-lora_path = "/path/to/lora_adapter"
-
+adapter_path = "/path/to/lora_adapter"
 omni = Omni(
     model="stabilityai/stable-diffusion-3.5-medium",
-    lora_path=lora_path,
-    lora_backend="peft",  # default, can be omitted
+    dynamic_lora=[f"{adapter_path}=1.0"],
 )
 
-lora_request = LoRARequest(
-    lora_name="preloaded",
-    lora_int_id=1,
-    lora_path=lora_path
+params = OmniDiffusionSamplingParams(
+    num_inference_steps=28,
+    lora_request=LoRARequest(
+        lora_name="style",
+        lora_int_id=1,
+        lora_path=adapter_path,
+    ),
+    lora_scale=0.8,
 )
-
-outputs = omni.generate(
-    prompt="A piece of cheesecake",
-    lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
-)
+outputs = omni.generate("A piece of cheesecake", params)
 ```
 
-#### Distill backend: fuse distilled LoRA at init
-
-For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
-
-##### Supported pipelines
-
-For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
-
-| Pipeline | Supported distilled LoRA repo | Notes |
-|----------|--------------------------------|-------|
-| `QwenImagePipeline` | `lightx2v/Qwen-Image-2512-Lightning` | Used with Qwen-Image-2512 Lightning-style few-step inference. |
-| `Wan22Pipeline` | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Wan2.1 uses one LoRA file. For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
-| `Wan22I2VPipeline` | `lightx2v/Wan2.2-Distill-Loras` | For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
-
-Other diffusion pipelines are not currently listed as supporting distilled LoRA. Use the PEFT backend for request-time adapters, or bake converted weights into a local Diffusers directory before serving.
-
-Single-file example (Qwen-Image-Lightning):
-
-```python
-from vllm_omni import Omni
-
-omni = Omni(
-    model="Qwen/Qwen-Image-2512",
-    lora_path="/path/to/Qwen-Image-2512-Lightning.safetensors",
-    lora_backend="distill",
-)
-
-outputs = omni.generate(prompt="A piece of cheesecake")
-```
-
-Multi-file example (Wan2.2 MoE, high + low noise):
-
-```python
-from vllm_omni import Omni
-
-omni = Omni(
-    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    lora_path=[
-        "/path/to/wan2.2_high_noise_lora.safetensors",   # -> transformer
-        "/path/to/wan2.2_low_noise_lora.safetensors",    # -> transformer_2
-    ],
-    lora_backend="distill",
-)
-```
-
-The CLI examples under `examples/offline_inference/` accept the same flags, e.g.:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-  --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --lora-backend distill \
-  --lora-path /path/to/high.safetensors /path/to/low.safetensors \
-  --prompt "A cat playing with yarn"
-```
-
-##### Online serving
-
-Distilled LoRAs can also be fused when an online diffusion server starts. The
-adapter remains active for the lifetime of that server, so requests do not pass
-a per-request `lora` field.
-
-```bash
-vllm serve Qwen/Qwen-Image-2512 \
-  --omni \
-  --port 8091 \
-  --lora-backend distill \
-  --lora-path /path/to/Qwen-Image-2512-Lightning-4steps.safetensors
-```
-
-Then send a normal generation request with the sampling settings expected by
-the distilled checkpoint:
-
-```bash
-curl -s http://localhost:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "A Chinese female college student, around 20 years old, with a very short haircut that conveys a gentle, artistic vibe. Her hair naturally falls to partially cover her cheeks, projecting a tomboyish yet charming demeanor. She has cool-toned fair skin and delicate features, with a slightly shy yet subtly confident expression—her mouth crooked in a playful, youthful smirk. She wears an off-shoulder top, revealing one shoulder, with a well-proportioned figure. The image is framed as a close-up selfie: she dominates the foreground, while the background clearly shows her dormitory—a neatly made bed with white linens on the top bunk, a tidy study desk with organized stationery, and wooden cabinets and drawers. The photo is captured on a smartphone under soft, even ambient lighting, with natural tones, high clarity, and a bright, lively atmosphere full of youthful, everyday energy."}
-    ],
-    "extra_body": {
-      "height": 1024,
-      "width": 1024,
-      "num_inference_steps": 4,
-      "true_cfg_scale": 1.0,
-      "seed": 42
-    }
-  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > qwen_image_distill_lora_output.png
-```
-
-For Wan2.2 MoE serving, pass the high-noise checkpoint first and the low-noise
-checkpoint second to `--lora-path`.
-
-!!! note "Server-side Path Requirement"
-    The LoRA adapter path (`local_path`) must be readable on the **server** machine. If your client and server are on different machines, ensure the LoRA adapter is accessible via a shared mount or copied to the server.
+For multiple adapters, pass matching tuples of `LoRARequest` and scales.
 
 ## Wan2.2 LightX2V Offline Assembly
 
@@ -238,7 +281,6 @@ Notes:
 
 - This route avoids runtime LoRA loading changes in vLLM-Omni when you choose to bake converted weights into a local Diffusers directory.
 - Output quality and speed depend on the replacement checkpoints and sampling params you choose.
-- If you only need to fuse distilled LoRAs into a Wan2.2 checkpoint at load time (without the full LightX2V convert + assemble pipeline), you can instead pass them directly via `--lora-backend distill --lora-path <high>.safetensors <low>.safetensors`. See the [Distill backend](#distill-backend-fuse-distilled-lora-at-init) section above.
 
 
 ## See Also
