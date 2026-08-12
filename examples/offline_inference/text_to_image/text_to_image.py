@@ -267,7 +267,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora-path",
         type=str,
-        nargs="+",
         default=None,
         help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
     )
@@ -278,13 +277,18 @@ def parse_args() -> argparse.Namespace:
         help="Scale factor for LoRA weights (default: 1.0).",
     )
     parser.add_argument(
-        "--lora-backend",
-        type=str,
-        default="peft",
-        choices=["peft", "distill"],
-        help="LoRA backend for loading LoRA adapters. Default: peft"
-        "'peft' loads a PEFT-format adapter folder, used e.g. for RL"
-        "'distill' fuses one or more concrete LoRA checkpoint files, used e.g. for distilled few-step LoRAs",
+        "--prefused-lora",
+        action="append",
+        default=None,
+        metavar="PATH[=SCALE]",
+        help="LoRA to merge into dense weights at startup. Repeat to compose adapters.",
+    )
+    parser.add_argument(
+        "--dynamic-lora",
+        action="append",
+        default=None,
+        metavar="PATH[=SCALE]",
+        help="LoRA to install dynamically at startup. Repeat to compose adapters.",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -421,12 +425,14 @@ def main():
     # Prepare LoRA kwargs for Omni initialization
     lora_args: dict[str, Any] = {}
     if args.lora_path:
-        lora_path = args.lora_path
-        if len(lora_path) == 1:
-            lora_path = lora_path[0]
-        lora_args["lora_path"] = lora_path
-        lora_args["lora_backend"] = args.lora_backend
-        print(f"Using LoRA from: {lora_path} with backend: {args.lora_backend}")
+        lora_args["lora_path"] = args.lora_path
+        print(f"Using request LoRA from: {args.lora_path}")
+    if args.prefused_lora:
+        lora_args["prefused_lora"] = args.prefused_lora
+        print(f"Prefusing LoRA composition: {args.prefused_lora}")
+    if args.dynamic_lora:
+        lora_args["dynamic_lora"] = args.dynamic_lora
+        print(f"Installing dynamic LoRA composition: {args.dynamic_lora}")
 
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
@@ -513,11 +519,8 @@ def main():
 
     # Build LoRA request when --lora-path is set
     lora_request = None
-    if args.lora_path and args.lora_backend == "peft":
-        if len(args.lora_path) != 1:
-            raise ValueError("Only one LoRA path is expected for PEFT backend.")
-
-        lora_path = args.lora_path[0]
+    if args.lora_path:
+        lora_path = args.lora_path
         lora_request_id = stable_lora_int_id(lora_path)
         lora_request = LoRARequest(
             lora_name=Path(lora_path).stem,

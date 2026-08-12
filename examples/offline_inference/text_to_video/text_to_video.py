@@ -373,10 +373,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora-path",
         type=str,
-        nargs="+",
         default=None,
-        help="Path to LoRA adapter folder (PEFT format) or concrete LoRA checkpoint files. Loaded at initialization and used for generation."
-        "Note: for Wan2.2 MoE models, two checkpoints positionally mapped to high-noise and low-noise modules.",
+        help="Path to one request-time LoRA adapter.",
     )
     parser.add_argument(
         "--lora-scale",
@@ -385,13 +383,18 @@ def parse_args() -> argparse.Namespace:
         help="Scale factor for LoRA weights (default: 1.0).",
     )
     parser.add_argument(
-        "--lora-backend",
-        type=str,
-        default="peft",
-        choices=["peft", "distill"],
-        help="LoRA backend for loading LoRA adapters. Default: peft"
-        "'peft' loads a PEFT-format adapter folder, used e.g. for RL"
-        "'distill' fuses one or more concrete LoRA checkpoint files, used e.g. for distilled few-step LoRAs",
+        "--prefused-lora",
+        action="append",
+        default=None,
+        metavar="PATH[=SCALE]",
+        help="LoRA to merge into dense weights at startup. Repeat to compose adapters.",
+    )
+    parser.add_argument(
+        "--dynamic-lora",
+        action="append",
+        default=None,
+        metavar="PATH[=SCALE]",
+        help="LoRA to install dynamically at startup. Repeat to compose adapters.",
     )
     parser.add_argument(
         "--use-hsdp",
@@ -496,11 +499,11 @@ def main():
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
     if args.lora_path is not None:
-        lora_path = args.lora_path
-        if len(lora_path) == 1:
-            lora_path = lora_path[0]
-        omni_kwargs["lora_path"] = lora_path
-        omni_kwargs["lora_backend"] = args.lora_backend
+        omni_kwargs["lora_path"] = args.lora_path
+    if args.prefused_lora:
+        omni_kwargs["prefused_lora"] = args.prefused_lora
+    if args.dynamic_lora:
+        omni_kwargs["dynamic_lora"] = args.dynamic_lora
 
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
@@ -532,11 +535,8 @@ def main():
     print(f"{'=' * 60}\n")
 
     lora_request = None
-    if args.lora_path and args.lora_backend == "peft":
-        if len(args.lora_path) != 1:
-            raise ValueError("Only one LoRA path is expected for PEFT backend.")
-
-        lora_path = args.lora_path[0]
+    if args.lora_path:
+        lora_path = args.lora_path
         lora_request_id = stable_lora_int_id(lora_path)
         lora_request = LoRARequest(
             lora_name=Path(lora_path).stem,

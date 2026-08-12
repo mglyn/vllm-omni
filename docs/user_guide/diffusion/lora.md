@@ -41,6 +41,13 @@ Single-file `.safetensors` adapters are also supported when their checkpoint
 layout is compatible with the selected pipeline. Check the corresponding
 recipe for supported adapter repositories and formats.
 
+Model-owned single-file adapters currently include MiniMax-H3 Turbo,
+Qwen-Image, Wan2.1 T2V, and Wan2.2 T2V. Wan2.2 assigns adapters containing
+`high_noise` and `low_noise` in their filenames to the corresponding
+transformers, so the two files can be passed in either CLI order. Current
+Wan2.2 I2V LightX2V files also contain dense and bias deltas; use the offline
+assembly workflow below because those tensors are not low-rank LoRA terms.
+
 ## Dynamic serving
 
 Install one adapter at startup and make it the deployment default:

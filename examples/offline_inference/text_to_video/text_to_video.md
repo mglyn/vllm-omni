@@ -232,9 +232,10 @@ python text_to_video.py \
 - `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (such as `fp8` for FP8).
 - `--flow-shift`: scheduler flow_shift parameter.
-- `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
+- `--lora-path`: path to one request-time LoRA adapter.
 - `--lora-scale`: scale factor for LoRA weights.
-- `--lora-backend`: backend for loading LoRA adapters. Default: peft. Available options: peft, distill.
+- `--prefused-lora`: `PATH[=SCALE]` adapter to fuse at startup; repeat to compose adapters.
+- `--dynamic-lora`: `PATH[=SCALE]` adapter to install dynamically at startup; repeat to compose adapters.
 - `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
 
 ### Wan2.2-specific

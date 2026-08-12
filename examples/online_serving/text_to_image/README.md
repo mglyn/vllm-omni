@@ -118,9 +118,9 @@ python gradio_demo.py
 
 ## LoRA
 
-This example supports both startup-time distilled LoRAs and request-time
-PEFT-compatible adapters. The LoRA path must be readable on the **server**
-machine (usually a local path or a mounted directory).
+This example supports startup-time prefusion and request-time dynamic LoRA.
+The LoRA path must be readable on the **server** machine (usually a local path
+or a mounted directory).
 
 ### Start Server with a Distilled LoRA
 
@@ -128,8 +128,7 @@ machine (usually a local path or a mounted directory).
 vllm serve Qwen/Qwen-Image-2512 \
   --omni \
   --port 8091 \
-  --lora-backend distill \
-  --lora-path /path/to/Qwen-Image-2512-Lightning-4steps.safetensors
+  --prefused-lora /path/to/Qwen-Image-2512-Lightning-4steps.safetensors
 ```
 
 The distilled LoRA is fused once during server initialization and applies to
