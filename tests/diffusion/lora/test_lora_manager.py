@@ -19,6 +19,7 @@ from vllm_omni.diffusion.lora.plan import (
     DiffusionLoRALoadPlan,
 )
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.types import WeightedLoRA
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -523,6 +524,42 @@ def test_prefused_and_dynamic_routes_share_the_same_delta_math():
     effective_weight = layer.base_layer.weight + dynamic_b @ dynamic_a
     expected = 0.25 * (b_1 @ a_1) + 0.75 * (b_2 @ a_2)
     torch.testing.assert_close(effective_weight, expected, rtol=0, atol=0)
+
+
+def test_prefused_bf16_weight_uses_single_rounding():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    layer = _FusableLoRALayer(in_features=1, out_features=1, max_rank=4)
+    layer.base_layer.to(dtype=torch.bfloat16)
+    with torch.no_grad():
+        layer.base_layer.weight.fill_(1.0)
+    layer.lora_a_stacked = [torch.zeros(1, 1, 4, 1, dtype=torch.bfloat16)]
+    layer.lora_b_stacked = [torch.zeros(1, 1, 1, 4, dtype=torch.bfloat16)]
+
+    lora_a = torch.tensor(
+        [-0.033203125, 0.10205078125, 0.0517578125, -0.08544921875],
+        dtype=torch.bfloat16,
+    ).view(4, 1)
+    lora_b = torch.tensor(
+        [0.0286865234375, -0.2001953125, -0.087890625, -0.006195068359375],
+        dtype=torch.bfloat16,
+    ).view(1, 4)
+    layer.set_lora(index=0, lora_a=lora_a, lora_b=lora_b)
+    manager._lora_modules = {"transformer.proj": layer}
+    manager._active_composition = (WeightedLoRA(request=_dummy_lora_request(1), scale=1.0),)
+
+    original_weight = layer.base_layer.weight.detach().clone()
+    delta = lora_b.float() @ lora_a.float()
+    expected = (original_weight.float() + delta).to(torch.bfloat16)
+    double_rounded = original_weight + delta.to(torch.bfloat16)
+    assert not torch.equal(double_rounded, expected)
+
+    manager._fuse_active_composition()
+
+    torch.testing.assert_close(layer.base_layer.weight, expected, rtol=0, atol=0)
 
 
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:

@@ -842,8 +842,10 @@ class DiffusionLoRAManager:
                         continue
                     a_tensor = lora_layer.lora_a_stacked[slice_idx][0, 0]
                     b_tensor = lora_layer.lora_b_stacked[slice_idx][0, 0]
-                    delta = torch.matmul(b_tensor.float(), a_tensor.float()).to(weight.dtype)
-                    weight[offset : offset + slice_size].add_(delta)
+                    weight_slice = weight[offset : offset + slice_size]
+                    merged_weight = weight_slice.float()
+                    merged_weight.addmm_(b_tensor.float(), a_tensor.float())
+                    weight_slice.copy_(merged_weight)
                     offset += slice_size
         self._deactivate_all_adapters()
 
