@@ -25,12 +25,16 @@ class DummyBaseLayerWithLoRA(torch.nn.Module):
         self.set_calls: list[
             tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
+        self.bias_calls: list[torch.Tensor | list[torch.Tensor | None] | None] = []
         self.reset_calls: int = 0
         self.create_calls: int = 0
 
     def set_lora(self, index: int, lora_a, lora_b):
         assert index == 0
         self.set_calls.append((lora_a, lora_b))
+
+    def set_additive_bias(self, bias):
+        self.bias_calls.append(bias)
 
     def reset_lora(self, index: int):
         assert index == 0

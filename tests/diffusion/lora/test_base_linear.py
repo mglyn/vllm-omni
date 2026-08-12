@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.lora.layers.base_linear import DiffusionBaseLinearLayerWithLoRA
+from vllm_omni.diffusion.lora.layers.row_parallel_linear import DiffusionRowParallelLinearWithLoRA
+from vllm_omni.diffusion.lora.layers.torch_linear import DiffusionTorchLinearWithLoRA
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -16,6 +18,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @dataclass
 class _DummyLoRAConfig:
     fully_sharded_loras: bool = False
+    max_lora_rank: int = 2
+    lora_dtype: torch.dtype = torch.float32
 
 
 class _DummyQuantMethod:
@@ -172,3 +176,58 @@ def test_diffusion_base_linear_apply_respects_inactive_slices():
     # Only the first slice should be adapted.
     expected = torch.tensor([[2.0, 4.0, 3.0]])
     assert torch.allclose(out, expected)
+
+
+def test_diffusion_base_linear_apply_adds_composed_additive_bias():
+    layer = DiffusionBaseLinearLayerWithLoRA.__new__(DiffusionBaseLinearLayerWithLoRA)
+    layer.tp_size = 1
+    layer.lora_config = _DummyLoRAConfig()
+    layer.base_layer = type("Base", (), {})()
+    layer.base_layer.quant_method = _DummyQuantMethod(torch.eye(3))
+    layer.lora_a_stacked = (torch.zeros((1, 1, 1, 3)),)
+    layer.lora_b_stacked = (torch.zeros((1, 1, 3, 1)),)
+    layer.output_slices = (3,)
+    layer._diffusion_lora_active_slices = (True,)
+    layer._diffusion_additive_bias = (torch.tensor([0.5, -1.0, 2.0]),)
+
+    output = layer.apply(torch.tensor([[1.0, 2.0, 3.0]]))
+
+    torch.testing.assert_close(output, torch.tensor([[1.5, 1.0, 5.0]]))
+
+
+def test_torch_linear_wrapper_applies_weight_and_bias_deltas():
+    base_layer = torch.nn.Linear(3, 2, bias=True)
+    with torch.no_grad():
+        base_layer.weight.zero_()
+        base_layer.bias.copy_(torch.tensor([1.0, -1.0]))
+    layer = DiffusionTorchLinearWithLoRA(base_layer)
+    layer.create_lora_weights(1, _DummyLoRAConfig())
+    layer.set_lora(
+        0,
+        lora_a=torch.tensor([[1.0, 0.0, 0.0]]),
+        lora_b=torch.tensor([[2.0], [3.0]]),
+    )
+    layer.set_additive_bias(torch.tensor([0.5, 1.5]))
+
+    output = layer(torch.tensor([[4.0, 5.0, 6.0]]))
+
+    torch.testing.assert_close(output, torch.tensor([[9.5, 12.5]]))
+
+
+@pytest.mark.parametrize(("tp_rank", "expects_bias"), [(0, True), (1, False)])
+def test_row_parallel_additive_bias_is_contributed_once(monkeypatch, tp_rank: int, expects_bias: bool):
+    received: list[torch.Tensor | list[torch.Tensor | None] | None] = []
+    monkeypatch.setattr(
+        DiffusionBaseLinearLayerWithLoRA,
+        "set_additive_bias",
+        lambda _self, bias: received.append(bias),
+    )
+    layer = DiffusionRowParallelLinearWithLoRA.__new__(DiffusionRowParallelLinearWithLoRA)
+    torch.nn.Module.__init__(layer)
+    layer.tp_size = 2
+    layer.tp_rank = tp_rank
+    bias = torch.tensor([1.0, 2.0])
+
+    layer.set_additive_bias(bias)
+
+    assert (received[0] is bias) is expects_bias

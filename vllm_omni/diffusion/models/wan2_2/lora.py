@@ -11,6 +11,8 @@ from diffusers.loaders.lora_conversion_utils import (
 )
 
 from vllm_omni.diffusion.lora.plan import (
+    AdditiveBiasUpdate,
+    ConvertedLoRAState,
     DiffusionLoRAApplyPlan,
     DiffusionLoRALoadPlan,
 )
@@ -24,6 +26,10 @@ _WAN_LORA_TARGETS = (
     "add_v_proj",
     "proj",
     "net_2",
+    "time_proj",
+    "proj_out",
+    "linear_1",
+    "linear_2",
 )
 
 WAN_LORA_APPLY_PLAN = DiffusionLoRAApplyPlan(
@@ -53,21 +59,18 @@ def convert_wan_lora_state_dict(
     state_dict: dict[str, torch.Tensor],
     *,
     component_name: str,
-) -> dict[str, torch.Tensor]:
+) -> ConvertedLoRAState:
     """Normalize one published Wan LoRA for the selected transformer."""
-
-    unsupported = [key for key in state_dict if key.endswith((".diff", ".diff_b", ".lora_B.bias"))]
-    if unsupported:
-        raise ValueError(
-            "This Wan adapter contains dense or bias deltas, which are not "
-            "representable by the shared low-rank LoRA backend: "
-            f"{unsupported[:3]}"
-        )
 
     if any(key.startswith("diffusion_model.") for key in state_dict):
         state_dict = _convert_non_diffusers_wan_lora_to_diffusers(dict(state_dict))
 
+    unsupported = [key for key in state_dict if key.endswith((".diff", ".diff_b"))]
+    if unsupported:
+        raise ValueError(f"This Wan adapter contains unsupported dense deltas: {unsupported[:3]}")
+
     converted: dict[str, torch.Tensor] = {}
+    auxiliary_updates: list[AdditiveBiasUpdate] = []
     for key, value in state_dict.items():
         key = key.replace(".ffn.net.0.", ".ffn.net_0.")
         key = key.replace(".ffn.net.2.", ".ffn.net_2.")
@@ -76,8 +79,19 @@ def convert_wan_lora_state_dict(
             key = f"{component_name}.{key.removeprefix('transformer.')}"
         elif not key.startswith(f"{component_name}."):
             key = f"{component_name}.{key}"
-        converted[key] = value
-    return converted
+        if key.endswith(".lora_B.bias"):
+            auxiliary_updates.append(
+                AdditiveBiasUpdate(
+                    module_name=key.removesuffix(".lora_B.bias"),
+                    tensor=value,
+                )
+            )
+        else:
+            converted[key] = value
+    return ConvertedLoRAState(
+        lora_tensors=converted,
+        auxiliary_updates=tuple(auxiliary_updates),
+    )
 
 
 def wan_lora_load_plan(
@@ -91,7 +105,7 @@ def wan_lora_load_plan(
 
     component_name = _wan_lora_component(adapter_path, has_transformer_2)
 
-    def convert(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def convert(state_dict: dict[str, torch.Tensor]) -> ConvertedLoRAState:
         return convert_wan_lora_state_dict(state_dict, component_name=component_name)
 
     return DiffusionLoRALoadPlan(

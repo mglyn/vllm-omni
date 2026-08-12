@@ -5,12 +5,36 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
 import torch
 
 LoRAStateDict = dict[str, torch.Tensor]
-LoRAStateDictConverter = Callable[[LoRAStateDict], LoRAStateDict]
+
+
+@dataclass(frozen=True)
+class DiffusionAdapterUpdate:
+    """Canonical non-low-rank update produced by a model converter."""
+
+    module_name: str
+
+
+@dataclass(frozen=True)
+class AdditiveBiasUpdate(DiffusionAdapterUpdate):
+    """Add a tensor to a linear module's output bias."""
+
+    tensor: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ConvertedLoRAState:
+    """Canonical output of a model-owned raw checkpoint converter."""
+
+    lora_tensors: LoRAStateDict
+    auxiliary_updates: tuple[DiffusionAdapterUpdate, ...] = ()
+
+
+LoRAStateDictConverter: TypeAlias = Callable[[LoRAStateDict], LoRAStateDict | ConvertedLoRAState]
 
 
 @dataclass(frozen=True)

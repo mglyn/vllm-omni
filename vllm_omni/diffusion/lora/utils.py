@@ -14,6 +14,7 @@ from vllm_omni.diffusion.lora.layers import (
     DiffusionQKVParallelLinearWithLoRA,
     DiffusionReplicatedLinearWithLoRA,
     DiffusionRowParallelLinearWithLoRA,
+    DiffusionTorchLinearWithLoRA,
 )
 
 
@@ -72,6 +73,7 @@ def from_layer_diffusion(
         DiffusionColumnParallelLinearWithLoRA,
         DiffusionRowParallelLinearWithLoRA,
         DiffusionReplicatedLinearWithLoRA,
+        DiffusionTorchLinearWithLoRA,
     ]
 
     for lora_cls in diffusion_lora_classes:

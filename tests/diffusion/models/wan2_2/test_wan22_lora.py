@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm_omni.diffusion.lora.plan import AdditiveBiasUpdate, ConvertedLoRAState
 from vllm_omni.diffusion.models.wan2_2.lora import (
     WAN_LORA_APPLY_PLAN,
     convert_wan_lora_state_dict,
@@ -40,7 +41,8 @@ def test_wan22_lora_plan_routes_by_noise_range(filename: str, component_name: st
     assert plan is not None
     assert plan.state_dict_converter is not None
     converted = plan.state_dict_converter(state_dict)
-    assert set(converted) == {
+    assert isinstance(converted, ConvertedLoRAState)
+    assert set(converted.lora_tensors) == {
         f"{component_name}.blocks.0.attn1.to_q.lora_A.weight",
         f"{component_name}.blocks.0.attn1.to_q.lora_B.weight",
         f"{component_name}.blocks.0.ffn.net_0.proj.lora_A.weight",
@@ -56,7 +58,9 @@ def test_wan_single_transformer_does_not_require_noise_range_name() -> None:
 
     assert plan is not None
     assert plan.state_dict_converter is not None
-    assert all(key.startswith("transformer.") for key in plan.state_dict_converter(state_dict))
+    converted = plan.state_dict_converter(state_dict)
+    assert isinstance(converted, ConvertedLoRAState)
+    assert all(key.startswith("transformer.") for key in converted.lora_tensors)
 
 
 def test_wan22_ambiguous_adapter_target_is_rejected() -> None:
@@ -68,12 +72,19 @@ def test_wan22_ambiguous_adapter_target_is_rejected() -> None:
         )
 
 
-def test_wan_dense_and_bias_deltas_are_rejected() -> None:
+def test_wan21_bias_deltas_are_normalized_for_shared_backend() -> None:
     state_dict = _published_wan_t2v_state_dict()
     state_dict["diffusion_model.blocks.0.self_attn.q.diff_b"] = torch.ones(4)
+    state_dict["diffusion_model.blocks.0.self_attn.norm_q.diff"] = torch.ones(4)
 
-    with pytest.raises(ValueError, match="dense or bias deltas"):
-        convert_wan_lora_state_dict(state_dict, component_name="transformer")
+    converted = convert_wan_lora_state_dict(state_dict, component_name="transformer")
+
+    assert not any(key.endswith((".diff", ".diff_b", ".bias")) for key in converted.lora_tensors)
+    assert len(converted.auxiliary_updates) == 1
+    update = converted.auxiliary_updates[0]
+    assert isinstance(update, AdditiveBiasUpdate)
+    assert update.module_name == "transformer.blocks.0.attn1.to_q"
+    assert update.tensor is state_dict["diffusion_model.blocks.0.self_attn.q.diff_b"]
 
 
 def test_wan_lora_plan_describes_both_transformers() -> None:

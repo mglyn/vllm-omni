@@ -13,11 +13,9 @@ from tests.diffusion.lora.helpers import (
     FakeLinearBase,
     fake_replace_submodule,
 )
+from vllm_omni.diffusion.lora.loader import LoadedDiffusionLoRA
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
-from vllm_omni.diffusion.lora.plan import (
-    DiffusionLoRAApplyPlan,
-    DiffusionLoRALoadPlan,
-)
+from vllm_omni.diffusion.lora.plan import AdditiveBiasUpdate, DiffusionLoRAApplyPlan
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.types import WeightedLoRA
 
@@ -31,11 +29,15 @@ class _DummyLoRALayer:
         self.set_calls: list[
             tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
+        self.bias_calls: list[torch.Tensor | list[torch.Tensor | None] | None] = []
         self.reset_calls: int = 0
 
     def set_lora(self, index: int, lora_a, lora_b):
         assert index == 0
         self.set_calls.append((lora_a, lora_b))
+
+    def set_additive_bias(self, bias):
+        self.bias_calls.append(bias)
 
     def reset_lora(self, index: int):
         assert index == 0
@@ -46,13 +48,20 @@ class _FusableLoRALayer:
     def __init__(self, in_features: int, out_features: int, max_rank: int):
         self.n_slices = 1
         self.output_slices = (out_features,)
-        self.base_layer = torch.nn.Linear(in_features, out_features, bias=False)
+        self.base_layer = torch.nn.Linear(in_features, out_features, bias=True)
         torch.nn.init.zeros_(self.base_layer.weight)
+        torch.nn.init.zeros_(self.base_layer.bias)
         self.lora_a_stacked = [torch.zeros(1, 1, max_rank, in_features)]
         self.lora_b_stacked = [torch.zeros(1, 1, out_features, max_rank)]
         self._diffusion_lora_active_slices = (False,)
+        self._diffusion_additive_bias = (None,)
 
-    def set_lora(self, index: int, lora_a: torch.Tensor, lora_b: torch.Tensor):
+    def set_lora(
+        self,
+        index: int,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+    ):
         assert index == 0
         rank = lora_a.shape[0]
         self.lora_a_stacked[0].zero_()
@@ -61,16 +70,25 @@ class _FusableLoRALayer:
         self.lora_b_stacked[0][0, 0, :, :rank].copy_(lora_b)
         self._diffusion_lora_active_slices = (True,)
 
+    def set_additive_bias(self, bias: torch.Tensor | None):
+        self._diffusion_additive_bias = (bias,)
+
     def reset_lora(self, index: int):
         assert index == 0
         self.lora_a_stacked[0].zero_()
         self.lora_b_stacked[0].zero_()
         self._diffusion_lora_active_slices = (False,)
+        self._diffusion_additive_bias = (None,)
 
 
 # Aliases for backward compatibility within this file
 _FakeLinearBase = FakeLinearBase
 _DummyBaseLayerWithLoRA = DummyBaseLayerWithLoRA
+
+
+def _loaded_lora(model, *updates) -> LoadedDiffusionLoRA:
+    peft_helper = type("PH", (), {})()
+    return LoadedDiffusionLoRA(model, peft_helper, tuple(updates))
 
 
 class _DummyPipeline(torch.nn.Module):
@@ -80,9 +98,7 @@ class _DummyPipeline(torch.nn.Module):
         self.transformer.foo = _FakeLinearBase()
 
 
-class _CustomPlanPipeline(torch.nn.Module):
-    """Test-only model extension for a synthetic raw adapter format."""
-
+class _CustomApplyPlanPipeline(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.custom_dit = torch.nn.Module()
@@ -93,26 +109,6 @@ class _CustomPlanPipeline(torch.nn.Module):
             component_names=("custom_dit",),
             target_modules=("proj",),
             packed_modules_mapping={"proj": ("query", "key")},
-        )
-
-    def get_lora_load_plan(
-        self,
-        adapter_path: str,
-        tensor_keys: tuple[str, ...],
-    ) -> DiffusionLoRALoadPlan | None:
-        del adapter_path
-        if "vendor.proj.down" not in tensor_keys:
-            return None
-
-        def convert(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-            return {
-                "proj.lora_A.weight": tensors["vendor.proj.down"],
-                "proj.lora_B.weight": tensors["vendor.proj.up"],
-            }
-
-        return DiffusionLoRALoadPlan(
-            peft_config={"lora_alpha": None, "target_modules": ["proj"]},
-            state_dict_converter=convert,
         )
 
 
@@ -146,30 +142,15 @@ class _DummyLM(torch.nn.Module):
         )
 
 
-def test_model_owned_plans_describe_custom_loading_and_application() -> None:
+def test_model_owned_apply_plan_describes_custom_application() -> None:
     manager = DiffusionLoRAManager(
-        pipeline=_CustomPlanPipeline(),
+        pipeline=_CustomApplyPlanPipeline(),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
     )
-    tensors = {
-        "vendor.proj.down": torch.ones(2, 4),
-        "vendor.proj.up": torch.ones(4, 2),
-    }
 
     assert manager._component_names() == ("custom_dit",)
     assert manager._packed_modules_mapping == {"proj": ["query", "key"]}
-
-    load_plan = manager._get_single_file_load_plan("custom.safetensors", tuple(tensors))
-    assert load_plan.peft_config == {
-        "lora_alpha": None,
-        "target_modules": ["proj"],
-    }
-    assert load_plan.state_dict_converter is not None
-    converted = load_plan.state_dict_converter(tensors)
-    assert set(converted) == {"proj.lora_A.weight", "proj.lora_B.weight"}
-    assert torch.equal(converted["proj.lora_A.weight"], tensors["vendor.proj.down"])
-    assert torch.equal(converted["proj.lora_B.weight"], tensors["vendor.proj.up"])
 
 
 def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypatch):
@@ -300,15 +281,17 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
         lora_b=B,
     )
     manager._registered_adapters = {
-        7: type(
-            "LM",
-            (),
-            {
-                "id": 7,
-                "loras": {"transformer.blocks.0.attn.to_qkv": lora},
-                "get_lora": lambda self, k: self.loras.get(k),
-            },
-        )()
+        7: _loaded_lora(
+            type(
+                "LM",
+                (),
+                {
+                    "id": 7,
+                    "loras": {"transformer.blocks.0.attn.to_qkv": lora},
+                    "get_lora": lambda self, k: self.loras.get(k),
+                },
+            )()
+        )
     }
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
@@ -352,15 +335,17 @@ def test_lora_manager_splits_fused_checkpoint_with_global_tp_sizes():
         lora_b=b,
     )
     manager._registered_adapters = {
-        7: type(
-            "LM",
-            (),
-            {
-                "id": 7,
-                "loras": {"transformer.blocks.0.mlp.fc1": lora},
-                "get_lora": lambda self, key: self.loras.get(key),
-            },
-        )()
+        7: _loaded_lora(
+            type(
+                "LM",
+                (),
+                {
+                    "id": 7,
+                    "loras": {"transformer.blocks.0.mlp.fc1": lora},
+                    "get_lora": lambda self, key: self.loras.get(key),
+                },
+            )()
+        )
     }
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
@@ -402,7 +387,7 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
         )
 
     manager._registered_adapters = {
-        1: type("LM", (), {"id": 1, "loras": loras, "get_lora": lambda self, k: self.loras.get(k)})()
+        1: _loaded_lora(type("LM", (), {"id": 1, "loras": loras, "get_lora": lambda self, k: self.loras.get(k)})())
     }
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
@@ -455,8 +440,8 @@ def test_lora_manager_composes_multiple_adapters_with_exact_math():
         )()
 
     manager._registered_adapters = {
-        1: _model(1, a_1, b_1),
-        2: _model(2, a_2, b_2),
+        1: _loaded_lora(_model(1, a_1, b_1)),
+        2: _loaded_lora(_model(2, a_2, b_2)),
     }
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(3)
     requests = (_dummy_lora_request(1), _dummy_lora_request(2))
@@ -484,8 +469,10 @@ def test_prefused_and_dynamic_routes_share_the_same_delta_math():
 
     a_1 = torch.tensor([[1.0, 2.0]])
     b_1 = torch.tensor([[3.0], [4.0]])
+    bias_1 = torch.tensor([2.0, -2.0])
     a_2 = torch.tensor([[2.0, -1.0]])
     b_2 = torch.tensor([[5.0], [6.0]])
+    bias_2 = torch.tensor([4.0, 8.0])
 
     def _model(adapter_id: int, a: torch.Tensor, b: torch.Tensor):
         weights = LoRALayerWeights(
@@ -506,8 +493,8 @@ def test_prefused_and_dynamic_routes_share_the_same_delta_math():
         )()
 
     manager._registered_adapters = {
-        1: _model(1, a_1, b_1),
-        2: _model(2, a_2, b_2),
+        1: _loaded_lora(_model(1, a_1, b_1), AdditiveBiasUpdate("transformer.proj", bias_1)),
+        2: _loaded_lora(_model(2, a_2, b_2), AdditiveBiasUpdate("transformer.proj", bias_2)),
     }
     manager._adapter_requests = {
         1: _dummy_lora_request(1),
@@ -517,6 +504,7 @@ def test_prefused_and_dynamic_routes_share_the_same_delta_math():
     manager._activate_adapter(1, scale=0.25)
     manager._fuse_active_composition()
     torch.testing.assert_close(layer.base_layer.weight, 0.25 * (b_1 @ a_1), rtol=0, atol=0)
+    torch.testing.assert_close(layer.base_layer.bias, 0.25 * bias_1, rtol=0, atol=0)
 
     manager._activate_adapter(2, scale=0.75)
     dynamic_a = layer.lora_a_stacked[0][0, 0]
@@ -524,6 +512,27 @@ def test_prefused_and_dynamic_routes_share_the_same_delta_math():
     effective_weight = layer.base_layer.weight + dynamic_b @ dynamic_a
     expected = 0.25 * (b_1 @ a_1) + 0.75 * (b_2 @ a_2)
     torch.testing.assert_close(effective_weight, expected, rtol=0, atol=0)
+    dynamic_bias = layer._diffusion_additive_bias[0]
+    assert dynamic_bias is not None
+    torch.testing.assert_close(layer.base_layer.bias + dynamic_bias, 0.25 * bias_1 + 0.75 * bias_2, rtol=0, atol=0)
+
+
+def test_additive_bias_update_does_not_require_low_rank_weights():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.proj": layer}
+    lora_model = type("LM", (), {"id": 1, "get_lora": lambda _self, _key: None})()
+    update = AdditiveBiasUpdate("transformer.proj", torch.tensor([2.0, -4.0]))
+    manager._registered_adapters = {1: _loaded_lora(lora_model, update)}
+
+    manager._activate_adapter(1, scale=0.25)
+
+    assert layer.reset_calls == 1
+    torch.testing.assert_close(layer.bias_calls[-1], torch.tensor([0.5, -1.0]))
 
 
 def test_prefused_bf16_weight_uses_single_rounding():
@@ -581,9 +590,9 @@ def test_lora_manager_evicts_lru_adapter_when_cache_full(monkeypatch):
     def _fake_load(_req: LoRARequest):
         lora_model = type("LM", (), {"id": _req.lora_int_id})()
         peft_helper = type("PH", (), {})()
-        return lora_model, peft_helper
+        return LoadedDiffusionLoRA(lora_model, peft_helper)
 
-    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
     monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
@@ -613,9 +622,9 @@ def test_lora_manager_does_not_evict_pinned_adapter(monkeypatch):
     def _fake_load(_req: LoRARequest):
         lora_model = type("LM", (), {"id": _req.lora_int_id})()
         peft_helper = type("PH", (), {})()
-        return lora_model, peft_helper
+        return LoadedDiffusionLoRA(lora_model, peft_helper)
 
-    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
     monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
@@ -639,9 +648,9 @@ def test_lora_manager_rejects_when_all_adapters_pinned(monkeypatch):
     def _fake_load(_req: LoRARequest):
         lora_model = type("LM", (), {"id": _req.lora_int_id})()
         peft_helper = type("PH", (), {})()
-        return lora_model, peft_helper
+        return LoadedDiffusionLoRA(lora_model, peft_helper)
 
-    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
     monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
@@ -681,11 +690,11 @@ def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
 
     def _fake_load(_req: LoRARequest):
         peft_helper = type("PH", (), {"r": rank})()
-        return lora_model, peft_helper
+        return LoadedDiffusionLoRA(lora_model, peft_helper)
 
-    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     manager._registered_adapters = {
-        adapter_id: lora_model,
+        adapter_id: _loaded_lora(lora_model),
     }
     manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
@@ -728,11 +737,11 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
 
     def _fake_load(_req: LoRARequest):
         peft_helper = type("PH", (), {"r": rank})()
-        return lora_model, peft_helper
+        return LoadedDiffusionLoRA(lora_model, peft_helper)
 
-    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     manager._registered_adapters = {
-        adapter_id: lora_model,
+        adapter_id: _loaded_lora(lora_model),
     }
     manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
@@ -786,9 +795,9 @@ def test_lora_manager_uses_valid_max_rank(monkeypatch):
     def _fake_load(_req: LoRARequest):
         lora_model = type("LM", (), {"id": _req.lora_int_id})()
         peft_helper = type("PH", (), {"r": unsupported_max_rank})()
-        return lora_model, peft_helper
+        return LoadedDiffusionLoRA(lora_model, peft_helper)
 
-    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     req1 = _dummy_lora_request(1)
     manager.add_adapter(req1)
     assert manager._max_lora_rank == supported_max_rank
@@ -808,9 +817,9 @@ def test_lora_manager_max_rank_validation(monkeypatch, rank):
     def _fake_load(_req: LoRARequest):
         lora_model = type("LM", (), {"id": _req.lora_int_id})()
         peft_helper = type("PH", (), {"r": lora_rank})()
-        return lora_model, peft_helper
+        return LoadedDiffusionLoRA(lora_model, peft_helper)
 
-    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     req1 = _dummy_lora_request(1)
     with pytest.raises(ValueError):
         manager.add_adapter(req1)

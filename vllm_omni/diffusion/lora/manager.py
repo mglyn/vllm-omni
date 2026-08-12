@@ -3,12 +3,10 @@
 
 import time
 from collections import OrderedDict
-from pathlib import Path
 from typing import get_args
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file
 from vllm.config.lora import LoRAConfig, MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
@@ -17,16 +15,16 @@ from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import (
-    get_adapter_absolute_path,
     get_supported_lora_modules,
     replace_submodule,
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
-from vllm_omni.diffusion.lora.plan import (
-    DiffusionLoRAApplyPlan,
-    DiffusionLoRALoadPlan,
+from vllm_omni.diffusion.lora.loader import (
+    DiffusionLoRAAdapterLoader,
+    LoadedDiffusionLoRA,
 )
+from vllm_omni.diffusion.lora.plan import AdditiveBiasUpdate, DiffusionLoRAApplyPlan
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
@@ -91,6 +89,12 @@ class DiffusionLoRAManager:
             self._supported_lora_modules,
             self._packed_modules_mapping,
         )
+        self._loader = DiffusionLoRAAdapterLoader(
+            pipeline=self.pipeline,
+            dtype=self.dtype,
+            expected_lora_modules=self._expected_lora_modules,
+            component_names=self._component_names(),
+        )
 
         # LRU-style cache management
         startup_dynamic = dynamic_loras
@@ -105,7 +109,7 @@ class DiffusionLoRAManager:
                 tuple(adapter.scale for adapter in dynamic_loras) + (lora_scale,),
             )
         self.max_cached_adapters = max(max_cached_adapters, len(prefused_loras), len(startup_dynamic), 1)
-        self._registered_adapters: dict[int, LoRAModel] = {}  # adapter_id -> LoRAModel
+        self._registered_adapters: dict[int, LoadedDiffusionLoRA] = {}
         self._adapter_requests: dict[int, LoRARequest] = {}
         self._active_composition: LoRAComposition = ()
         self._default_dynamic_composition: LoRAComposition = ()
@@ -277,106 +281,6 @@ class DiffusionLoRAManager:
 
         return mapping
 
-    def _get_single_file_load_plan(
-        self,
-        adapter_path: str,
-        tensor_keys: tuple[str, ...],
-    ) -> DiffusionLoRALoadPlan:
-        providers = [self.pipeline]
-        providers.extend(
-            component
-            for component_name in self._component_names()
-            if isinstance((component := getattr(self.pipeline, component_name, None)), nn.Module)
-        )
-        plans: list[DiffusionLoRALoadPlan] = []
-        for provider in providers:
-            resolver = getattr(provider, "get_lora_load_plan", None)
-            if not callable(resolver):
-                continue
-            plan = resolver(adapter_path, tensor_keys)
-            if plan is None:
-                continue
-            if not isinstance(plan, DiffusionLoRALoadPlan):
-                raise TypeError(
-                    f"{type(provider).__name__}.get_lora_load_plan() must return "
-                    f"DiffusionLoRALoadPlan or None, got {type(plan)!r}"
-                )
-            plans.append(plan)
-
-        if not plans:
-            raise ValueError(
-                "Raw single-file LoRA adapters require the diffusion model to "
-                "implement get_lora_load_plan(). Use a PEFT adapter directory "
-                "with adapter_config.json instead."
-            )
-        if any(plan != plans[0] for plan in plans[1:]):
-            raise ValueError("Diffusion components returned conflicting LoRA load plans")
-        return plans[0]
-
-    @staticmethod
-    def _find_single_lora_file(lora_path: str) -> str | None:
-        path = Path(lora_path)
-        if path.is_file():
-            if path.suffix != ".safetensors":
-                raise ValueError(f"Raw LoRA file must use safetensors, got {path}.")
-            return str(path)
-        if not path.is_dir() or (path / "adapter_config.json").is_file():
-            return None
-
-        candidates = sorted(path.glob("*.safetensors"))
-        if len(candidates) == 1:
-            return str(candidates[0])
-        if candidates:
-            raise ValueError(
-                f"LoRA repository {path} contains multiple safetensors files; pass the desired file path explicitly."
-            )
-        return None
-
-    @staticmethod
-    def _infer_single_file_rank(tensors: dict[str, torch.Tensor]) -> int:
-        ranks = {int(tensor.shape[0]) for name, tensor in tensors.items() if ".lora_A" in name and tensor.ndim == 2}
-        if len(ranks) != 1:
-            raise ValueError(f"Raw LoRA must contain one matrix rank, found {sorted(ranks)}.")
-        return ranks.pop()
-
-    def _load_single_file_adapter(
-        self,
-        lora_file: str,
-        lora_model_id: int,
-    ) -> tuple[LoRAModel, PEFTHelper]:
-        tensors = load_file(lora_file, device="cpu")
-        plan = self._get_single_file_load_plan(lora_file, tuple(tensors))
-        if plan.state_dict_converter is not None:
-            tensors = plan.state_dict_converter(tensors)
-        rank = self._infer_single_file_rank(tensors)
-        config = dict(plan.peft_config)
-        config["r"] = rank
-        # Raw diffusion LoRAs commonly omit alpha. The neutral interpretation
-        # is alpha == rank, so their internal multiplier is one.
-        if config.get("lora_alpha") is None:
-            config["lora_alpha"] = rank
-        peft_helper = PEFTHelper.from_dict(config)
-        lora_model = LoRAModel.from_lora_tensors(
-            lora_model_id=lora_model_id,
-            tensors=tensors,
-            peft_helper=peft_helper,
-            device="cpu",
-            dtype=self.dtype,
-            model_vocab_size=None,
-            weights_mapper=plan.weights_mapper,
-        )
-
-        incomplete = [
-            name for name, weights in lora_model.loras.items() if weights.lora_a is None or weights.lora_b is None
-        ]
-        unexpected = [name for name in lora_model.loras if name.rsplit(".", 1)[-1] not in self._expected_lora_modules]
-        if incomplete or unexpected:
-            raise ValueError(
-                f"Raw LoRA {lora_file} is incompatible with this diffusion model: "
-                f"incomplete={incomplete[:3]}, unexpected={unexpected[:3]}."
-            )
-        return lora_model, peft_helper
-
     def _get_packed_sublayer_suffixes(self, packed_module_suffix: str, n_slices: int) -> list[str] | None:
         sub_suffixes = self._packed_modules_mapping.get(packed_module_suffix)
         if not sub_suffixes:
@@ -447,66 +351,6 @@ class DiffusionLoRAManager:
 
     def _update_adapter_scale(self, adapter_id: int, lora_scale: float) -> None:
         self._adapter_scales[adapter_id] = lora_scale
-
-    def _load_adapter(
-        self,
-        lora_request: LoRARequest,
-    ) -> tuple[LoRAModel, PEFTHelper]:
-        if not self._expected_lora_modules:
-            raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
-
-        logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
-
-        lora_path = get_adapter_absolute_path(lora_request.lora_path)
-        logger.debug("Resolved LoRA path: %s", lora_path)
-
-        lora_file = self._find_single_lora_file(lora_path)
-        if lora_file is not None:
-            logger.info("Loading raw single-file LoRA from %s", lora_file)
-            lora_model, peft_helper = self._load_single_file_adapter(
-                lora_file,
-                lora_request.lora_int_id,
-            )
-            for lora in lora_model.loras.values():
-                lora.optimize()
-            return lora_model, peft_helper
-
-        peft_helper = PEFTHelper.from_local_dir(
-            lora_path,
-            max_position_embeddings=None,  # no need in diffusion
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-        )
-
-        logger.info(
-            "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
-            peft_helper.r,
-            peft_helper.lora_alpha,
-            peft_helper.target_modules,
-        )
-
-        lora_model = LoRAModel.from_local_checkpoint(
-            lora_path,
-            expected_lora_modules=self._expected_lora_modules,
-            peft_helper=peft_helper,
-            lora_model_id=lora_request.lora_int_id,
-            device="cpu",  # consistent w/ vllm's behavior
-            dtype=self.dtype,
-            model_vocab_size=None,
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            weights_mapper=None,
-        )
-
-        logger.info(
-            "Loaded LoRA model: id=%d, num_modules=%d, modules=%s",
-            lora_model.id,
-            len(lora_model.loras),
-            list(lora_model.loras.keys()),
-        )
-
-        for lora in lora_model.loras.values():
-            lora.optimize()  # ref: _create_merged_loras_inplace, internal scaling
-
-        return lora_model, peft_helper
 
     def _get_packed_modules_list(self, module: nn.Module) -> list[str]:
         """Return a packed_modules_list suitable for vLLM LoRA can_replace_layer().
@@ -739,6 +583,59 @@ class DiffusionLoRAManager:
 
         return [None] * n_slices, [None] * n_slices
 
+    @staticmethod
+    def _lookup_additive_bias(
+        loaded: LoadedDiffusionLoRA,
+        full_module_name: str,
+    ) -> torch.Tensor | None:
+        relative_name = full_module_name.split(".", 1)[-1] if "." in full_module_name else full_module_name
+        matches = [
+            update.tensor
+            for update in loaded.auxiliary_updates
+            if isinstance(update, AdditiveBiasUpdate) and update.module_name in {full_module_name, relative_name}
+        ]
+        if not matches:
+            matches = [
+                update.tensor
+                for update in loaded.auxiliary_updates
+                if isinstance(update, AdditiveBiasUpdate) and update.module_name.endswith(f".{full_module_name}")
+            ]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous additive bias updates for {full_module_name}")
+        return matches[0] if matches else None
+
+    def _get_additive_bias_slices(
+        self,
+        adapter_id: int,
+        full_module_name: str,
+        lora_layer: BaseLayerWithLoRA,
+    ) -> list[torch.Tensor | None]:
+        n_slices = int(getattr(lora_layer, "n_slices", 1))
+        loaded = self._registered_adapters[adapter_id]
+        bias = self._lookup_additive_bias(loaded, full_module_name)
+        if bias is not None:
+            if n_slices == 1:
+                return [bias]
+            output_sizes = getattr(lora_layer, "output_sizes", None)
+            if output_sizes is None:
+                output_sizes = getattr(lora_layer, "output_slices", None)
+            if output_sizes is None or bias.shape[0] != sum(output_sizes):
+                raise ValueError(
+                    f"Packed LoRA bias shape mismatch for {full_module_name}: "
+                    f"bias={tuple(bias.shape)}, output_sizes={output_sizes}"
+                )
+            return list(torch.split(bias, list(output_sizes), dim=0))
+
+        if n_slices > 1:
+            prefix, _, packed_suffix = full_module_name.rpartition(".")
+            sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, n_slices)
+            if sub_suffixes is not None:
+                return [
+                    self._lookup_additive_bias(loaded, f"{prefix}.{suffix}" if prefix else suffix)
+                    for suffix in sub_suffixes
+                ]
+        return [None] * n_slices
+
     def _compose_layer_slices(
         self,
         composition: LoRAComposition,
@@ -748,7 +645,7 @@ class DiffusionLoRAManager:
         n_slices = int(getattr(lora_layer, "n_slices", 1))
         slice_pairs: list[list[tuple[torch.Tensor, torch.Tensor]]] = [[] for _ in range(n_slices)]
         for adapter in composition:
-            lora_model = self._registered_adapters[adapter.adapter_id]
+            lora_model = self._registered_adapters[adapter.adapter_id].model
             lora_a, lora_b = self._get_layer_slices(lora_model, full_module_name, lora_layer)
             if len(lora_a) != n_slices or len(lora_b) != n_slices:
                 raise ValueError(f"LoRA slice count mismatch for {full_module_name}")
@@ -776,17 +673,52 @@ class DiffusionLoRAManager:
             composed_b.append(torch.cat([b for _, b in pairs], dim=1))
         return composed_a, composed_b
 
+    def _compose_additive_bias_slices(
+        self,
+        composition: LoRAComposition,
+        full_module_name: str,
+        lora_layer: BaseLayerWithLoRA,
+    ) -> list[torch.Tensor | None]:
+        n_slices = int(getattr(lora_layer, "n_slices", 1))
+        terms: list[list[torch.Tensor]] = [[] for _ in range(n_slices)]
+        for adapter in composition:
+            biases = self._get_additive_bias_slices(adapter.adapter_id, full_module_name, lora_layer)
+            for slice_terms, bias in zip(terms, biases, strict=True):
+                if bias is not None:
+                    slice_terms.append(bias * adapter.scale)
+
+        composed: list[torch.Tensor | None] = []
+        for slice_idx, slice_terms in enumerate(terms):
+            if not slice_terms:
+                composed.append(None)
+                continue
+            shapes = {tuple(tensor.shape) for tensor in slice_terms}
+            if len(shapes) != 1:
+                raise ValueError(
+                    f"Additive bias updates have incompatible shapes for {full_module_name} slice {slice_idx}"
+                )
+            composed.append(torch.stack(slice_terms).sum(dim=0))
+        return composed
+
     def _activate_composition(self, composition: LoRAComposition) -> None:
         if not composition:
             self._active_composition = ()
             self._active_adapter_id = None
             return
 
-        bound: dict[str, tuple[list[torch.Tensor | None], list[torch.Tensor | None]]] = {}
+        bound: dict[
+            str,
+            tuple[
+                list[torch.Tensor | None],
+                list[torch.Tensor | None],
+                list[torch.Tensor | None],
+            ],
+        ] = {}
         required_rank = 0
         for full_module_name, lora_layer in self._lora_modules.items():
             slices = self._compose_layer_slices(composition, full_module_name, lora_layer)
-            bound[full_module_name] = slices
+            bias_slices = self._compose_additive_bias_slices(composition, full_module_name, lora_layer)
+            bound[full_module_name] = (*slices, bias_slices)
             for a_tensor in slices[0]:
                 if a_tensor is not None:
                     required_rank = max(required_rank, a_tensor.shape[0])
@@ -794,7 +726,7 @@ class DiffusionLoRAManager:
             self._ensure_max_lora_rank(required_rank, reactivate=False)
 
         for full_module_name, lora_layer in self._lora_modules.items():
-            lora_a, lora_b = bound[full_module_name]
+            lora_a, lora_b, additive_bias = bound[full_module_name]
             if not any(a is not None for a in lora_a):
                 lora_layer.reset_lora(0)
             elif len(lora_a) == 1:
@@ -802,6 +734,7 @@ class DiffusionLoRAManager:
                 lora_layer.set_lora(index=0, lora_a=lora_a[0], lora_b=lora_b[0])
             else:
                 lora_layer.set_lora(index=0, lora_a=lora_a, lora_b=lora_b)
+            lora_layer.set_additive_bias(additive_bias[0] if len(additive_bias) == 1 else additive_bias)
 
         self._active_composition = composition
         self._active_adapter_id = composition[0].adapter_id if len(composition) == 1 else None
@@ -847,6 +780,18 @@ class DiffusionLoRAManager:
                     merged_weight.addmm_(b_tensor.float(), a_tensor.float())
                     weight_slice.copy_(merged_weight)
                     offset += slice_size
+
+                active_bias = getattr(lora_layer, "_diffusion_additive_bias", ())
+                if any(bias is not None for bias in active_bias):
+                    base_bias = getattr(base_layer, "bias", None)
+                    if not isinstance(base_bias, torch.Tensor):
+                        raise ValueError(f"Prefused LoRA bias requires a dense base bias for {full_module_name}")
+                    offset = 0
+                    for slice_size, bias in zip(output_slices, active_bias, strict=True):
+                        if bias is not None:
+                            bias_slice = base_bias[offset : offset + slice_size]
+                            bias_slice.copy_((bias_slice.float() + bias.float()).to(base_bias.dtype))
+                        offset += slice_size
         self._deactivate_all_adapters()
 
     def _deactivate_all_adapters(self) -> None:
@@ -903,9 +848,9 @@ class DiffusionLoRAManager:
         # so that we don't go over capacity on the new load
         self._evict_for_new_adapter()
 
-        lora_model, peft_helper = self._load_adapter(lora_request)
-        self._replace_layers_with_lora(peft_helper)
-        self._registered_adapters[adapter_id] = lora_model
+        loaded = self._loader.load_adapter(lora_request)
+        self._replace_layers_with_lora(loaded.peft_helper)
+        self._registered_adapters[adapter_id] = loaded
         self._adapter_requests[adapter_id] = lora_request
         self._touch_adapter_info(adapter_id)
 

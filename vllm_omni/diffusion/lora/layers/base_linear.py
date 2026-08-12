@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 
 
@@ -38,11 +39,13 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         object.__setattr__(self, "_diffusion_base_layer_ref", base_layer)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
+        self._diffusion_additive_bias = (None,) * int(n_slices)
 
     def reset_lora(self, index: int):
         super().reset_lora(index)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
+        self._diffusion_additive_bias = (None,) * int(n_slices)
 
     def set_lora(
         self,
@@ -66,6 +69,33 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # Single-slice layer.
             self._diffusion_lora_active_slices = (True,)
 
+    def set_additive_bias(
+        self,
+        bias: torch.Tensor | list[torch.Tensor | None] | None,
+    ) -> None:
+        n_slices = int(getattr(self, "n_slices", 1))
+        if bias is None:
+            self._diffusion_additive_bias = (None,) * n_slices
+            return
+
+        bias_slices = bias if isinstance(bias, list) else [bias]
+        if len(bias_slices) != n_slices:
+            raise ValueError(f"Additive bias slice mismatch: got {len(bias_slices)}, expected {n_slices}")
+        if self.tp_size > 1:
+            shaped_bias = [bias.unsqueeze(1) if bias is not None else None for bias in bias_slices]
+            if n_slices == 1:
+                assert shaped_bias[0] is not None
+                sliced_bias = [self.slice_lora_b(shaped_bias[0])]
+            else:
+                sliced_bias = self.slice_lora_b(shaped_bias)
+            bias_slices = [bias.squeeze(1) if bias is not None else None for bias in sliced_bias]
+
+        device = self.lora_b_stacked[0].device
+        dtype = self.lora_b_stacked[0].dtype
+        self._diffusion_additive_bias = tuple(
+            bias.to(device=device, dtype=dtype, non_blocking=True) if bias is not None else None for bias in bias_slices
+        )
+
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """
         override: Use simple matmul instead of punica_wrapper.add_lora_linear().
@@ -74,7 +104,19 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         for the single-LoRA case. For packed projections (e.g. fused QKV), we
         apply LoRA per-slice using `output_slices`.
         """
-        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+        quant_method = getattr(self.base_layer, "quant_method", None)
+        if quant_method is None:
+            output = F.linear(x, self.base_layer.weight, bias)
+        else:
+            output = quant_method.apply(self.base_layer, x, bias)
+
+        additive_bias = getattr(self, "_diffusion_additive_bias", ())
+        if any(bias is not None for bias in additive_bias):
+            output_offset = 0
+            for slice_size, bias in zip(self.output_slices, additive_bias, strict=True):
+                if bias is not None:
+                    output[..., output_offset : output_offset + slice_size] += bias
+                output_offset += slice_size
 
         if not hasattr(self, "lora_a_stacked") or not hasattr(self, "lora_b_stacked"):
             return output
