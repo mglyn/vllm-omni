@@ -14,7 +14,7 @@ from vllm_omni.diffusion.sched.interface import (
     RequestBatchSamplingParamsKey,
     _AdmissionWaitDecision,
 )
-from vllm_omni.lora.types import normalize_lora_composition, split_lora_composition
+from vllm_omni.lora.types import lora_batch_key_fields
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -43,14 +43,10 @@ def _normalize_explicit_flow_shift(value: object | None) -> float | None:
 def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
     """Build the compatibility key shared by scheduling and DP dispatch."""
     sampling = request.sampling_params
-    # LoRA identity is optional on sampling params (and on test stubs).
-    raw_lora_request = getattr(sampling, "lora_request", None)
-    composition = normalize_lora_composition(
-        raw_lora_request,
+    lora_int_id, lora_scale = lora_batch_key_fields(
+        getattr(sampling, "lora_request", None),
         getattr(sampling, "lora_scale", 1.0),
     )
-    _, canonical_scales = split_lora_composition(composition)
-    explicit_empty = raw_lora_request is not None and not composition
     key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
     extra_args = sampling.extra_args or {}
     # Match pipeline resolution for explicit overrides, but preserve None:
@@ -59,16 +55,8 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     key_kwargs["sample_solver"] = _normalize_explicit_sample_solver(extra_args.get("sample_solver"))
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
-    key_kwargs["lora_int_id"] = (
-        ()
-        if explicit_empty
-        else None
-        if not composition
-        else composition[0].adapter_id
-        if len(composition) == 1
-        else tuple(adapter.adapter_id for adapter in composition)
-    )
-    key_kwargs["lora_scale"] = () if explicit_empty else canonical_scales
+    key_kwargs["lora_int_id"] = lora_int_id
+    key_kwargs["lora_scale"] = lora_scale
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 

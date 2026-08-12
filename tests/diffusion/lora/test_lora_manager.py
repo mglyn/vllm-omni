@@ -295,7 +295,7 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
     }
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
-    manager._activate_adapter(7, 0.5)
+    _activate_single_composition(manager, 7, 0.5)
 
     assert packed_layer.reset_calls == 0
     assert len(packed_layer.set_calls) == 1
@@ -349,7 +349,7 @@ def test_lora_manager_splits_fused_checkpoint_with_global_tp_sizes():
     }
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
-    manager._activate_adapter(7, 1.0)
+    _activate_single_composition(manager, 7, 1.0)
 
     lora_a, lora_b = packed_layer.set_calls[-1]
     assert isinstance(lora_a, list)
@@ -391,7 +391,7 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     }
     manager._max_lora_rank = manager._get_smallest_valid_max_rank(rank)
 
-    manager._activate_adapter(1, scale=2.0)
+    _activate_single_composition(manager, 1, scale=2.0)
 
     assert packed_layer.reset_calls == 0
     assert len(packed_layer.set_calls) == 1
@@ -501,12 +501,12 @@ def test_prefused_and_dynamic_routes_share_the_same_delta_math():
         2: _dummy_lora_request(2),
     }
 
-    manager._activate_adapter(1, scale=0.25)
+    _activate_single_composition(manager, 1, scale=0.25)
     manager._fuse_active_composition()
     torch.testing.assert_close(layer.base_layer.weight, 0.25 * (b_1 @ a_1), rtol=0, atol=0)
     torch.testing.assert_close(layer.base_layer.bias, 0.25 * bias_1, rtol=0, atol=0)
 
-    manager._activate_adapter(2, scale=0.75)
+    _activate_single_composition(manager, 2, scale=0.75)
     dynamic_a = layer.lora_a_stacked[0][0, 0]
     dynamic_b = layer.lora_b_stacked[0][0, 0]
     effective_weight = layer.base_layer.weight + dynamic_b @ dynamic_a
@@ -529,10 +529,63 @@ def test_additive_bias_update_does_not_require_low_rank_weights():
     update = AdditiveBiasUpdate("transformer.proj", torch.tensor([2.0, -4.0]))
     manager._registered_adapters = {1: _loaded_lora(lora_model, update)}
 
-    manager._activate_adapter(1, scale=0.25)
+    _activate_single_composition(manager, 1, scale=0.25)
 
     assert layer.reset_calls == 1
     torch.testing.assert_close(layer.bias_calls[-1], torch.tensor([0.5, -1.0]))
+
+
+def test_auxiliary_update_must_bind_to_an_installed_lora_module():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    manager._lora_modules = {"transformer.proj": _DummyLoRALayer(n_slices=1, output_slices=(2,))}
+    loaded = _loaded_lora(
+        type("LM", (), {})(),
+        AdditiveBiasUpdate("transformer.missing", torch.ones(2)),
+    )
+
+    with pytest.raises(ValueError, match="does not match any installed LoRA module"):
+        manager._validate_auxiliary_update_bindings(loaded)
+
+
+def test_auxiliary_update_shape_is_validated_when_bound():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    manager._lora_modules = {"transformer.proj": _DummyLoRALayer(n_slices=1, output_slices=(2,))}
+    loaded = _loaded_lora(
+        type("LM", (), {})(),
+        AdditiveBiasUpdate("transformer.proj", torch.ones(1)),
+    )
+
+    with pytest.raises(ValueError, match=r"got \(1,\), expected \(2,\)"):
+        manager._validate_auxiliary_update_bindings(loaded)
+
+
+def test_auxiliary_update_binds_to_a_packed_logical_sublayer():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    manager._packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
+    manager._lora_modules = {
+        "transformer.block.attn.to_qkv": _DummyLoRALayer(
+            n_slices=3,
+            output_slices=(4, 2, 2),
+        )
+    }
+    loaded = _loaded_lora(
+        type("LM", (), {})(),
+        AdditiveBiasUpdate("transformer.block.attn.to_q", torch.ones(4)),
+    )
+
+    manager._validate_auxiliary_update_bindings(loaded)
 
 
 def test_prefused_bf16_weight_uses_single_rounding():
@@ -579,6 +632,10 @@ def _dummy_lora_request(adapter_id: int) -> LoRARequest:
     )
 
 
+def _activate_single_composition(manager: DiffusionLoRAManager, adapter_id: int, scale: float) -> None:
+    manager._activate_composition((WeightedLoRA(request=_dummy_lora_request(adapter_id), scale=scale),))
+
+
 def test_lora_manager_evicts_lru_adapter_when_cache_full(monkeypatch):
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),
@@ -594,7 +651,6 @@ def test_lora_manager_evicts_lru_adapter_when_cache_full(monkeypatch):
 
     monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
     req1 = _dummy_lora_request(1)
     req2 = _dummy_lora_request(2)
@@ -626,7 +682,6 @@ def test_lora_manager_does_not_evict_pinned_adapter(monkeypatch):
 
     monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
     manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
     assert manager.pin_adapter(1)
@@ -652,7 +707,6 @@ def test_lora_manager_rejects_when_all_adapters_pinned(monkeypatch):
 
     monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
     manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
     manager.set_active_adapter(_dummy_lora_request(2), lora_scale=1.0)
@@ -765,17 +819,6 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
     lora_a, lora_b = lora_model.transformer.foo.set_calls[1]
     assert torch.all(lora_a == 1)
     assert torch.all(lora_b == initial_scale)
-
-
-def test_scale_keys_preserve_exact_value():
-    manager = DiffusionLoRAManager(
-        pipeline=_DummyPipeline(),
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-    )
-    adapter_id = 1
-    manager._update_adapter_scale(adapter_id, 0.0031)
-    assert manager._adapter_scales[adapter_id] == 0.0031
 
 
 def test_lora_manager_uses_valid_max_rank(monkeypatch):

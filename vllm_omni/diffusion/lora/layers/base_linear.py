@@ -8,6 +8,31 @@ import torch.nn.functional as F
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 
 
+def get_global_output_sizes(lora_layer: object) -> tuple[int, ...]:
+    """Return checkpoint-visible output sizes for a possibly TP-sharded layer."""
+
+    n_slices = int(getattr(lora_layer, "n_slices", 1))
+    base_layer = getattr(lora_layer, "base_layer", None)
+    output_sizes = getattr(lora_layer, "output_sizes", None)
+    if output_sizes is None:
+        output_sizes = getattr(base_layer, "output_sizes", None)
+    if n_slices > 1 and output_sizes is not None and len(output_sizes) == n_slices:
+        return tuple(int(size) for size in output_sizes)
+
+    output_size = getattr(base_layer, "output_size", None)
+    if output_size is None:
+        output_size = getattr(lora_layer, "output_size", None)
+    if output_size is None and output_sizes is not None:
+        output_size = sum(output_sizes)
+    if n_slices == 1 and output_size is not None:
+        return (int(output_size),)
+
+    output_slices = tuple(int(size) for size in getattr(lora_layer, "output_slices", ()))
+    if len(output_slices) != n_slices:
+        raise RuntimeError(f"LoRA output slice metadata mismatch: got {len(output_slices)}, expected {n_slices}")
+    return output_slices
+
+
 class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     """
     Diffusion-specific base that overrides apply() to use direct torch matmul
@@ -69,6 +94,18 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # Single-slice layer.
             self._diffusion_lora_active_slices = (True,)
 
+    @staticmethod
+    def _validate_bias_shapes(
+        bias_slices: list[torch.Tensor | None],
+        output_sizes: tuple[int, ...],
+    ) -> None:
+        for slice_idx, (bias, output_size) in enumerate(zip(bias_slices, output_sizes, strict=True)):
+            if bias is not None and tuple(bias.shape) != (output_size,):
+                raise ValueError(
+                    f"Additive bias shape mismatch for slice {slice_idx}: "
+                    f"got {tuple(bias.shape)}, expected {(output_size,)}"
+                )
+
     def set_additive_bias(
         self,
         bias: torch.Tensor | list[torch.Tensor | None] | None,
@@ -81,6 +118,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         bias_slices = bias if isinstance(bias, list) else [bias]
         if len(bias_slices) != n_slices:
             raise ValueError(f"Additive bias slice mismatch: got {len(bias_slices)}, expected {n_slices}")
+        self._validate_bias_shapes(bias_slices, get_global_output_sizes(self))
         if self.tp_size > 1:
             shaped_bias = [bias.unsqueeze(1) if bias is not None else None for bias in bias_slices]
             if n_slices == 1:
@@ -89,6 +127,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             else:
                 sliced_bias = self.slice_lora_b(shaped_bias)
             bias_slices = [bias.squeeze(1) if bias is not None else None for bias in sliced_bias]
+        self._validate_bias_shapes(bias_slices, tuple(int(size) for size in self.output_slices))
 
         device = self.lora_b_stacked[0].device
         dtype = self.lora_b_stacked[0].dtype
@@ -115,7 +154,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             output_offset = 0
             for slice_size, bias in zip(self.output_slices, additive_bias, strict=True):
                 if bias is not None:
-                    output[..., output_offset : output_offset + slice_size] += bias
+                    output[..., output_offset : output_offset + slice_size] += bias.to(
+                        device=output.device, non_blocking=True
+                    )
                 output_offset += slice_size
 
         if not hasattr(self, "lora_a_stacked") or not hasattr(self, "lora_b_stacked"):
@@ -159,8 +200,10 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 offset += slice_size
                 continue
 
-            A = self.lora_a_stacked[slice_idx][0, 0, :, :]  # (rank, in_dim)
-            B = self.lora_b_stacked[slice_idx][0, 0, :, :]  # (out_dim, rank)
+            A = self.lora_a_stacked[slice_idx][0, 0, :, :].to(device=x_flat.device, non_blocking=True)  # (rank, in_dim)
+            B = self.lora_b_stacked[slice_idx][0, 0, :, :].to(
+                device=x_flat.device, non_blocking=True
+            )  # (out_dim, rank)
 
             if A.numel() == 0 or B.numel() == 0:
                 offset += slice_size

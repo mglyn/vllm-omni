@@ -62,6 +62,22 @@ def convert_wan_lora_state_dict(
 ) -> ConvertedLoRAState:
     """Normalize one published Wan LoRA for the selected transformer."""
 
+    # Diffusers silently drops unsupported ``.diff`` tensors such as norm
+    # deltas because published adapters normally store them as zero-valued
+    # placeholders. Preserve that compatibility, but never discard a real
+    # dense update. ``head.head.diff`` is the one dense delta that the upstream
+    # converter explicitly represents as a LoRA A/B pair.
+    unsupported_dense_deltas = {
+        key: value
+        for key, value in state_dict.items()
+        if key.endswith(".diff") and not key.removeprefix("diffusion_model.").endswith("head.head.diff")
+    }
+    nonzero_dense_deltas = [key for key, value in unsupported_dense_deltas.items() if torch.count_nonzero(value).item()]
+    if nonzero_dense_deltas:
+        raise ValueError(f"This Wan adapter contains unsupported non-zero dense deltas: {nonzero_dense_deltas[:3]}")
+    if unsupported_dense_deltas:
+        state_dict = {key: value for key, value in state_dict.items() if key not in unsupported_dense_deltas}
+
     if any(key.startswith("diffusion_model.") for key in state_dict):
         state_dict = _convert_non_diffusers_wan_lora_to_diffusers(dict(state_dict))
 

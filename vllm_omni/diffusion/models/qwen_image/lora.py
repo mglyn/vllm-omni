@@ -58,11 +58,15 @@ def convert_qwen_image_lora_state_dict(
     """Normalize published Qwen-Image LoRAs for the shared backend."""
 
     has_alpha = any(key.endswith(".alpha") for key in state_dict)
-    is_diffusers_format = any(key.endswith(".lora_A.weight") for key in state_dict)
-    if has_alpha and is_diffusers_format:
+    diffusers_lora_keys = [key for key in state_dict if key.endswith((".lora_A.weight", ".lora_B.weight"))]
+    component_prefixes = {key.startswith("transformer.") for key in diffusers_lora_keys}
+    if len(component_prefixes) > 1:
+        raise ValueError("Qwen-Image LoRA mixes component-prefixed and unprefixed Diffusers keys")
+    is_component_prefixed = component_prefixes == {True}
+    if has_alpha and diffusers_lora_keys:
         state_dict = _fold_diffusers_alpha(state_dict)
 
-    if has_alpha or any(
+    if (has_alpha and not is_component_prefixed) or any(
         key.startswith(("diffusion_model.", "lora_unet_")) or ".lora_down.weight" in key for key in state_dict
     ):
         state_dict = _convert_non_diffusers_qwen_lora_to_diffusers(dict(state_dict))

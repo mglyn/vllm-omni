@@ -32,6 +32,8 @@ class WeightedLoRA:
 
 LoRAComposition: TypeAlias = tuple[WeightedLoRA, ...]
 LoRACompositionKey: TypeAlias = tuple[tuple[int, float], ...]
+LoRABatchAdapterKey: TypeAlias = int | tuple[int, ...] | None
+LoRABatchScaleKey: TypeAlias = float | tuple[float, ...]
 
 
 def normalize_lora_composition(
@@ -91,6 +93,26 @@ def split_lora_composition(
     if len(composition) == 1:
         return composition[0].request, composition[0].scale
     return tuple(adapter.request for adapter in composition), tuple(adapter.scale for adapter in composition)
+
+
+def lora_batch_key_fields(
+    requests: LoRARequestInput,
+    scales: LoRAScaleInput = 1.0,
+) -> tuple[LoRABatchAdapterKey, LoRABatchScaleKey]:
+    """Return canonical adapter identity and scale fields for batching."""
+
+    composition = normalize_lora_composition(requests, scales)
+    if requests is not None and not composition:
+        # An explicit empty composition disables a deployment default and must
+        # remain distinct from an omitted request.
+        return (), ()
+    if not composition:
+        return None, 1.0
+    adapter_ids: LoRABatchAdapterKey = (
+        composition[0].adapter_id if len(composition) == 1 else tuple(adapter.adapter_id for adapter in composition)
+    )
+    _, canonical_scales = split_lora_composition(composition)
+    return adapter_ids, canonical_scales
 
 
 def parse_lora_adapter_spec(value: str | Mapping[str, Any]) -> WeightedLoRA:

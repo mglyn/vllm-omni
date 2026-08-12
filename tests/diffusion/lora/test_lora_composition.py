@@ -10,6 +10,7 @@ from vllm.lora.request import LoRARequest
 
 from vllm_omni.entrypoints.openai.utils import parse_lora_request
 from vllm_omni.lora.types import (
+    lora_batch_key_fields,
     normalize_lora_composition,
     parse_lora_adapter_specs,
 )
@@ -45,6 +46,15 @@ def test_composition_rejects_invalid_scales_and_id_collisions() -> None:
             (_request(1, "/tmp/a"), _request(1, "/tmp/b")),
             (1.0, 1.0),
         )
+
+
+def test_batch_key_fields_preserve_omitted_and_explicit_empty_semantics() -> None:
+    assert lora_batch_key_fields(None) == (None, 1.0)
+    assert lora_batch_key_fields((), ()) == ((), ())
+    assert lora_batch_key_fields((_request(2), _request(1)), (0.25, 0.75)) == (
+        (1, 2),
+        (0.75, 0.25),
+    )
 
 
 def test_startup_specs_support_repeated_weighted_adapters() -> None:

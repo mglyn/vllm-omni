@@ -40,6 +40,46 @@ def test_qwen_image_published_lora_conversion_preserves_alpha_scale() -> None:
     )
 
 
+def test_qwen_image_diffusers_lora_alpha_does_not_repeat_conversion() -> None:
+    lora_a = torch.ones(2, 3)
+    lora_b = torch.ones(4, 2)
+    converted = convert_qwen_image_lora_state_dict(
+        {
+            "transformer.transformer_blocks.0.attn.to_q.lora_A.weight": lora_a,
+            "transformer.transformer_blocks.0.attn.to_q.lora_B.weight": lora_b,
+            "transformer.transformer_blocks.0.attn.to_q.alpha": torch.tensor(1.0),
+        }
+    )
+
+    assert set(converted) == {
+        "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+        "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+    }
+    torch.testing.assert_close(
+        converted["transformer.transformer_blocks.0.attn.to_q.lora_B.weight"],
+        lora_b * 0.5,
+    )
+
+
+def test_qwen_image_unprefixed_diffusers_keys_receive_component_prefix() -> None:
+    converted = convert_qwen_image_lora_state_dict(
+        {
+            "transformer_blocks.0.attn.to_q.lora_A.weight": torch.ones(2, 3),
+            "transformer_blocks.0.attn.to_q.lora_B.weight": torch.ones(4, 2),
+            "transformer_blocks.0.attn.to_q.alpha": torch.tensor(1.0),
+        }
+    )
+
+    assert set(converted) == {
+        "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+        "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+    }
+    torch.testing.assert_close(
+        converted["transformer.transformer_blocks.0.attn.to_q.lora_B.weight"],
+        torch.full((4, 2), 0.5),
+    )
+
+
 def test_qwen_image_lora_plan_describes_packed_projections() -> None:
     plan = qwen_image_lora_load_plan(
         "lightning.safetensors",

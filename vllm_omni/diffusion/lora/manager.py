@@ -20,6 +20,7 @@ from vllm.lora.utils import (
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
+from vllm_omni.diffusion.lora.layers.base_linear import get_global_output_sizes
 from vllm_omni.diffusion.lora.loader import (
     DiffusionLoRAAdapterLoader,
     LoadedDiffusionLoRA,
@@ -34,7 +35,6 @@ from vllm_omni.lora.types import (
     LoRAComposition,
     LoRARequestInput,
     LoRAScaleInput,
-    WeightedLoRA,
     lora_composition_key,
     normalize_lora_composition,
 )
@@ -113,10 +113,6 @@ class DiffusionLoRAManager:
         self._adapter_requests: dict[int, LoRARequest] = {}
         self._active_composition: LoRAComposition = ()
         self._default_dynamic_composition: LoRAComposition = ()
-        # Compatibility alias for callers/tests that inspect the historical
-        # single-adapter state. It is None for zero or multiple adapters.
-        self._active_adapter_id: int | None = None
-        self._adapter_scales: dict[int, float] = {}  # adapter_id -> external scale
 
         # LRU cache tracking (adapter_id -> last_used_time)
         self._adapter_access_order: OrderedDict[int, float] = OrderedDict()
@@ -349,9 +345,6 @@ class DiffusionLoRAManager:
         self._adapter_access_order[adapter_id] = time.time()
         self._adapter_access_order.move_to_end(adapter_id)
 
-    def _update_adapter_scale(self, adapter_id: int, lora_scale: float) -> None:
-        self._adapter_scales[adapter_id] = lora_scale
-
     def _get_packed_modules_list(self, module: nn.Module) -> list[str]:
         """Return a packed_modules_list suitable for vLLM LoRA can_replace_layer().
 
@@ -497,7 +490,6 @@ class DiffusionLoRAManager:
         if reactivate and self._active_composition:
             active = self._active_composition
             self._active_composition = ()
-            self._active_adapter_id = None
             self._activate_composition(active)
 
     @classmethod
@@ -584,25 +576,61 @@ class DiffusionLoRAManager:
         return [None] * n_slices, [None] * n_slices
 
     @staticmethod
+    def _module_name_matches(update_name: str, full_module_name: str) -> bool:
+        relative_name = full_module_name.split(".", 1)[-1] if "." in full_module_name else full_module_name
+        return update_name in {full_module_name, relative_name} or update_name.endswith(f".{full_module_name}")
+
+    @staticmethod
     def _lookup_additive_bias(
         loaded: LoadedDiffusionLoRA,
         full_module_name: str,
     ) -> torch.Tensor | None:
-        relative_name = full_module_name.split(".", 1)[-1] if "." in full_module_name else full_module_name
         matches = [
             update.tensor
             for update in loaded.auxiliary_updates
-            if isinstance(update, AdditiveBiasUpdate) and update.module_name in {full_module_name, relative_name}
+            if isinstance(update, AdditiveBiasUpdate)
+            and DiffusionLoRAManager._module_name_matches(update.module_name, full_module_name)
         ]
-        if not matches:
-            matches = [
-                update.tensor
-                for update in loaded.auxiliary_updates
-                if isinstance(update, AdditiveBiasUpdate) and update.module_name.endswith(f".{full_module_name}")
-            ]
         if len(matches) > 1:
             raise ValueError(f"Ambiguous additive bias updates for {full_module_name}")
         return matches[0] if matches else None
+
+    def _validate_auxiliary_update_bindings(self, loaded: LoadedDiffusionLoRA) -> None:
+        for update in loaded.auxiliary_updates:
+            if not isinstance(update, AdditiveBiasUpdate):
+                continue
+
+            matches: dict[tuple[str, int | None], int] = {}
+            for full_module_name, lora_layer in self._lora_modules.items():
+                output_sizes = get_global_output_sizes(lora_layer)
+                if self._module_name_matches(update.module_name, full_module_name):
+                    matches[(full_module_name, None)] = sum(output_sizes)
+
+                if len(output_sizes) <= 1:
+                    continue
+                prefix, _, packed_suffix = full_module_name.rpartition(".")
+                sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, len(output_sizes))
+                if sub_suffixes is None:
+                    continue
+                for slice_idx, (sub_suffix, output_size) in enumerate(zip(sub_suffixes, output_sizes, strict=True)):
+                    sub_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
+                    if self._module_name_matches(update.module_name, sub_name):
+                        matches[(full_module_name, slice_idx)] = output_size
+
+            if not matches:
+                raise ValueError(
+                    f"Additive bias update {update.module_name!r} does not match any installed LoRA module"
+                )
+            if len(matches) > 1:
+                targets = [name if slice_idx is None else f"{name}[{slice_idx}]" for name, slice_idx in matches]
+                raise ValueError(f"Additive bias update {update.module_name!r} is ambiguous across {targets}")
+
+            expected_size = next(iter(matches.values()))
+            if tuple(update.tensor.shape) != (expected_size,):
+                raise ValueError(
+                    f"Additive bias update shape mismatch for {update.module_name}: "
+                    f"got {tuple(update.tensor.shape)}, expected {(expected_size,)}"
+                )
 
     def _get_additive_bias_slices(
         self,
@@ -616,10 +644,8 @@ class DiffusionLoRAManager:
         if bias is not None:
             if n_slices == 1:
                 return [bias]
-            output_sizes = getattr(lora_layer, "output_sizes", None)
-            if output_sizes is None:
-                output_sizes = getattr(lora_layer, "output_slices", None)
-            if output_sizes is None or bias.shape[0] != sum(output_sizes):
+            output_sizes = get_global_output_sizes(lora_layer)
+            if bias.shape[0] != sum(output_sizes):
                 raise ValueError(
                     f"Packed LoRA bias shape mismatch for {full_module_name}: "
                     f"bias={tuple(bias.shape)}, output_sizes={output_sizes}"
@@ -703,7 +729,6 @@ class DiffusionLoRAManager:
     def _activate_composition(self, composition: LoRAComposition) -> None:
         if not composition:
             self._active_composition = ()
-            self._active_adapter_id = None
             return
 
         bound: dict[
@@ -737,22 +762,7 @@ class DiffusionLoRAManager:
             lora_layer.set_additive_bias(additive_bias[0] if len(additive_bias) == 1 else additive_bias)
 
         self._active_composition = composition
-        self._active_adapter_id = composition[0].adapter_id if len(composition) == 1 else None
-        for adapter in composition:
-            self._update_adapter_scale(adapter.adapter_id, adapter.scale)
         logger.info("Activated LoRA composition %s", lora_composition_key(composition))
-
-    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
-        """Backward-compatible single-adapter activation helper."""
-
-        request = self._adapter_requests.get(adapter_id)
-        if request is None:
-            request = LoRARequest(
-                lora_name=f"adapter-{adapter_id}",
-                lora_int_id=adapter_id,
-                lora_path=f"registered://{adapter_id}",
-            )
-        self._activate_composition((WeightedLoRA(request=request, scale=scale),))
 
     def _fuse_active_composition(self) -> None:
         """Permanently merge the active rank-local delta into dense weights."""
@@ -802,7 +812,6 @@ class DiffusionLoRAManager:
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
         self._active_composition = ()
-        self._active_adapter_id = None
         logger.debug("All adapters deactivated")
 
     def _evict_for_new_adapter(self) -> None:
@@ -850,6 +859,7 @@ class DiffusionLoRAManager:
 
         loaded = self._loader.load_adapter(lora_request)
         self._replace_layers_with_lora(loaded.peft_helper)
+        self._validate_auxiliary_update_bindings(loaded)
         self._registered_adapters[adapter_id] = loaded
         self._adapter_requests[adapter_id] = lora_request
         self._touch_adapter_info(adapter_id)
@@ -873,7 +883,6 @@ class DiffusionLoRAManager:
 
         del self._registered_adapters[adapter_id]
         self._adapter_requests.pop(adapter_id, None)
-        self._adapter_scales.pop(adapter_id, None)
         self._adapter_access_order.pop(adapter_id, None)
         self._pinned_adapters.discard(adapter_id)
         logger.debug(

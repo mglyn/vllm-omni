@@ -75,7 +75,7 @@ def test_wan22_ambiguous_adapter_target_is_rejected() -> None:
 def test_wan21_bias_deltas_are_normalized_for_shared_backend() -> None:
     state_dict = _published_wan_t2v_state_dict()
     state_dict["diffusion_model.blocks.0.self_attn.q.diff_b"] = torch.ones(4)
-    state_dict["diffusion_model.blocks.0.self_attn.norm_q.diff"] = torch.ones(4)
+    state_dict["diffusion_model.blocks.0.self_attn.norm_q.diff"] = torch.zeros(4)
 
     converted = convert_wan_lora_state_dict(state_dict, component_name="transformer")
 
@@ -85,6 +85,14 @@ def test_wan21_bias_deltas_are_normalized_for_shared_backend() -> None:
     assert isinstance(update, AdditiveBiasUpdate)
     assert update.module_name == "transformer.blocks.0.attn1.to_q"
     assert update.tensor is state_dict["diffusion_model.blocks.0.self_attn.q.diff_b"]
+
+
+def test_wan_nonzero_unsupported_dense_delta_is_rejected() -> None:
+    state_dict = _published_wan_t2v_state_dict()
+    state_dict["diffusion_model.blocks.0.self_attn.norm_q.diff"] = torch.ones(4)
+
+    with pytest.raises(ValueError, match="unsupported non-zero dense deltas.*norm_q.diff"):
+        convert_wan_lora_state_dict(state_dict, component_name="transformer")
 
 
 def test_wan_lora_plan_describes_both_transformers() -> None:

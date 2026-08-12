@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm_omni.diffusion.lora.layers.base_linear import DiffusionBaseLinearLayerWithLoRA
 from vllm_omni.diffusion.lora.layers.row_parallel_linear import DiffusionRowParallelLinearWithLoRA
@@ -212,6 +213,32 @@ def test_torch_linear_wrapper_applies_weight_and_bias_deltas():
     output = layer(torch.tensor([[4.0, 5.0, 6.0]]))
 
     torch.testing.assert_close(output, torch.tensor([[9.5, 12.5]]))
+
+
+def test_torch_linear_wrapper_rejects_additive_bias_shape_mismatch():
+    layer = DiffusionTorchLinearWithLoRA(torch.nn.Linear(3, 2))
+    layer.create_lora_weights(1, _DummyLoRAConfig())
+
+    with pytest.raises(ValueError, match=r"got \(1,\), expected \(2,\)"):
+        layer.set_additive_bias(torch.ones(1))
+
+
+def test_torch_linear_wrapper_moves_cpu_sidecars_to_input_device():
+    # Offload only tracks parameters and buffers, while the dynamic LoRA
+    # sidecars are plain tensors. Simulate an offloaded layer whose base weight
+    # and input are on CUDA but whose LoRA tensors remain on CPU.
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        base_layer = torch.nn.Linear(3, 2, device="cuda")
+        layer = DiffusionTorchLinearWithLoRA(base_layer)
+        layer.create_lora_weights(1, _DummyLoRAConfig())
+        layer.lora_a_stacked = tuple(tensor.cpu() for tensor in layer.lora_a_stacked)
+        layer.lora_b_stacked = tuple(tensor.cpu() for tensor in layer.lora_b_stacked)
+        layer._diffusion_lora_active_slices = (True,)
+        layer._diffusion_additive_bias = (torch.zeros(2),)
+
+        output = layer(torch.randn(1, 3, device="cuda"))
+
+    assert output.device.type == "cuda"
 
 
 @pytest.mark.parametrize(("tp_rank", "expects_bias"), [(0, True), (1, False)])
