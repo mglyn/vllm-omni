@@ -16,8 +16,8 @@ from tests.diffusion.lora.helpers import (
 from vllm_omni.diffusion.lora.loader import LoadedDiffusionLoRA
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.lora.plan import AdditiveBiasUpdate, DiffusionLoRAApplyPlan
+from vllm_omni.diffusion.lora.types import WeightedLoRA
 from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.types import WeightedLoRA
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

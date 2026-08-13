@@ -1,5 +1,6 @@
 import copy
 import pprint
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
 
@@ -9,7 +10,7 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.lora.types import LoRARequestInput, LoRAScaleInput
+from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
@@ -317,8 +318,8 @@ class OmniDiffusionSamplingParams:
     return_frames: bool = False
 
     # LoRA
-    lora_request: LoRARequestInput = None
-    lora_scale: LoRAScaleInput = 1.0
+    lora_request: LoRARequest | Sequence[LoRARequest] | None = None
+    lora_scale: float | Sequence[float] = 1.0
 
     # STA parameters
     STA_param: list | None = None

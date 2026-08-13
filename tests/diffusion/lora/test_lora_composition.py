@@ -8,12 +8,12 @@ import math
 import pytest
 from vllm.lora.request import LoRARequest
 
-from vllm_omni.entrypoints.openai.utils import parse_lora_request
-from vllm_omni.lora.types import (
+from vllm_omni.diffusion.lora.types import (
     lora_batch_key_fields,
     normalize_lora_composition,
     parse_lora_adapter_specs,
 )
+from vllm_omni.entrypoints.openai.utils import parse_lora_request
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

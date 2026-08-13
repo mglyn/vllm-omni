@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
+from vllm_omni.diffusion.lora.types import lora_batch_key_fields
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -14,7 +15,6 @@ from vllm_omni.diffusion.sched.interface import (
     RequestBatchSamplingParamsKey,
     _AdmissionWaitDecision,
 )
-from vllm_omni.lora.types import lora_batch_key_fields
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import RunnerOutput

@@ -15,6 +15,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVAdmissionError, DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.lora.types import lora_batch_key_fields
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -28,7 +29,6 @@ from vllm_omni.diffusion.sched.interface import (
     _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
-from vllm_omni.lora.types import lora_batch_key_fields
 
 logger = init_logger(__name__)
 

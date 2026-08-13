@@ -36,6 +36,7 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.types import parse_lora_adapter_specs
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsPromptUpdate,
@@ -67,7 +68,6 @@ from vllm_omni.diffusion.worker.utils import (
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.types import parse_lora_adapter_specs
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 

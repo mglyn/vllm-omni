@@ -26,17 +26,17 @@ from vllm_omni.diffusion.lora.loader import (
     LoadedDiffusionLoRA,
 )
 from vllm_omni.diffusion.lora.plan import AdditiveBiasUpdate, DiffusionLoRAApplyPlan
-from vllm_omni.diffusion.lora.utils import (
-    _expand_expected_modules_for_packed_layers,
-    _match_target_modules,
-    from_layer_diffusion,
-)
-from vllm_omni.lora.types import (
+from vllm_omni.diffusion.lora.types import (
     LoRAComposition,
     LoRARequestInput,
     LoRAScaleInput,
     lora_composition_key,
     normalize_lora_composition,
+)
+from vllm_omni.diffusion.lora.utils import (
+    _expand_expected_modules_for_packed_layers,
+    _match_target_modules,
+    from_layer_diffusion,
 )
 from vllm_omni.lora.utils import stable_lora_int_id
 

@@ -10,7 +10,7 @@ from vllm_omni.diffusion.lora.plan import (
     DiffusionLoRALoadPlan,
     SupportsDiffusionLoRAPlan,
 )
-from vllm_omni.lora.types import WeightedLoRA
+from vllm_omni.diffusion.lora.types import WeightedLoRA
 
 __all__ = [
     "AdditiveBiasUpdate",

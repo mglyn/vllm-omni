@@ -52,6 +52,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.types import LoRARequestInput, LoRAScaleInput
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -66,7 +67,6 @@ from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.types import LoRARequestInput, LoRAScaleInput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.types import (
+from vllm_omni.diffusion.lora.types import (
     LoRARequestInput,
     LoRAScaleInput,
     normalize_lora_composition,
     split_lora_composition,
 )
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 
