@@ -314,7 +314,7 @@ class LTXRuntime(
             if phase.adapter_slot is not None:
                 raise RuntimeError(f"LTX phase {phase.name!r} requires adapter slot {phase.adapter_slot!r}.")
             return
-        phase_adapter.activate(phase.adapter_slot)
+        phase_adapter.activate(phase.adapter_slot, strength=phase.adapter_strength)
 
     def eval(self):
         result = super().eval()
@@ -733,6 +733,29 @@ class LTXRuntime(
             forward_ctx,
             denoise_ctx,
             preserve_positive_velocity=forward_ctx.sampler == "euler_ancestral",
+        )
+
+    def _predict_denoised_for_step(
+        self,
+        index: int,
+        timestep: torch.Tensor,
+        state: latent_ops.LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+        *,
+        video_sigma: torch.Tensor,
+        audio_sigma: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.guidance_executor.predict_denoised(
+            self,
+            self._guidance_plan,
+            index,
+            timestep,
+            state,
+            forward_ctx,
+            denoise_ctx,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
         )
 
     def _denoise_step(

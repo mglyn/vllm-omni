@@ -213,6 +213,8 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("two_stage", "2"): LTX2_TWO_STAGE_COMPONENT_PROFILE,
     ("two_stage", "2.3"): LTX23_TWO_STAGE_COMPONENT_PROFILE,
     ("two_stage", "2.5"): LTX25_TWO_STAGE_COMPONENT_PROFILE,
+    ("two_stage_hq", "2.3"): LTX23_TWO_STAGE_COMPONENT_PROFILE,
+    ("two_stage_hq", "2.5"): LTX25_TWO_STAGE_COMPONENT_PROFILE,
     ("distilled_one_stage", "2"): LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
     ("distilled_one_stage", "2.3"): LTX23_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
     ("distilled_one_stage", "2.5"): LTX25_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,

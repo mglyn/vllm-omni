@@ -28,6 +28,7 @@ EXCLUDED_MODELS = [
     "WanPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
+    "LTX2TwoStageHQPipeline",
     "LTX2DistilledOneStagePipeline",
     "LTX2DistilledTwoStagePipeline",
     "LTX2DistilledPipeline",
