@@ -77,12 +77,16 @@ FL2VA partition. Loading the adapter and selecting its four-step sampling plan
 are explicit, independent settings:
 
 ```bash
+TURBO_LORA=$(hf download lightx2v/Minimax-h3-Turbo \
+  minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors)
+
 vllm serve MiniMaxAI/MiniMax-H3 \
   --omni \
   --trust-remote-code \
   --task-type fl2va \
-  --dynamic-lora lightx2v/Minimax-h3-Turbo=1.0 \
-  --default-sampling-params '{"0":{"num_inference_steps":5}}'
+  --dynamic-lora "$TURBO_LORA=1.0" \
+  --default-sampling-params \
+    '{"0":{"num_inference_steps":5,"extra_args":{"flow_shift":6.0,"audio_flow_shift":3.0}}}'
 ```
 
 `--dynamic-lora` installs and enables the adapter before compilation without
@@ -102,19 +106,23 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/videos/sync" \
   -F 'model=MiniMaxAI/MiniMax-H3' \
   -F 'prompt=A cinematic wide shot of a singer on an open-air stage.' \
   -F 'num_inference_steps=5' \
-  -F 'lora={"name":"turbo","path":"lightx2v/Minimax-h3-Turbo","scale":1.0}'
+  -F 'flow_shift=6' \
+  -F 'extra_params={"audio_flow_shift":3.0}' \
+  -F "lora={\"name\":\"turbo\",\"path\":\"$TURBO_LORA\",\"scale\":1.0}"
 ```
 
 With compile or offload enabled, preload the adapter before the graph is fixed.
 A request may then select, disable (`lora=[]`), or reweight it without changing
 its sampling step count.
 
-The H3 integration formally supports the raw
-`lightx2v/Minimax-h3-Turbo` checkpoint layout only. Other H3 LoRA publication
-formats require their own model-side normalization plan and are not part of
-this recipe's compatibility contract. Do not specify Turbo in both prefused
-and dynamic sets unless applying its weight delta twice is intentional. Turbo
-targets only the FL2VA transformer; a Ref2VA-only service rejects it.
+The H3 integration formally supports the Diffusers-format FL2VA adapters in
+`lightx2v/Minimax-h3-Turbo`. Download and pass a specific safetensors file: the
+repository now contains several task, step-count, resolution, and ComfyUI
+variants. Other H3 LoRA publication formats require their own model-side
+normalization plan and are not part of this recipe's compatibility contract.
+Do not specify Turbo in both prefused and dynamic sets unless applying its
+weight delta twice is intentional. Turbo targets only the FL2VA transformer; a
+Ref2VA-only service rejects it.
 
 ### Memory and storage requirements
 
