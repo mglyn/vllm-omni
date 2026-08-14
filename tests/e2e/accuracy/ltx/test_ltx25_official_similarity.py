@@ -111,30 +111,10 @@ LTX25_FULL_AUDIO_RELATIVE_L2_THRESHOLD = 0.3
 LTX25_FULL_VIDEO_LPIPS_MEAN_THRESHOLD = 0.01
 LTX25_FULL_I2V_VIDEO_LPIPS_MEAN_THRESHOLD = 0.02
 LTX25_FULL_AUDIO_COSINE_THRESHOLD = AUDIO_COSINE_THRESHOLD
-# Res2s deliberately injects noise after each BF16 model evaluation. The two
-# runtimes start from bitwise-identical latents and schedules, but small kernel
-# rounding differences are amplified by later stochastic second-order steps.
-# These manual-only gates guard perceptual/semantic parity without pretending
-# that the final decoded tensors should retain deterministic Euler tolerances.
-LTX25_HQ_VIDEO_SSIM_MEAN_THRESHOLD = 0.72
-LTX25_HQ_VIDEO_SSIM_MIN_THRESHOLD = 0.68
-LTX25_HQ_VIDEO_PSNR_MEAN_THRESHOLD = 17.0
-LTX25_HQ_VIDEO_LPIPS_MEAN_THRESHOLD = 0.22
-LTX25_HQ_AUDIO_RELATIVE_L2_THRESHOLD = 0.60
-LTX25_HQ_AUDIO_COSINE_THRESHOLD = 0.82
 LTX25_STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
 
-def _ltx25_full_thresholds(task: str, pipeline_mode: str) -> dict[str, float]:
-    if pipeline_mode == "full_two_stage_hq":
-        return {
-            "video_ssim_mean": LTX25_HQ_VIDEO_SSIM_MEAN_THRESHOLD,
-            "video_ssim_min": LTX25_HQ_VIDEO_SSIM_MIN_THRESHOLD,
-            "video_psnr_mean_db": LTX25_HQ_VIDEO_PSNR_MEAN_THRESHOLD,
-            "video_lpips_mean": LTX25_HQ_VIDEO_LPIPS_MEAN_THRESHOLD,
-            "audio_relative_l2": LTX25_HQ_AUDIO_RELATIVE_L2_THRESHOLD,
-            "audio_cosine": LTX25_HQ_AUDIO_COSINE_THRESHOLD,
-        }
+def _ltx25_full_thresholds(task: str) -> dict[str, float]:
     return {
         "video_ssim_mean": LTX25_FULL_VIDEO_SSIM_MEAN_THRESHOLD,
         "video_ssim_min": LTX25_FULL_VIDEO_SSIM_MIN_THRESHOLD,
@@ -790,7 +770,7 @@ def _run_ltx25_full_comparison(accuracy_artifact_root: Path, task: str, pipeline
         np.load(official_output / "audio.npy"),
         np.load(omni_output / "audio.npy"),
     )
-    thresholds = _ltx25_full_thresholds(task, pipeline_mode)
+    thresholds = _ltx25_full_thresholds(task)
     result = {
         "case": f"ltx2_5_{pipeline_mode}",
         "task": task,
@@ -810,7 +790,7 @@ def _run_ltx25_full_comparison(accuracy_artifact_root: Path, task: str, pipeline
             "omni_parent_allocated": omni_metadata["peak_memory_allocated_mb"],
             "omni_parent_reserved": omni_metadata["peak_memory_reserved_mb"],
         },
-        "threshold_profile": "res2s_hq" if pipeline_mode == "full_two_stage_hq" else "full_euler",
+        "threshold_profile": "full_strict",
         "thresholds": thresholds,
         "video": video_metrics,
         "audio": audio_metrics,

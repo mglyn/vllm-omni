@@ -85,17 +85,6 @@ STRICT_THRESHOLDS = LTXAccuracyThresholds(
     audio_cosine_similarity=0.95,
 )
 
-# Res2s feeds every BF16 forward into a stochastic second-order update, so
-# harmless backend rounding grows across the phase. Keep a meaningful manual
-# parity floor while reserving the strict thresholds for deterministic Euler.
-RES2S_HQ_THRESHOLDS = LTXAccuracyThresholds(
-    video_ssim_mean=0.70,
-    video_ssim_min=0.65,
-    video_psnr_mean_db=16.0,
-    audio_relative_l2=0.65,
-    audio_cosine_similarity=0.80,
-)
-
 
 @dataclass(frozen=True)
 class LTXAccuracyCase:
@@ -335,7 +324,7 @@ MANUAL_HQ_CASES = (
         seed=10,
         stg_block=None,
         enable_layerwise_offload=True,
-        thresholds=RES2S_HQ_THRESHOLDS,
+        thresholds=STRICT_THRESHOLDS,
     ),
 )
 
