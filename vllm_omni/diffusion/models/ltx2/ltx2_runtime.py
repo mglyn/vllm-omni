@@ -29,6 +29,7 @@ from vllm_omni.platforms import current_omni_platform
 from . import ltx2_latents as latent_ops
 from .ltx2_components import (
     LTXComponentProfile,
+    _ltx2_use_diffusion_decoder,
     detect_ltx_model_version,
     initialize_pipeline_components,
     resolve_ltx_component_profile,
@@ -145,6 +146,9 @@ class LTXRuntime(
                 "Use the default ulysses_mode='strict' for LTX sequence parallelism."
             )
         self.model_version = detect_ltx_model_version(od_config.model, revision=getattr(od_config, "revision", None))
+        self.use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config)
+        if self.use_diffusion_decoder and self.model_version != "2.5":
+            raise ValueError("ltx2_use_diffusion_decoder is supported only by LTX-2.5 checkpoints.")
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
         if getattr(od_config, "cache_backend", "none") == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:
@@ -155,6 +159,8 @@ class LTXRuntime(
         self._dit_modules = list(self.component_profile.dit_modules)
         self._encoder_modules = list(self.component_profile.encoder_modules)
         self._vae_modules = list(self.component_profile.vae_modules)
+        if self.use_diffusion_decoder:
+            self._vae_modules.append("diffusion_decoder")
         self._resident_modules = list(self.component_profile.resident_modules)
         if self.model_version in ("2.3", "2.5"):
             self.preserve_sp_padded_audio_duration = True
@@ -519,7 +525,10 @@ class LTXRuntime(
             return self._make_output((latents, audio_latents))
 
         latents = latents.to(connector_prompt_embeds.dtype)
-        if not self.vae.config.timestep_conditioning:
+        use_diffusion_decoder = getattr(self, "use_diffusion_decoder", False)
+        if use_diffusion_decoder:
+            timestep_decode = None
+        elif not self.vae.config.timestep_conditioning:
             timestep_decode = None
         else:
             noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
@@ -537,13 +546,25 @@ class LTXRuntime(
         is_output_rank = not dist_initialized or torch.distributed.get_rank() == 0
         vae_decode_needs_all_ranks = False
         is_distributed_vae_enabled = getattr(self.vae, "is_distributed_enabled", None)
-        if self.distributed_video_decode and dist_initialized and callable(is_distributed_vae_enabled):
+        if (
+            not use_diffusion_decoder
+            and self.distributed_video_decode
+            and dist_initialized
+            and callable(is_distributed_vae_enabled)
+        ):
             # Distributed tiled decode is collective, so every rank must enter it.
             vae_decode_needs_all_ranks = bool(is_distributed_vae_enabled())
 
         should_decode_video = not self.distributed_video_decode or is_output_rank or vae_decode_needs_all_ranks
         if should_decode_video:
-            video = self.vae.decode(latents.to(self.vae.dtype), timestep_decode, return_dict=False)[0]
+            if use_diffusion_decoder:
+                video = self.diffusion_decoder.decode(
+                    latents.to(self.diffusion_decoder.dtype),
+                    generator=generator,
+                    return_dict=False,
+                )[0]
+            else:
+                video = self.vae.decode(latents.to(self.vae.dtype), timestep_decode, return_dict=False)[0]
         else:
             video = torch.empty(0, device=latents.device, dtype=latents.dtype)
 

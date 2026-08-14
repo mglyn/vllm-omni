@@ -11,6 +11,125 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class TestLTXDiffusionDecoder:
+    @pytest.mark.parametrize(
+        ("extras", "expected"),
+        [({}, False), ({"ltx2_use_diffusion_decoder": True}, True)],
+    )
+    def test_diffusion_decoder_opt_in_is_ltx2_model_extra(self, extras, expected):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder
+
+        assert _ltx2_use_diffusion_decoder(SimpleNamespace(extras=extras)) is expected
+
+    def test_diffusion_decoder_opt_in_rejects_non_boolean_model_extra(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder
+
+        with pytest.raises(TypeError, match="ltx2_use_diffusion_decoder"):
+            _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_diffusion_decoder": "true"}))
+
+    def test_decode_uses_diffusion_decoder_without_conv_vae_conditioning(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        seen = {}
+
+        class ConvVae:
+            dtype = torch.float32
+            config = SimpleNamespace(timestep_conditioning=True)
+
+            def decode(self, *_args, **_kwargs):
+                raise AssertionError("the convolutional VAE decoder must not run")
+
+        class DiffusionDecoder:
+            dtype = torch.float32
+
+            def decode(self, latents, *, generator, return_dict):
+                seen["latents"] = latents
+                seen["generator"] = generator
+                seen["return_dict"] = return_dict
+                return (latents + 1,)
+
+        class AudioVae:
+            dtype = torch.float32
+
+            def decode(self, audio_latents, *, return_dict):
+                assert return_dict is False
+                return (audio_latents + 2,)
+
+        class VideoProcessor:
+            def postprocess_video(self, video, *, output_type):
+                seen["output_type"] = output_type
+                return video
+
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.vae = ConvVae()
+        pipe.diffusion_decoder = DiffusionDecoder()
+        pipe.audio_vae = AudioVae()
+        pipe.vocoder = torch.nn.Identity()
+        pipe.video_processor = VideoProcessor()
+
+        generator = torch.Generator().manual_seed(123)
+        latents = torch.ones(1, 1)
+        output = pipe._decode_output(
+            latents=latents,
+            audio_latents=torch.ones(1, 1),
+            output_type="pt",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=generator,
+            device=torch.device("cpu"),
+            decode_timestep=0.7,
+            decode_noise_scale=0.5,
+            prompt_batch_size=1,
+        )
+
+        torch.testing.assert_close(seen["latents"], latents)
+        assert seen["generator"] is generator
+        assert seen["return_dict"] is False
+        assert seen["output_type"] == "pt"
+        torch.testing.assert_close(output.output[0], latents + 1)
+        torch.testing.assert_close(output.output[1], torch.full((1, 1), 3.0))
+
+    def test_non_output_rank_does_not_enter_diffusion_decoder(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        class ConvVae:
+            config = SimpleNamespace(timestep_conditioning=False)
+
+            def is_distributed_enabled(self):
+                raise AssertionError("DiffVAE decode must not inspect ConvVAE collectives")
+
+        class DiffusionDecoder:
+            dtype = torch.float32
+
+            def decode(self, *_args, **_kwargs):
+                raise AssertionError("only the output rank may run DiffVAE decode")
+
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "get_rank", lambda: 1)
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.vae = ConvVae()
+        pipe.diffusion_decoder = DiffusionDecoder()
+
+        output = pipe._decode_output(
+            latents=torch.ones(1, 1),
+            audio_latents=torch.ones(1, 1),
+            output_type="pt",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=None,
+            device=torch.device("cpu"),
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+            prompt_batch_size=1,
+        )
+
+        assert output.output[0].numel() == 0
+        assert output.output[1].numel() == 0
+
+
 class TestLTXOutputRank:
     @pytest.mark.parametrize(
         ("distributed_vae_state", "expected_decode_calls"),
