@@ -10,7 +10,9 @@ only the generation shape and step count are reduced for CI runtime.
 LTX-2.5 runs the official split-artifact pipelines with connector weights from
 the same Diffusers checkpoint under test. The distilled case covers the fixed
 two-stage schedule; the Full/SFT case covers raw dev weights and an explicit
-shared one-stage schedule.
+shared one-stage schedule. A separate reduced Full/SFT HQ guard exercises
+Res2s and weighted phase LoRAs without registering the expensive case in
+nightly CI.
 """
 
 from __future__ import annotations
@@ -109,7 +111,40 @@ LTX25_FULL_AUDIO_RELATIVE_L2_THRESHOLD = 0.3
 LTX25_FULL_VIDEO_LPIPS_MEAN_THRESHOLD = 0.01
 LTX25_FULL_I2V_VIDEO_LPIPS_MEAN_THRESHOLD = 0.02
 LTX25_FULL_AUDIO_COSINE_THRESHOLD = AUDIO_COSINE_THRESHOLD
+# Res2s deliberately injects noise after each BF16 model evaluation. The two
+# runtimes start from bitwise-identical latents and schedules, but small kernel
+# rounding differences are amplified by later stochastic second-order steps.
+# These manual-only gates guard perceptual/semantic parity without pretending
+# that the final decoded tensors should retain deterministic Euler tolerances.
+LTX25_HQ_VIDEO_SSIM_MEAN_THRESHOLD = 0.72
+LTX25_HQ_VIDEO_SSIM_MIN_THRESHOLD = 0.68
+LTX25_HQ_VIDEO_PSNR_MEAN_THRESHOLD = 17.0
+LTX25_HQ_VIDEO_LPIPS_MEAN_THRESHOLD = 0.22
+LTX25_HQ_AUDIO_RELATIVE_L2_THRESHOLD = 0.60
+LTX25_HQ_AUDIO_COSINE_THRESHOLD = 0.82
 LTX25_STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+
+
+def _ltx25_full_thresholds(task: str, pipeline_mode: str) -> dict[str, float]:
+    if pipeline_mode == "full_two_stage_hq":
+        return {
+            "video_ssim_mean": LTX25_HQ_VIDEO_SSIM_MEAN_THRESHOLD,
+            "video_ssim_min": LTX25_HQ_VIDEO_SSIM_MIN_THRESHOLD,
+            "video_psnr_mean_db": LTX25_HQ_VIDEO_PSNR_MEAN_THRESHOLD,
+            "video_lpips_mean": LTX25_HQ_VIDEO_LPIPS_MEAN_THRESHOLD,
+            "audio_relative_l2": LTX25_HQ_AUDIO_RELATIVE_L2_THRESHOLD,
+            "audio_cosine": LTX25_HQ_AUDIO_COSINE_THRESHOLD,
+        }
+    return {
+        "video_ssim_mean": LTX25_FULL_VIDEO_SSIM_MEAN_THRESHOLD,
+        "video_ssim_min": LTX25_FULL_VIDEO_SSIM_MIN_THRESHOLD,
+        "video_psnr_mean_db": LTX25_FULL_VIDEO_PSNR_MEAN_THRESHOLD,
+        "video_lpips_mean": (
+            LTX25_FULL_VIDEO_LPIPS_MEAN_THRESHOLD if task == "t2v" else LTX25_FULL_I2V_VIDEO_LPIPS_MEAN_THRESHOLD
+        ),
+        "audio_relative_l2": LTX25_FULL_AUDIO_RELATIVE_L2_THRESHOLD,
+        "audio_cosine": LTX25_FULL_AUDIO_COSINE_THRESHOLD,
+    }
 
 
 def test_ltx_reference_runner_unwraps_flattened_pipeline_output() -> None:
@@ -399,6 +434,34 @@ def _ltx25_full_request(image: Path | None = None) -> dict[str, object]:
     return request
 
 
+def _ltx25_hq_request(image: Path | None = None) -> dict[str, object]:
+    request: dict[str, object] = {
+        "prompt": LTX25_PROMPT,
+        "negative_prompt": NEGATIVE_PROMPT,
+        # Preserve the HQ sampler and phase topology while keeping this manual
+        # precision guard practical on one accelerator.
+        "width": 512,
+        "height": 384,
+        "num_frames": 25,
+        "fps": 24,
+        "num_inference_steps": 8,
+        "seed": 42,
+        "video_cfg_scale": 3.0,
+        "audio_cfg_scale": 7.0,
+        "video_stg_scale": 0.0,
+        "audio_stg_scale": 0.0,
+        "video_modality_scale": 3.0,
+        "audio_modality_scale": 3.0,
+        "video_rescale_scale": 0.45,
+        "audio_rescale_scale": 1.0,
+        "video_stg_blocks": [],
+        "audio_stg_blocks": [],
+    }
+    if image is not None:
+        request.update(image=str(image.resolve()), image_crf=18)
+    return request
+
+
 def test_ltx25_full_request_pins_official_schedule() -> None:
     request = _ltx25_full_request()
     sigmas = request["sigmas"]
@@ -413,9 +476,23 @@ def test_ltx25_full_request_pins_official_schedule() -> None:
 
 def test_ltx25_i2v_requests_pin_official_crf() -> None:
     image = Path("conditioning.png")
-    for request in (_ltx25_request(image), _ltx25_full_request(image)):
+    for request in (_ltx25_request(image), _ltx25_full_request(image), _ltx25_hq_request(image)):
         assert request["image"] == str(image.resolve())
         assert request["image_crf"] == 18
+
+
+def test_ltx25_hq_request_matches_official_contract() -> None:
+    request = _ltx25_hq_request()
+
+    assert (request["width"], request["height"], request["num_frames"]) == (512, 384, 25)
+    assert request["num_inference_steps"] == 8
+    assert (request["video_cfg_scale"], request["audio_cfg_scale"]) == (3.0, 7.0)
+    assert (request["video_stg_scale"], request["audio_stg_scale"]) == (0.0, 0.0)
+    assert (request["video_modality_scale"], request["audio_modality_scale"]) == (3.0, 3.0)
+    assert (request["video_rescale_scale"], request["audio_rescale_scale"]) == (0.45, 1.0)
+    assert "sigmas" not in request
+    assert "stage_1_sigmas" not in request
+    assert "stage_2_sigmas" not in request
 
 
 def _video_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
@@ -591,20 +668,15 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
     assert audio_metrics["relative_l2"] <= LTX25_AUDIO_RELATIVE_L2_THRESHOLD
 
 
-@pytest.mark.slow
-@pytest.mark.benchmark
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("task", ["t2v", "i2v"])
-@pytest.mark.parametrize("pipeline_mode", ["full_one_stage", "full_two_stage"])
-def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
-    """Compare raw official Full/SFT weights with Omni's converted Full pipeline."""
+def _run_ltx25_full_comparison(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
+    """Compare one raw official Full/SFT pipeline with its Omni equivalent."""
     _require_ltx25_model_access()
     artifact_parent = accuracy_artifact_root / "ltx_official"
     output_root = reset_artifact_dir(artifact_parent / f"ltx2_5_{pipeline_mode}_{task}")
     model_class_name = {
         "full_one_stage": "LTX2Pipeline",
         "full_two_stage": "LTX2TwoStagePipeline",
+        "full_two_stage_hq": "LTX2TwoStageHQPipeline",
     }[pipeline_mode]
     official_root, official_revision = _ltx25_official_source(artifact_parent)
     official_artifacts, official_model_source, official_model_revision = _resolve_ltx25_official_artifacts(
@@ -614,7 +686,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         transformer_subfolder="transformer_full"
     )
     image = _resolve_ltx25_image() if task == "i2v" else None
-    request = _ltx25_full_request(image)
+    request = _ltx25_hq_request(image) if pipeline_mode == "full_two_stage_hq" else _ltx25_full_request(image)
     if pipeline_mode == "full_two_stage":
         request["stage_1_sigmas"] = request.pop("sigmas")
         request["stage_2_sigmas"] = LTX25_STAGE_2_SIGMAS
@@ -639,7 +711,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
 
     official_output = output_root / "official"
     official_sidecar_args: list[str] = []
-    if pipeline_mode == "full_two_stage":
+    if pipeline_mode in {"full_two_stage", "full_two_stage_hq"}:
         official_sidecar_args = [
             "--spatial-upsampler-path",
             str(official_artifacts["spatial_upsampler"]),
@@ -699,6 +771,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         == {
             "full_one_stage": "TI2VidOneStagePipeline",
             "full_two_stage": "TI2VidTwoStagesPipeline",
+            "full_two_stage_hq": "TI2VidTwoStagesHQPipeline",
         }[pipeline_mode]
     )
     assert official_metadata["attention_backend"] == ATTENTION_BACKEND
@@ -717,6 +790,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         np.load(official_output / "audio.npy"),
         np.load(omni_output / "audio.npy"),
     )
+    thresholds = _ltx25_full_thresholds(task, pipeline_mode)
     result = {
         "case": f"ltx2_5_{pipeline_mode}",
         "task": task,
@@ -736,18 +810,38 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
             "omni_parent_allocated": omni_metadata["peak_memory_allocated_mb"],
             "omni_parent_reserved": omni_metadata["peak_memory_reserved_mb"],
         },
+        "threshold_profile": "res2s_hq" if pipeline_mode == "full_two_stage_hq" else "full_euler",
+        "thresholds": thresholds,
         "video": video_metrics,
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 
-    assert video_metrics["ssim_mean"] >= LTX25_FULL_VIDEO_SSIM_MEAN_THRESHOLD
-    assert video_metrics["ssim_min"] >= LTX25_FULL_VIDEO_SSIM_MIN_THRESHOLD
-    assert video_metrics["psnr_mean_db"] >= LTX25_FULL_VIDEO_PSNR_MEAN_THRESHOLD
-    lpips_threshold = (
-        LTX25_FULL_VIDEO_LPIPS_MEAN_THRESHOLD if task == "t2v" else LTX25_FULL_I2V_VIDEO_LPIPS_MEAN_THRESHOLD
-    )
-    assert audio_metrics["relative_l2"] <= LTX25_FULL_AUDIO_RELATIVE_L2_THRESHOLD
-    assert video_metrics["lpips_alex_mean"] <= lpips_threshold
-    assert audio_metrics["cosine_similarity"] >= LTX25_FULL_AUDIO_COSINE_THRESHOLD
+    assert video_metrics["ssim_mean"] >= thresholds["video_ssim_mean"]
+    assert video_metrics["ssim_min"] >= thresholds["video_ssim_min"]
+    assert video_metrics["psnr_mean_db"] >= thresholds["video_psnr_mean_db"]
+    assert audio_metrics["relative_l2"] <= thresholds["audio_relative_l2"]
+    assert video_metrics["lpips_alex_mean"] <= thresholds["video_lpips_mean"]
+    assert audio_metrics["cosine_similarity"] >= thresholds["audio_cosine"]
+
+
+@pytest.mark.slow
+@pytest.mark.benchmark
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("task", ["t2v", "i2v"])
+@pytest.mark.parametrize("pipeline_mode", ["full_one_stage", "full_two_stage"])
+def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
+    """Compare the nightly Full/SFT one-stage and ordinary two-stage paths."""
+    _run_ltx25_full_comparison(accuracy_artifact_root, task, pipeline_mode)
+
+
+@pytest.mark.full_model
+@pytest.mark.benchmark
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("task", ["t2v", "i2v"])
+def test_ltx25_hq_matches_official(accuracy_artifact_root: Path, task: str) -> None:
+    """Compare the manual-only Full/SFT Res2s HQ path with the official runtime."""
+    _run_ltx25_full_comparison(accuracy_artifact_root, task, "full_two_stage_hq")

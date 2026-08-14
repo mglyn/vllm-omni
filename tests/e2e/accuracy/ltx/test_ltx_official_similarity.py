@@ -5,7 +5,9 @@
 
 The original reduced one-stage guards remain unchanged. Four complementary
 default-shape cases cover both model versions, both two-stage weight families,
-and T2V/I2V without expanding every combination into a duplicate golden.
+and T2V/I2V without expanding every combination into a duplicate golden. A
+reduced LTX-2.3 HQ case is available for manual precision checks but is not
+registered in nightly CI.
 """
 
 from __future__ import annotations
@@ -83,11 +85,22 @@ STRICT_THRESHOLDS = LTXAccuracyThresholds(
     audio_cosine_similarity=0.95,
 )
 
+# Res2s feeds every BF16 forward into a stochastic second-order update, so
+# harmless backend rounding grows across the phase. Keep a meaningful manual
+# parity floor while reserving the strict thresholds for deterministic Euler.
+RES2S_HQ_THRESHOLDS = LTXAccuracyThresholds(
+    video_ssim_mean=0.70,
+    video_ssim_min=0.65,
+    video_psnr_mean_db=16.0,
+    audio_relative_l2=0.65,
+    audio_cosine_similarity=0.80,
+)
+
 
 @dataclass(frozen=True)
 class LTXAccuracyCase:
     name: str
-    pipeline_kind: Literal["one_stage", "distilled", "two_stage"]
+    pipeline_kind: Literal["one_stage", "distilled", "two_stage", "two_stage_hq"]
     model_id: str
     model_revision: str
     model_env: str
@@ -304,7 +317,29 @@ TWO_STAGE_CASES = (
     ),
 )
 
-CASES = (*LEGACY_CASES, *TWO_STAGE_CASES)
+MANUAL_HQ_CASES = (
+    LTXAccuracyCase(
+        name="ltx23_two_stage_hq_t2v",
+        pipeline_kind="two_stage_hq",
+        model_id="diffusers/LTX-2.3-Diffusers",
+        model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
+        model_env="VLLM_TEST_LTX23_MODEL",
+        model_class_name="LTX2TwoStageHQPipeline",
+        checkpoint=LTX23_CHECKPOINT,
+        spatial_upsampler=LTX23_UPSAMPLER,
+        distilled_lora=LTX23_DISTILLED_LORA,
+        width=512,
+        height=384,
+        num_frames=25,
+        num_inference_steps=8,
+        seed=10,
+        stg_block=None,
+        enable_layerwise_offload=True,
+        thresholds=RES2S_HQ_THRESHOLDS,
+    ),
+)
+
+CASES = (*LEGACY_CASES, *TWO_STAGE_CASES, *MANUAL_HQ_CASES)
 
 
 def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> None:
@@ -472,7 +507,20 @@ def _request(case: LTXAccuracyCase, image: Path | None) -> dict[str, object]:
         "num_inference_steps": case.num_inference_steps,
         "seed": case.seed,
     }
-    if case.pipeline_kind != "distilled":
+    if case.pipeline_kind == "two_stage_hq":
+        request.update(
+            video_cfg_scale=3.0,
+            audio_cfg_scale=7.0,
+            video_stg_scale=0.0,
+            audio_stg_scale=0.0,
+            video_modality_scale=3.0,
+            audio_modality_scale=3.0,
+            video_rescale_scale=0.45,
+            audio_rescale_scale=1.0,
+            video_stg_blocks=[],
+            audio_stg_blocks=[],
+        )
+    elif case.pipeline_kind != "distilled":
         assert case.stg_block is not None
         request.update(
             video_cfg_scale=3.0,
@@ -489,6 +537,17 @@ def _request(case: LTXAccuracyCase, image: Path | None) -> dict[str, object]:
     if image is not None:
         request["image"] = str(image.resolve())
     return request
+
+
+def test_ltx23_hq_request_matches_official_contract() -> None:
+    request = _request(MANUAL_HQ_CASES[0], None)
+
+    assert (request["width"], request["height"], request["num_frames"]) == (512, 384, 25)
+    assert request["num_inference_steps"] == 8
+    assert (request["video_cfg_scale"], request["audio_cfg_scale"]) == (3.0, 7.0)
+    assert (request["video_stg_scale"], request["audio_stg_scale"]) == (0.0, 0.0)
+    assert (request["video_modality_scale"], request["audio_modality_scale"]) == (3.0, 3.0)
+    assert (request["video_rescale_scale"], request["audio_rescale_scale"]) == (0.45, 1.0)
 
 
 def _video_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
