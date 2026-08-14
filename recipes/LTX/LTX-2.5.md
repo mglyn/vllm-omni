@@ -28,6 +28,49 @@ latent upsampler, and run a three-step refinement stage. Select the class with
 `--model-class-name`; no `--task-type` flag is required. Supplying one initial
 image selects I2V, while omitting it selects T2V.
 
+## Video decoder selection
+
+The convolutional VAE decoder remains the default. LTX-2.5 can instead load
+the published DiffVAE component by setting the startup-only model extra
+`ltx2_use_diffusion_decoder: true` on diffusion stage 0. The choice is made at
+engine startup because it changes which weights are loaded; it is not a
+per-request sampling parameter.
+
+For offline Python usage, pass the model extra through the stage override:
+
+```python
+omni = Omni(
+    model="Lightricks/LTX-2.5-Diffusers",
+    model_class_name="LTX2Pipeline",
+    stage_overrides='{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}',
+    vae_use_tiling=True,
+)
+```
+
+For online serving, use the same stage override at startup:
+
+```bash
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --model-class-name LTX2Pipeline \
+  --stage-overrides '{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}' \
+  --vae-use-tiling
+```
+
+The equivalent deploy YAML is:
+
+```yaml
+stages:
+  - stage_id: 0
+    extras:
+      ltx2_use_diffusion_decoder: true
+```
+
+`vae_use_tiling` is optional and applies the decoder's native overlapping-tile
+path. DiffVAE is decoder-only, so the convolutional VAE is still loaded for
+I2V encoding. DiffVAE decoding runs on the output rank and does not use VAE
+patch parallelism.
+
 ## Prerequisites
 
 ```bash

@@ -35,6 +35,10 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from .ltx2_diffusion_decoder import (
+    LTX2VideoDiffusionDecoderModel,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
+)
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -68,6 +72,18 @@ _LTX_COMPONENT_SUBFOLDERS = (
     "latent_upsampler",
 )
 logger = logging.getLogger(__name__)
+
+_LTX2_DIFFUSION_DECODER_EXTRA = "ltx2_use_diffusion_decoder"
+_LTX2_DIFFUSION_DECODER_SUBFOLDER = "diffusion_decoder"
+
+
+def _ltx2_use_diffusion_decoder(od_config: Any) -> bool:
+    """Read the LTX-2.5 diffusion-decoder opt-in from model extras."""
+    extras = getattr(od_config, "extras", {}) or {}
+    enabled = extras.get(_LTX2_DIFFUSION_DECODER_EXTRA, False)
+    if not isinstance(enabled, bool):
+        raise TypeError(f"{_LTX2_DIFFUSION_DECODER_EXTRA} must be a bool, got {type(enabled)!r}")
+    return enabled
 
 
 @dataclass(frozen=True)
@@ -519,12 +535,13 @@ def _load_component(
     local_files_only: bool,
     dtype: torch.dtype,
     revision: str | None,
+    prefetch_list: tuple[str, ...] = _LTX_COMPONENT_SUBFOLDERS,
 ) -> Any:
     return from_pretrained_with_prefetch(
         component_cls.from_pretrained,
         model,
         subfolder=subfolder,
-        prefetch_list=_LTX_COMPONENT_SUBFOLDERS,
+        prefetch_list=prefetch_list,
         local_files_only=local_files_only,
         revision=revision,
         torch_dtype=dtype,
@@ -555,6 +572,12 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     model = od_config.model
     revision = getattr(od_config, "revision", None)
     local_files_only = os.path.exists(model)
+    use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config)
+    component_subfolders = (
+        (*_LTX_COMPONENT_SUBFOLDERS, _LTX2_DIFFUSION_DECODER_SUBFOLDER)
+        if use_diffusion_decoder
+        else _LTX_COMPONENT_SUBFOLDERS
+    )
 
     pipeline.weights_sources = [
         DiffusersPipelineLoader.ComponentSource(
@@ -565,7 +588,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             fall_back_to_pt=True,
         ),
     ]
-    prefetch_subfolders(model, _LTX_COMPONENT_SUBFOLDERS, local_files_only=local_files_only, revision=revision)
+    prefetch_subfolders(model, component_subfolders, local_files_only=local_files_only, revision=revision)
 
     pipeline.tokenizer = AutoTokenizer.from_pretrained(
         model,
@@ -604,6 +627,23 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
+    if use_diffusion_decoder:
+        pipeline.diffusion_decoder = _load_component(
+            LTX2VideoDiffusionDecoderModel,
+            model,
+            _LTX2_DIFFUSION_DECODER_SUBFOLDER,
+            local_files_only=local_files_only,
+            dtype=dtype,
+            revision=revision,
+            prefetch_list=component_subfolders,
+        )
+        # The published decoder is trained and validated with NATTEN. Its
+        # portable FlexAttention fallback materializes an impractically large
+        # block mask at production video sizes, so fail early if the matching
+        # Hub kernel cannot be loaded instead of failing later during decode.
+        pipeline.diffusion_decoder.set_attn_processor(LTX2VideoVaeNeighborhoodNattenProcessor())
+        if getattr(od_config, "vae_use_tiling", False):
+            pipeline.diffusion_decoder.enable_tiling()
     pipeline.audio_vae = _load_component(
         AutoencoderKLLTX2Audio,
         model,
