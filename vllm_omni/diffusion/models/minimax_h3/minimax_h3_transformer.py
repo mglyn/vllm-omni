@@ -26,13 +26,16 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -104,6 +107,16 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 # video/text/audio tokens (padding is clamped to 0 before the embedding
 # lookup and masked out afterwards).
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
+_LOCAL_SP_PREPARE_HOOK = "sp_input---local_sp_prepare"
+
+# Opt-in fp16-range protection for the NPU ascend_laser_attention kernel
+# (consumed only via the "laser_input_scale" extra key; other backends and
+# platforms ignore it). The kernel stores unscaled QK^T in an fp16 GM
+# workspace, and H3's outlier activations (per-element amax in the hundreds)
+# push dot products past fp16 max 65504, turning whole 128-row blocks NaN.
+# 256 is a power of two, so pre-dividing q/k/v and the compensating
+# kernel-scale/output multiplies are exact in floating point.
+MINIMAX_H3_LASER_INPUT_SCALE = 256.0
 
 
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
@@ -132,6 +145,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_pos_for_infer_output_info",
         "packed_seq_params",
         "refiner_packed_seq_params",
+        "video_token_layout",
     }
 )
 
@@ -168,16 +182,11 @@ def _reorder_grouped_qkv_to_qkv(
     )
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
+def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
     # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
     # reduction, matching that accumulation semantic.
-    return nn.RMSNorm(size, eps=eps, dtype=dtype)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+    return RMSNorm(size, eps=eps, dtype=dtype)
 
 
 def _modulate_scale_shift(
@@ -202,6 +211,51 @@ def _modulate_gate(
 ) -> torch.Tensor:
     # Apply the per-index gated residual: x + gate[idx] * other.
     return (x + gate.index_select(0, indices) * other).to(dtype)
+
+
+def _sequence_parallel_local_span(
+    seq_len: int,
+    *,
+    hooks_applied: bool,
+) -> tuple[int, int]:
+    """Return the packed-row span owned by this sequence-parallel rank."""
+    from vllm_omni.diffusion.forward_context import (
+        get_ulysses_mode,
+        is_forward_context_available,
+    )
+
+    if not hooks_applied or not is_forward_context_available():
+        return 0, seq_len
+    if get_ulysses_mode(default="strict") != "strict":
+        return 0, seq_len
+
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_allgather_parallel_world_size,
+            get_ring_parallel_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_ulysses_parallel_world_size,
+        )
+
+        world_size = int(get_sequence_parallel_world_size())
+        rank = int(get_sequence_parallel_rank())
+        ulysses_world_size = int(get_ulysses_parallel_world_size())
+        ring_world_size = int(get_ring_parallel_world_size())
+        allgather_world_size = int(get_allgather_parallel_world_size())
+    except AssertionError:
+        return 0, seq_len
+
+    if world_size <= 1 or ulysses_world_size != world_size:
+        return 0, seq_len
+    if ring_world_size != 1 or allgather_world_size != 1:
+        return 0, seq_len
+    if seq_len < world_size or seq_len % world_size:
+        return 0, seq_len
+
+    chunk_size = seq_len // world_size
+    start = rank * chunk_size
+    return start, chunk_size
 
 
 class MiniMaxH3Rope(nn.Module):
@@ -230,18 +284,13 @@ class MiniMaxH3Rope(nn.Module):
         return torch.cat((half, half), dim=-1)  # [S, 96]
 
 
-def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Rotate the first rot_dim head dims; pass the rest through.
-
-    x: [T, heads, head_dim]; freqs: [T, rot_dim]. In the unfused path, cos/sin
-    are cast to the activation dtype before the elementwise math.
-    """
-    rot_dim = freqs.shape[-1]
-    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    cos = torch.cos(freqs).to(x.dtype).unsqueeze(1)  # [T, 1, rot_dim]
-    sin = torch.sin(freqs).to(x.dtype).unsqueeze(1)
-    x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
-    return torch.cat((x_rot, x_pass), dim=-1)
+def _build_rope_table(freqs: torch.Tensor) -> torch.Tensor:
+    """Materialize H3's packed ``[cos(freqs[:48]), sin(freqs[:48])]`` table."""
+    half = freqs.shape[-1] // 2
+    return torch.cat(
+        (torch.cos(freqs[..., :half]), torch.sin(freqs[..., :half])),
+        dim=-1,
+    ).to(_BF16_DTYPE)
 
 
 class MiniMaxH3TimeEmbedder(nn.Module):
@@ -327,6 +376,8 @@ class MiniMaxH3Attention(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        role: str = "self",
+        role_category: str | None = None,
         skip_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
@@ -347,8 +398,10 @@ class MiniMaxH3Attention(nn.Module):
         )
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.rot_dim = 6 * arch.rope_inv_freq_len
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
+        self.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
         self.out_proj = RowParallelLinear(
             inner_dim,
             arch.hidden_size,
@@ -364,8 +417,26 @@ class MiniMaxH3Attention(nn.Module):
             head_size=self.head_dim,
             softmax_scale=self.softmax_scale,
             causal=False,
+            # Packed rows reach the impl as [B, S, N, D].
+            qkv_layout="BSND",
+            role=role,
+            role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
+            prefix=prefix,
         )
+
+    def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """Rotate the first rot_dim head dims; pass the rest through.
+
+        x: [T, heads, head_dim]; freqs: [T, rot_dim]. In the unfused path, cos/sin
+        are cast to the activation dtype before the elementwise math.
+        """
+        rot_dim = self.rot_dim
+        x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+        cos = torch.cos(freqs).to(x.dtype)  # [T, rot_dim]
+        sin = torch.sin(freqs).to(x.dtype)
+        x_rot = self.rope(x_rot, cos, sin)
+        return torch.cat((x_rot, x_pass), dim=-1)
 
     @torch.compiler.disable
     def _run_packed_attention(
@@ -377,6 +448,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -395,11 +467,16 @@ class MiniMaxH3Attention(nn.Module):
         used = min(max_seqlen, packed_total)
         attn_mask = None
         # Ring attention can dispatch to a different implementation from the
-        # configured backend, so this no-mask fast path is local-only.
-        prefix_slice = (
-            not getattr(self.attention, "use_ring", False) and self.attention.attn_backend.supports_prefix_kv_slicing
+        # configured backend, so the no-mask fast paths are local-only.
+        # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
+        # supports_packed_mask_free: backend consumes the packed metadata
+        # without ever reading attn_mask (CUDA packed varlen, NPU
+        # npu_attn_varlen opt-in with its own fallback rebuild).
+        no_mask = not getattr(self.attention, "use_ring", False) and (
+            self.attention.attn_backend.supports_prefix_kv_slicing
+            or self.attention.attn_backend.supports_packed_mask_free()
         )
-        if used < packed_total and not prefix_slice:
+        if used < packed_total and not no_mask:
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -409,7 +486,17 @@ class MiniMaxH3Attention(nn.Module):
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
                 "valid_kv_length": used,
+                # Opt the NPU flash backend into the packed varlen path so the
+                # quadratic full_qk mask is never materialized. Ring attention
+                # is excluded: it keeps the aligned padding rows for its
+                # fixed-size P2P buffers and still needs the mask.
+                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                # fp16-range protection for the ascend_laser_attention kernel
+                # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
+                # backend/path.
+                "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
             },
+            video_layout=video_layout,
         )
         return self.attention(
             q.unsqueeze(0),
@@ -422,11 +509,12 @@ class MiniMaxH3Attention(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        rope_freqs: torch.Tensor | None,
+        rope_table: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int | None = None,
         sp_seq_lens: list[int] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -447,11 +535,18 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        if rope_freqs is not None:
-            q = _apply_rope(q, rope_freqs)
-            k = _apply_rope(k, rope_freqs)
+        if rope_table is None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        else:
+            q, k = fused_qk_norm_rope(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                rope_table,
+                self.q_norm.variance_epsilon,
+            )
 
         # The packed layout uses a second document for alignment padding.
         # Local/Ulysses backends unpad it, while Ring keeps aligned rows for
@@ -466,6 +561,7 @@ class MiniMaxH3Attention(nn.Module):
             # backend receives the global sequence after all-to-all, so carry
             # its Python length explicitly instead of inferring it from q.
             packed_total=packed_total if packed_total is not None else q.shape[0],
+            video_layout=video_layout,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -576,6 +672,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            role="minimax_h3.token_refiner",
+            role_category="self",
             skip_sequence_parallel=True,
         )
         self.mlp = MiniMaxH3MLP(
@@ -593,7 +691,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
-            rope_freqs=None,
+            rope_table=None,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
@@ -645,6 +743,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
+        # The prefix also carries the block index that block-sparse attention
+        # backends match against their skip_layers selector.
         self.attn = MiniMaxH3Attention(
             arch,
             quant_config,
@@ -670,11 +770,12 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         t_emb: torch.Tensor,
         combined_indices: torch.Tensor,
-        rope_freqs: torch.Tensor,
+        rope_table: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
         sp_seq_lens: list[int] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -697,11 +798,12 @@ class MiniMaxH3DiTBlock(nn.Module):
         h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE)
         h = self.attn(
             h,
-            rope_freqs=rope_freqs,
+            rope_table=rope_table,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             packed_total=packed_total,
             sp_seq_lens=sp_seq_lens,
+            video_layout=video_layout,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
 
@@ -778,10 +880,10 @@ class MiniMaxH3SPPrepare(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        rope_freqs: torch.Tensor,
+        rope_table: torch.Tensor,
         combined_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return hidden_states, rope_freqs, combined_indices
+        return hidden_states, rope_table, combined_indices
 
 
 class MiniMaxH3SPGather(nn.Module):
@@ -832,8 +934,19 @@ class MiniMaxH3DiTModel(nn.Module):
                 split_output=True,
             ),
         },
+        "local_sp_prepare": {
+            2: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=1,
+                split_output=True,
+            ),
+        },
         "sp_gather": SequenceParallelOutput(gather_dim=0, expected_dims=2),
     }
+    # The checkpoint already stores qkv and the MLP gate/up as single tensors
+    # (see the reordering in load_weights), so there are no unfused names for
+    # quantization or LoRA to map onto. Address the fused layers directly, e.g.
+    # ignored_layers=["blocks.0.attn.qkv_proj"].
     packed_modules_mapping = {}
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
@@ -935,6 +1048,7 @@ class MiniMaxH3DiTModel(nn.Module):
             ]
         )
         self.sp_prepare = MiniMaxH3SPPrepare()
+        self.local_sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
@@ -1027,16 +1141,39 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_max_seqlen: int,
         seq_len: int,
         device: torch.device,
+        local_span: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build packed multimodal embeddings for the TP=1/SP=1 inference path.
+        """Build this rank's packed multimodal embedding rows.
 
-        Returns (decoder_input [S, H] bf16, t_emb [M, t_dim] fp32).
+        Returns (decoder_input [S_local, H] bf16, t_emb [M, t_dim] fp32).
         """
+        local_start, local_len = local_span
+        local_end = local_start + local_len
+        local_only = local_len != seq_len
+        if local_only:
+            img_mask = (img_pos >= local_start) & (img_pos < local_end)
+            audio_mask = (audio_pos >= local_start) & (audio_pos < local_end)
+            text_mask = (text_pos >= local_start) & (text_pos < local_end)
+            img_global_pos = img_pos[img_mask]
+            audio_global_pos = audio_pos[audio_mask]
+            img_local_pos = img_global_pos - local_start
+            audio_local_pos = audio_global_pos - local_start
+            text_local_pos = text_pos[text_mask] - local_start
+            text_local_indices = torch.nonzero(text_mask, as_tuple=False).view(-1)
+        else:
+            img_global_pos = img_pos
+            audio_global_pos = audio_pos
+            img_local_pos = img_pos
+            audio_local_pos = audio_pos
+            text_local_pos = text_pos
+            text_local_indices = None
+
         # Latent embedders stay fp32 in and out; their outputs are cast to the
         # bf16 sequence dtype only during indexed scattering.
-        x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos).to(_FP32_DTYPE)
+        x_rows = x.view(-1, x.shape[-1]).index_select(0, img_global_pos).to(_FP32_DTYPE)
         video_embed, _ = self.video_patch_proj(x_rows)
-        audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos).to(_FP32_DTYPE)
+        audio_rows = audio_x.view(-1, audio_x.shape[-1])
+        audio_rows = audio_rows.index_select(0, audio_global_pos).to(_FP32_DTYPE)
         audio_embed, _ = self.audio_patch_proj(audio_rows)
 
         text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
@@ -1046,11 +1183,29 @@ class MiniMaxH3DiTModel(nn.Module):
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
         )
+        if text_local_indices is not None:
+            text_embed = text_embed.index_select(0, text_local_indices)
 
-        embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
-        embeddings.index_add_(0, text_pos, text_embed.to(_BF16_DTYPE)[: text_pos.shape[0]])
-        embeddings.index_add_(0, img_pos, video_embed.to(_BF16_DTYPE)[: img_pos.shape[0]])
-        embeddings.index_add_(0, audio_pos, audio_embed.to(_BF16_DTYPE)[: audio_pos.shape[0]])
+        embeddings = torch.zeros(
+            (local_len, self.hidden_size),
+            device=device,
+            dtype=_BF16_DTYPE,
+        )
+        embeddings.index_add_(
+            0,
+            text_local_pos,
+            text_embed.to(_BF16_DTYPE)[: text_local_pos.shape[0]],
+        )
+        embeddings.index_add_(
+            0,
+            img_local_pos,
+            video_embed.to(_BF16_DTYPE)[: img_local_pos.shape[0]],
+        )
+        embeddings.index_add_(
+            0,
+            audio_local_pos,
+            audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
+        )
 
         t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
@@ -1080,7 +1235,6 @@ class MiniMaxH3DiTModel(nn.Module):
         update_mask = _required_kwarg(kwargs, "update_mask")
         token_tags = _required_kwarg(kwargs, "token_tags").view(-1).to(torch.long)
         skip_mask_out_condition = bool(kwargs.get("skip_mask_out_condition", False))
-
         text_selected = _required_kwarg(kwargs, "prompt_embeds")
 
         img_pos = self._pos_ids(_required_kwarg(kwargs, "img_pos_info"), "img_pos_info")
@@ -1100,6 +1254,7 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
+        video_layout = kwargs.get("video_token_layout")
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1109,8 +1264,18 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        # Compute RoPE frequencies over the full packed sequence.
-        rope_freqs = self.rope(img_position_ids).to(device)
+        local_sp_registry = getattr(self.local_sp_prepare, "_hook_registry", None)
+        hooks_applied = local_sp_registry is not None
+        if local_sp_registry is not None:
+            local_sp_hook = local_sp_registry.get_hook(_LOCAL_SP_PREPARE_HOOK)
+            hooks_applied = local_sp_hook is not None
+        local_span = _sequence_parallel_local_span(
+            seq_len,
+            hooks_applied=hooks_applied,
+        )
+        local_start, local_len = local_span
+        rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+        rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
 
         decoder_input, t_emb = self._embed(
             x=x,
@@ -1124,6 +1289,7 @@ class MiniMaxH3DiTModel(nn.Module):
             refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
+            local_span=local_span,
         )
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -1131,31 +1297,55 @@ class MiniMaxH3DiTModel(nn.Module):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
-        block_rope = rope_freqs
+        block_rope = rope_table
         block_combined = combined_indices
 
-        hidden, block_rope, block_combined = self.sp_prepare(
-            hidden,
-            block_rope,
-            block_combined,
-        )
+        if local_len == seq_len:
+            hidden, block_rope, block_combined = self.sp_prepare(
+                hidden,
+                block_rope,
+                block_combined,
+            )
+        else:
+            hidden, block_rope, block_combined = self.local_sp_prepare(
+                hidden,
+                block_rope,
+                block_combined,
+            )
         for block in self.blocks:
             hidden = block(
                 hidden,
                 t_emb=t_emb,
                 combined_indices=block_combined,
-                rope_freqs=block_rope,
+                rope_table=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
+                video_layout=video_layout,
             )
-        hidden = self.sp_gather(hidden)
-
-        video_logits, audio_logits = self.final_layer(
-            hidden,
-            t_emb=t_emb,
-            inverse_indices=inverse_indices,
-        )
+        if local_len == seq_len:
+            hidden = self.sp_gather(hidden)
+            video_logits, audio_logits = self.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=inverse_indices,
+            )
+        else:
+            local_inverse_indices = inverse_indices.narrow(
+                0,
+                local_start,
+                local_len,
+            )
+            video_logits, audio_logits = self.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=local_inverse_indices,
+            )
+            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            compact_logits = self.sp_gather(compact_logits)
+            video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
+            video_logits = compact_logits[..., :video_width]
+            audio_logits = compact_logits[..., video_width:]
 
         # Select target and condition rows at inference-output positions, then
         # zero the condition rows.
