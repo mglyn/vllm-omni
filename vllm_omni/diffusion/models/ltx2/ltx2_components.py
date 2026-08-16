@@ -228,7 +228,7 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
 
 def resolve_ltx_checkpoint_kind(pipeline_kind: str) -> LTXCheckpointKind | None:
     """Derive checkpoint requirements from the execution contract."""
-    if pipeline_kind in {"one_stage", "two_stage"}:
+    if pipeline_kind in {"one_stage", "two_stage", "two_stage_hq"}:
         return "regular"
     if pipeline_kind in {"distilled_one_stage", "distilled_two_stage"}:
         return "distilled"

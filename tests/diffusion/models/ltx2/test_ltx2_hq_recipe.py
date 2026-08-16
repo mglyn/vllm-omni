@@ -8,6 +8,7 @@ import pytest
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX23_TWO_STAGE_COMPONENT_PROFILE,
     LTX25_TWO_STAGE_COMPONENT_PROFILE,
+    resolve_ltx_checkpoint_kind,
     resolve_ltx_component_profile,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidancePlan, LTXGuidanceSpec
@@ -77,6 +78,7 @@ def test_ltx25_hq_keeps_generation_specific_negative_prompt():
 
 
 def test_ltx_hq_entry_supports_ltx23_and_ltx25():
+    assert resolve_ltx_checkpoint_kind("two_stage_hq") == "regular"
     assert resolve_ltx_component_profile("two_stage_hq", "2.3") is LTX23_TWO_STAGE_COMPONENT_PROFILE
     assert resolve_ltx_component_profile("two_stage_hq", "2.5") is LTX25_TWO_STAGE_COMPONENT_PROFILE
     assert resolve_ltx_pipeline_recipe("two_stage_hq", "2.3") is LTX23_TWO_STAGE_HQ_RECIPE
