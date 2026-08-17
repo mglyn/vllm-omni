@@ -28,13 +28,13 @@ latent upsampler, and run a three-step refinement stage. Select the class with
 `--model-class-name`; no `--task-type` flag is required. Supplying one initial
 image selects I2V, while omitting it selects T2V.
 
-## Video decoder selection
+## Diffusion VAE decoder selection
 
 The convolutional VAE decoder remains the default. LTX-2.5 can instead load
-the published DiffVAE component by setting the startup-only model extra
-`ltx2_use_diffusion_decoder: true` on diffusion stage 0. The choice is made at
-engine startup because it changes which weights are loaded; it is not a
-per-request sampling parameter. The same extra works with all four public
+the published Diffusion VAE decoder (DiffVAE) by setting the startup-only model
+extra `ltx2_use_diffusion_decoder: true` on diffusion stage 0. The choice is
+made at engine startup because it changes which weights are loaded; it is not
+a per-request sampling parameter. The same extra works with all four public
 LTX-2.5 pipeline classes listed above.
 
 For offline Python usage, pass the model extra through the stage override:
