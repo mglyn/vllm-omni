@@ -36,9 +36,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from .ltx2_diffusion_decoder import (
-    LTX2VideoDiffusionDecoderModel,
     LTX2VideoVaeNeighborhoodNattenProcessor,
 )
+from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -629,7 +629,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     )
     if use_diffusion_decoder:
         pipeline.diffusion_decoder = _load_component(
-            LTX2VideoDiffusionDecoderModel,
+            DistributedLTX2VideoDiffusionDecoderModel,
             model,
             _LTX2_DIFFUSION_DECODER_SUBFOLDER,
             local_files_only=local_files_only,
@@ -642,8 +642,15 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         # block mask at production video sizes, so fail early if the matching
         # Hub kernel cannot be loaded instead of failing later during decode.
         pipeline.diffusion_decoder.set_attn_processor(LTX2VideoVaeNeighborhoodNattenProcessor())
-        if getattr(od_config, "vae_use_tiling", False):
+        vae_patch_parallel_size = int(
+            getattr(getattr(od_config, "parallel_config", None), "vae_patch_parallel_size", 1)
+        )
+        if vae_patch_parallel_size > 1 or getattr(od_config, "vae_use_tiling", False):
             pipeline.diffusion_decoder.enable_tiling()
+        pipeline.diffusion_decoder.set_parallel_size(
+            vae_patch_parallel_size,
+            mode=getattr(getattr(od_config, "parallel_config", None), "vae_parallel_mode", "tile"),
+        )
     pipeline.audio_vae = _load_component(
         AutoencoderKLLTX2Audio,
         model,

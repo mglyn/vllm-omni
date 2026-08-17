@@ -545,13 +545,9 @@ class LTXRuntime(
         dist_initialized = torch.distributed.is_initialized()
         is_output_rank = not dist_initialized or torch.distributed.get_rank() == 0
         vae_decode_needs_all_ranks = False
-        is_distributed_vae_enabled = getattr(self.vae, "is_distributed_enabled", None)
-        if (
-            not use_diffusion_decoder
-            and self.distributed_video_decode
-            and dist_initialized
-            and callable(is_distributed_vae_enabled)
-        ):
+        video_decoder = self.diffusion_decoder if use_diffusion_decoder else self.vae
+        is_distributed_vae_enabled = getattr(video_decoder, "is_distributed_enabled", None)
+        if self.distributed_video_decode and dist_initialized and callable(is_distributed_vae_enabled):
             # Distributed tiled decode is collective, so every rank must enter it.
             vae_decode_needs_all_ranks = bool(is_distributed_vae_enabled())
 
