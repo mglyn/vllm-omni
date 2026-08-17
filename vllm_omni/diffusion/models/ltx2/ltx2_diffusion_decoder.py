@@ -532,6 +532,7 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         self.model_output_type = model_output_type
         self.default_num_inference_steps = default_num_inference_steps
         self.temporal_compression_ratio = temporal_compression_ratio
+        self.stage5_kernel = tuple(stage5_kernel)
         self.context_channels = stage_channels[-1]
         # NATTEN shifts its window inward at the grid border, so the last latent frame is replicated
         # through stages 1-4 and cropped off the context before stage 5, moving that border past the
@@ -625,7 +626,14 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
 
         num_pad = self.trailing_pad_latent_frames
         if crop_trailing_ghost and num_pad > 0:
-            hidden_states = hidden_states[:, : -num_pad * self.temporal_compression_ratio]
+            # Match the reference decoder's soft crop.  Normally all ghost
+            # frames are removed, but a short clip must retain enough repeated
+            # trailing context for stage 5's temporal neighborhood kernel.
+            # The final pixels are cropped back to the requested duration in
+            # ``LTX2VideoDiffusionDecoderModel.decode``.
+            content_frames = max(hidden_states.shape[1] - num_pad * self.temporal_compression_ratio, 1)
+            keep_frames = min(hidden_states.shape[1], max(content_frames, self.stage5_kernel[0]))
+            hidden_states = hidden_states[:, :keep_frames]
         return hidden_states
 
     def forward_diffusion_step(
@@ -1021,6 +1029,15 @@ class LTX2VideoDiffusionDecoderModel(ModelMixin, AttentionMixin, ConfigMixin):
             decoded = self.tiled_decode(z, generator=generator, num_inference_steps=num_inference_steps)
         else:
             decoded = self.decoder(z, generator=generator, num_inference_steps=num_inference_steps)
+
+        # Short clips retain replicated trailing context through stage 5 so
+        # NATTEN always sees at least its temporal kernel size.  Do not expose
+        # those context frames to the caller.  This is also a no-op for normal
+        # and tiled production shapes.
+        target_num_frames = (z.shape[2] - 1) * self.temporal_compression_ratio + 1
+        target_height = z.shape[3] * self.spatial_compression_ratio
+        target_width = z.shape[4] * self.spatial_compression_ratio
+        decoded = decoded[:, :, :target_num_frames, :target_height, :target_width]
 
         if not return_dict:
             return (decoded,)

@@ -1195,11 +1195,29 @@ class AsyncOmniEngine:
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
+        # Unregistered diffusion checkpoints use the single-stage fallback
+        # below instead of StageConfigFactory, so fold stage-0 model extras
+        # into the fallback's input as well.  Registered pipelines still get
+        # the complete override mapping through load_and_resolve_stage_configs.
+        default_stage_kwargs = kwargs
+        stage_zero_overrides = (stage_overrides or {}).get("0", {})
+        if "extras" in stage_zero_overrides:
+            override_extras = stage_zero_overrides["extras"]
+            if not isinstance(override_extras, Mapping):
+                raise TypeError("stage 0 extras must be a mapping")
+            default_stage_kwargs = {
+                **kwargs,
+                "extras": {
+                    **(kwargs.get("extras") or {}),
+                    **override_extras,
+                },
+            }
+
         config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
             kwargs,
             trust_remote_code=trust_remote_code,
-            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(default_stage_kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
