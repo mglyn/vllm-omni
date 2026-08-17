@@ -65,6 +65,8 @@ Setting it above 1 automatically enables tiling and distributes each tile's
 last deterministic stage and diffusion stage across the DiT process group;
 rank 0 blends the decoded RGB tiles. The low-resolution deterministic stages
 run on every participating rank so tile borders retain their shared context.
+VAE patch parallelism does not launch workers; for PP=4, provision four DiT
+ranks too, for example with `--usp 4 --vae-patch-parallel-size 4`.
 
 ## Prerequisites
 
