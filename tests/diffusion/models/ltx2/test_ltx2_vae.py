@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for LTX-2.3 VAE tiling and distributed decode behavior."""
+"""Unit tests for LTX video VAE tiling and distributed decode behavior."""
 
 from types import SimpleNamespace
 
@@ -209,6 +209,137 @@ class TestLTXDiffusionDecoder:
 
         assert output.output[0].numel() == 0
         assert output.output[1].numel() == 0
+
+    def test_non_output_rank_enters_distributed_diffusion_decoder(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        class ConvVae:
+            config = SimpleNamespace(timestep_conditioning=False)
+
+            def is_distributed_enabled(self):
+                raise AssertionError("DiffVAE decode must query the active decoder")
+
+        class DiffusionDecoder:
+            dtype = torch.float32
+
+            def __init__(self):
+                self.decode_calls = 0
+
+            def is_distributed_enabled(self):
+                return True
+
+            def decode(self, *_args, **_kwargs):
+                self.decode_calls += 1
+                return (torch.empty(0, 3, 0, 0, 0),)
+
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "get_rank", lambda: 1)
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.vae = ConvVae()
+        pipe.diffusion_decoder = DiffusionDecoder()
+
+        output = pipe._decode_output(
+            latents=torch.ones(1, 1),
+            audio_latents=torch.ones(1, 1),
+            output_type="pt",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=None,
+            device=torch.device("cpu"),
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+            prompt_batch_size=1,
+        )
+
+        assert pipe.diffusion_decoder.decode_calls == 1
+        assert output.output[0].numel() == 0
+        assert output.output[1].numel() == 0
+
+    def test_diffusion_decoder_patch_parallel_size_one_uses_native_tiling(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        expected = torch.ones(1, 3, 1, 2, 2)
+        seen = {}
+
+        def native_tiled_decode(self, z, generator=None, num_inference_steps=None):
+            seen["z"] = z
+            seen["generator"] = generator
+            seen["num_inference_steps"] = num_inference_steps
+            return expected
+
+        monkeypatch.setattr(LTX2VideoDiffusionDecoderModel, "tiled_decode", native_tiled_decode)
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.is_distributed_enabled = lambda: False
+        generator = torch.Generator().manual_seed(17)
+        z = torch.zeros(1, 1, 1, 1, 1)
+
+        result = DistributedLTX2VideoDiffusionDecoderModel.tiled_decode(
+            model,
+            z,
+            generator=generator,
+            num_inference_steps=1,
+        )
+
+        assert result is expected
+        assert seen["z"] is z
+        assert seen["generator"] is generator
+        assert seen["num_inference_steps"] == 1
+
+    def test_distributed_diffusion_tiles_preserve_serial_noise_order(self, monkeypatch):
+        from diffusers.utils.torch_utils import randn_tensor
+
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        model = DistributedLTX2VideoDiffusionDecoderModel(
+            out_channels=1,
+            latent_channels=1,
+            patch_size=1,
+            decoder_head_dim=8,
+            decoder_stage_channels=(8, 8, 8, 8, 8),
+            decoder_stage_depths=(1, 1, 1, 1, 1),
+            decoder_stage_kernels=((1, 1, 1),) * 4,
+            decoder_upsample_strides=((1, 1, 1),) * 4,
+            decoder_upsample_channel_reductions=(1, 1, 1, 1),
+            decoder_stage5_kernel=(1, 1, 1),
+            spatial_compression_ratio=1,
+            temporal_compression_ratio=1,
+        )
+        model.tile_sample_min_num_frames = 2
+        model.tile_sample_stride_num_frames = 1
+        model.tile_sample_min_height = 2
+        model.tile_sample_stride_height = 1
+        model.tile_sample_min_width = 2
+        model.tile_sample_stride_width = 1
+        model.distributed_executor = SimpleNamespace(group=None)
+        model.decoder.forward_stages_1_to_3 = lambda z: z.permute(0, 2, 3, 4, 1)
+        monkeypatch.setattr(torch.distributed, "broadcast", lambda *_args, **_kwargs: None)
+
+        z = torch.zeros(1, 1, 2, 3, 3)
+        distributed_generator = torch.Generator().manual_seed(123)
+        reference_generator = torch.Generator().manual_seed(123)
+        tasks, grid_spec = model._distributed_tile_split(z, distributed_generator, num_inference_steps=1)
+
+        assert grid_spec.grid_shape == (1, 3, 3)
+        assert grid_spec.split_dims == (2, 3, 4)
+        for task in tasks:
+            tile_shape = model._tiled_pixel_shape_from_features(
+                task.tensor,
+                drop_leading_frame=task.drop_leading_frame,
+                crop_trailing_ghost=task.crop_trailing_ghost,
+            )
+            expected = randn_tensor(tile_shape, generator=reference_generator, device=z.device, dtype=z.dtype)
+            actual = randn_tensor(tile_shape, generator=task.noise_generator, device=z.device, dtype=z.dtype)
+            torch.testing.assert_close(actual, expected)
+
+        assert torch.equal(distributed_generator.get_state(), reference_generator.get_state())
 
 
 class TestLTXOutputRank:

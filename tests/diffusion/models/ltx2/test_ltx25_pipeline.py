@@ -197,6 +197,9 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         def enable_tiling(self):
             calls["diffusion_decoder_tiling"] = True
 
+        def set_parallel_size(self, parallel_size, mode):
+            calls["diffusion_decoder_parallel"] = (parallel_size, mode)
+
     profile = replace(
         LTX25_DISTILLED_COMPONENT_PROFILE,
         text_encoder_cls=object,
@@ -212,7 +215,8 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         dtype=torch.bfloat16,
         quantization_config=None,
         extras={"ltx2_use_diffusion_decoder": True},
-        vae_use_tiling=True,
+        vae_use_tiling=False,
+        parallel_config=SimpleNamespace(vae_patch_parallel_size=2, vae_parallel_mode="tile"),
     )
 
     monkeypatch.setattr(ltx2_components, "get_local_device", lambda: torch.device("cpu"))
@@ -283,6 +287,7 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     assert "diffusion_decoder" in calls["prefetch"][1]
     assert calls["diffusion_decoder_processor"] is natten_processor
     assert calls["diffusion_decoder_tiling"] is True
+    assert calls["diffusion_decoder_parallel"] == (2, "tile")
     assert calls["transformer_config"] == (
         od_config.model,
         profile.transformer_subfolder,

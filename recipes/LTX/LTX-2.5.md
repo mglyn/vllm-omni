@@ -60,8 +60,11 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 
 `vae_use_tiling` is optional and applies the decoder's native overlapping-tile
 path. DiffVAE is decoder-only, so the convolutional VAE is still loaded for
-I2V encoding. DiffVAE decoding runs on the output rank and does not use VAE
-patch parallelism.
+I2V encoding. `vae_patch_parallel_size=1` keeps this native single-rank path.
+Setting it above 1 automatically enables tiling and distributes each tile's
+last deterministic stage and diffusion stage across the DiT process group;
+rank 0 blends the decoded RGB tiles. The low-resolution deterministic stages
+run on every participating rank so tile borders retain their shared context.
 
 ## Prerequisites
 
