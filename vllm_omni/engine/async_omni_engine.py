@@ -979,6 +979,17 @@ class AsyncOmniEngine:
                 attention_backend=kwargs.get("diffusion_attention_backend"),
             )
 
+        extras = dict(kwargs.get("extras") or {})
+        for key, default in (
+            ("auxiliary_text_encoder", None),
+            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        ):
+            top_level_value = kwargs.get(key)
+            if top_level_value is not None:
+                extras[key] = top_level_value
+            else:
+                extras.setdefault(key, default)
+
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
@@ -1038,11 +1049,7 @@ class AsyncOmniEngine:
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
-            "extras": {
-                **(kwargs.get("extras") or {}),
-                "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),
-                "default_llama_model_id": kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-            },
+            "extras": extras,
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])
