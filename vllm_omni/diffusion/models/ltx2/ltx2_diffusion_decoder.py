@@ -1,8 +1,9 @@
 # Copyright 2026 Lightricks and The HuggingFace Team. All rights reserved.
 #
-# Copied from Hugging Face Diffusers' LTX-2.5 diffusion decoder. Keep this
-# private compatibility copy until vLLM-Omni's pinned Diffusers exposes the
-# component publicly.
+# Copied and modified from Hugging Face Diffusers' LTX-2.5 diffusion decoder:
+# https://github.com/huggingface/diffusers/blob/7564fb016dabda0c943416190fc92398c50b1b20/src/diffusers/models/autoencoders/ltx2_diffusion_decoder.py
+# Keep this private compatibility copy until vLLM-Omni's pinned Diffusers
+# exposes the component publicly.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

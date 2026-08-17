@@ -14,6 +14,13 @@ repository is not directly loadable with `--model`. It supplies the official
 upsampler and LoRA sidecars used by the Full/SFT two-stage pipeline, so accept
 both model licenses and authenticate before first use.
 
+The vLLM-Omni integration code is provided under the project's
+[Apache-2.0 license](../../LICENSE). The LTX-2.5 model weights are separate
+artifacts covered by the
+[LTX-2.x Community License](https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md),
+not the vLLM-Omni license. Users are responsible for reviewing and complying
+with the model license before downloading or using the weights.
+
 ## Choose a pipeline
 
 | Pipeline | Mode | Default size | Schedule |
