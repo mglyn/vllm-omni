@@ -251,14 +251,13 @@ class LTX2VideoVaeNeighborhoodNattenProcessor:
         if DIFFUSERS_DISABLE_REMOTE_CODE:
             raise ValueError(
                 "LTX2VideoVaeNeighborhoodNattenProcessor downloads the `shi-labs/natten` kernel from the Hub, which "
-                "is disabled globally by the `DIFFUSERS_DISABLE_REMOTE_CODE` environment variable. Unset it, or use "
-                "the default `LTX2VideoVaeNeighborhoodAttnProcessor` (FlexAttention) instead."
+                "is disabled globally by the `DIFFUSERS_DISABLE_REMOTE_CODE` environment variable. Unset it to allow "
+                "the trusted kernel download required by the LTX-2.5 diffusion decoder."
             )
         if not is_kernels_available():
             raise ImportError(
                 "LTX2VideoVaeNeighborhoodNattenProcessor fetches NATTEN from the Hub with the `kernels` package. "
-                "Install it with `pip install kernels`, or use the default "
-                "`LTX2VideoVaeNeighborhoodAttnProcessor` (FlexAttention) instead."
+                "Install the project's pinned `kernels` dependency to use the LTX-2.5 diffusion decoder."
             )
         from kernels import get_kernel
 

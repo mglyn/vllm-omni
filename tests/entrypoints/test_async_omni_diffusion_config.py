@@ -39,6 +39,37 @@ def test_default_stage_config_preserves_model_extras():
     assert stage_cfg["engine_args"]["extras"]["ltx2_use_diffusion_decoder"] is True
 
 
+def test_default_stage_config_preserves_and_overrides_promoted_extras():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": None,
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/extras-llama"
+    assert extras["default_llama_model_id"] == "extras/default-llama"
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": "/models/top-level-llama",
+            "default_llama_model_id": "top-level/default-llama",
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/top-level-llama"
+    assert extras["default_llama_model_id"] == "top-level/default-llama"
+
+
 def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocker):
     """Local/unregistered Diffusers checkpoints still honor stage-0 extras."""
 
