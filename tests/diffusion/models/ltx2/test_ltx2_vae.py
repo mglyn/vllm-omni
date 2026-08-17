@@ -12,6 +12,62 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class TestLTXDiffusionDecoder:
+    def test_short_clip_keeps_stage5_temporal_context_then_crops_output(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+            LTX2VideoDiffusionDecoder3d,
+            LTX2VideoDiffusionDecoderModel,
+        )
+
+        class IdentityAttention:
+            def build_block_mask(self, _hidden_states):
+                return None
+
+        class IdentityBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = IdentityAttention()
+
+            def forward(self, hidden_states, _block_mask):
+                return hidden_states
+
+        class IdentityUpsample(torch.nn.Module):
+            def forward(self, hidden_states, *, drop_leading_frame):
+                assert drop_leading_frame
+                return hidden_states
+
+        decoder = object.__new__(LTX2VideoDiffusionDecoder3d)
+        torch.nn.Module.__init__(decoder)
+        decoder.det_stages = torch.nn.ModuleList([torch.nn.ModuleList([IdentityBlock()])])
+        decoder.upsamples = torch.nn.ModuleList([IdentityUpsample()])
+        decoder.trailing_pad_latent_frames = 2
+        decoder.temporal_compression_ratio = 8
+        decoder.stage5_kernel = (11, 3, 3)
+
+        # 17 frames contain one real frame followed by 16 propagated ghost
+        # frames. The reference keeps 11 for stage-5 NATTEN instead of
+        # cropping the tensor immediately back to one.
+        context = decoder.forward_stage_4(torch.zeros(1, 17, 3, 3, 4))
+        assert context.shape == (1, 11, 3, 3, 4)
+
+        class FakeDecoder(torch.nn.Module):
+            def forward(self, z, *, generator, num_inference_steps):
+                assert generator is None
+                assert num_inference_steps is None
+                return torch.zeros(z.shape[0], 3, 11, z.shape[3] * 2, z.shape[4] * 2)
+
+        model = object.__new__(LTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.decoder = FakeDecoder()
+        model.use_tiling = False
+        model.tile_sample_min_num_frames = 80
+        model.tile_sample_min_height = 768
+        model.tile_sample_min_width = 768
+        model.temporal_compression_ratio = 8
+        model.spatial_compression_ratio = 2
+
+        output = model.decode(torch.zeros(1, 4, 1, 2, 3), generator=None, return_dict=False)[0]
+        assert output.shape == (1, 3, 1, 4, 6)
+
     @pytest.mark.parametrize(
         ("extras", "expected"),
         [({}, False), ({"ltx2_use_diffusion_decoder": True}, True)],

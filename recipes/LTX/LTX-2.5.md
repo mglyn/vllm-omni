@@ -34,7 +34,8 @@ The convolutional VAE decoder remains the default. LTX-2.5 can instead load
 the published DiffVAE component by setting the startup-only model extra
 `ltx2_use_diffusion_decoder: true` on diffusion stage 0. The choice is made at
 engine startup because it changes which weights are loaded; it is not a
-per-request sampling parameter.
+per-request sampling parameter. The same extra works with all four public
+LTX-2.5 pipeline classes listed above.
 
 For offline Python usage, pass the model extra through the stage override:
 
@@ -55,15 +56,6 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
   --model-class-name LTX2Pipeline \
   --stage-overrides '{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}' \
   --vae-use-tiling
-```
-
-The equivalent deploy YAML is:
-
-```yaml
-stages:
-  - stage_id: 0
-    extras:
-      ltx2_use_diffusion_decoder: true
 ```
 
 `vae_use_tiling` is optional and applies the decoder's native overlapping-tile

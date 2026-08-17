@@ -188,6 +188,15 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
     calls = {"components": []}
+    natten_processor = object()
+
+    class FakeDiffusionDecoder:
+        def set_attn_processor(self, processor):
+            calls["diffusion_decoder_processor"] = processor
+
+        def enable_tiling(self):
+            calls["diffusion_decoder_tiling"] = True
+
     profile = replace(
         LTX25_DISTILLED_COMPONENT_PROFILE,
         text_encoder_cls=object,
@@ -202,6 +211,8 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         revision=revision,
         dtype=torch.bfloat16,
         quantization_config=None,
+        extras={"ltx2_use_diffusion_decoder": True},
+        vae_use_tiling=True,
     )
 
     monkeypatch.setattr(ltx2_components, "get_local_device", lambda: torch.device("cpu"))
@@ -225,6 +236,8 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
                 temporal_compression_ratio=4,
                 config=SimpleNamespace(sample_rate=16_000, mel_hop_length=160),
             )
+        if subfolder == "diffusion_decoder":
+            return FakeDiffusionDecoder()
         return object()
 
     def fake_transformer_config(model, subfolder, local_files_only, *, revision):
@@ -235,6 +248,11 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     monkeypatch.setattr(ltx2_components.AutoTokenizer, "from_pretrained", fake_tokenizer)
     monkeypatch.setattr(ltx2_components, "_load_component", fake_component)
     monkeypatch.setattr(ltx2_components, "load_transformer_config", fake_transformer_config)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodNattenProcessor",
+        lambda: natten_processor,
+    )
     monkeypatch.setattr(
         ltx2_components,
         "create_transformer_from_config",
@@ -259,8 +277,12 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         "audio_vae",
         "vocoder",
         "latent_upsampler",
+        "diffusion_decoder",
     }
     assert all(call[3]["revision"] == revision for call in calls["components"])
+    assert "diffusion_decoder" in calls["prefetch"][1]
+    assert calls["diffusion_decoder_processor"] is natten_processor
+    assert calls["diffusion_decoder_tiling"] is True
     assert calls["transformer_config"] == (
         od_config.model,
         profile.transformer_subfolder,
@@ -409,6 +431,40 @@ def test_ltx25_four_public_pipeline_semantics_are_disjoint():
     assert LTX2TwoStagePipeline.pipeline_kind == "two_stage"
     assert LTX2DistilledOneStagePipeline.pipeline_kind == "distilled_one_stage"
     assert LTX2DistilledTwoStagePipeline.pipeline_kind == "distilled_two_stage"
+
+
+@pytest.mark.parametrize(
+    "pipeline_cls",
+    [
+        LTX2Pipeline,
+        LTX2TwoStagePipeline,
+        LTX2DistilledOneStagePipeline,
+        LTX2DistilledTwoStagePipeline,
+    ],
+)
+def test_ltx25_all_public_pipelines_accept_diffusion_decoder_opt_in(tmp_path, monkeypatch, pipeline_cls):
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"text_encoder": ["transformers", "Gemma4UnifiedForConditionalGeneration"]})
+    )
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.vae_spatial_compression_ratio = 32
+
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
+    monkeypatch.setattr(ltx2_runtime, "build_ltx_phase_adapter", lambda _pipe: None)
+    monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", lambda *_args, **_kwargs: None)
+
+    pipe = pipeline_cls(
+        od_config=SimpleNamespace(
+            model=str(tmp_path),
+            extras={"ltx2_use_diffusion_decoder": True},
+            enable_diffusion_pipeline_profiler=False,
+        )
+    )
+
+    assert pipe.use_diffusion_decoder is True
+    assert pipe._vae_modules.count("diffusion_decoder") == 1
 
 
 @pytest.mark.parametrize(
