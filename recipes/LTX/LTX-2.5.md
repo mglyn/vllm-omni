@@ -44,7 +44,6 @@ omni = Omni(
     model="Lightricks/LTX-2.5-Diffusers",
     model_class_name="LTX2Pipeline",
     stage_overrides='{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}',
-    vae_use_tiling=True,
 )
 ```
 
@@ -54,19 +53,24 @@ For online serving, use the same stage override at startup:
 vllm serve Lightricks/LTX-2.5-Diffusers \
   --omni \
   --model-class-name LTX2Pipeline \
-  --stage-overrides '{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}' \
-  --vae-use-tiling
+  --stage-overrides '{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}'
 ```
 
-`vae_use_tiling` is optional and applies the decoder's native overlapping-tile
-path. DiffVAE is decoder-only, so the convolutional VAE is still loaded for
-I2V encoding. `vae_patch_parallel_size=1` keeps this native single-rank path.
-Setting it above 1 automatically enables tiling and distributes each tile's
-last deterministic stage and diffusion stage across the DiT process group;
-rank 0 blends the decoded RGB tiles. The low-resolution deterministic stages
-run on every participating rank so tile borders retain their shared context.
-VAE patch parallelism does not launch workers; for PP=4, provision four DiT
-ranks too, for example with `--usp 4 --vae-patch-parallel-size 4`.
+Both decoders are untiled by default. Choose the decode mode based on memory
+and latency:
+
+| Settings | Decode mode | Choose when |
+|---|---|---|
+| PP=1 without `vae_use_tiling` | One full decode | It fits memory; this is the fastest single-GPU path |
+| PP=1 with `vae_use_tiling` | Serial overlapping tiles | Lower peak memory is worth extra tile/blend work |
+| `--usp N --vae-patch-parallel-size N` | Tiles distributed over N ranks | Multiple DiT ranks are available and decode latency matters |
+
+For DiffVAE, tiling activates when frames exceed 80 or either spatial dimension
+exceeds 768 pixels. Setting `vae_patch_parallel_size>1` enables it automatically;
+the option reuses existing DiT ranks rather than launching workers. DiffVAE
+stages 1-3 still process the full low-resolution feature volume on every rank,
+while stage 4 and the diffusion stage run per tile and rank 0 blends the result.
+DiffVAE is decoder-only, so the convolutional VAE remains loaded for I2V encoding.
 
 ## Prerequisites
 
