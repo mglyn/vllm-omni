@@ -2,6 +2,8 @@
 #
 # Copied and modified from Hugging Face Diffusers' LTX-2.5 diffusion decoder:
 # https://github.com/huggingface/diffusers/blob/7564fb016dabda0c943416190fc92398c50b1b20/src/diffusers/models/autoencoders/ltx2_diffusion_decoder.py
+# Native checkpoint conversion rules copied and modified from:
+# https://github.com/huggingface/diffusers/blob/7564fb016dabda0c943416190fc92398c50b1b20/scripts/convert_ltx2_to_diffusers.py
 # Keep this private compatibility copy until vLLM-Omni's pinned Diffusers
 # exposes the component publicly.
 #
@@ -17,7 +19,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -32,6 +36,7 @@ from diffusers.utils import is_kernels_available, logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from diffusers.utils.constants import DIFFUSERS_DISABLE_REMOTE_CODE
 from diffusers.utils.torch_utils import randn_tensor
+from safetensors import safe_open
 
 try:
     from diffusers.utils.torch_utils import maybe_adjust_dtype_for_device
@@ -44,6 +49,115 @@ except ImportError:
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID = "Lightricks/LTX-2.5"
+LTX25_NATIVE_DIFFUSION_DECODER_FILENAME = "vae/ltx-2.5-video-vae-bf16.safetensors"
+
+_NATIVE_DECODER_PREFIXES = ("vae.decoder.", "decoder.")
+_NATIVE_STATISTICS_KEYS = {
+    "per_channel_statistics.mean-of-means": "latents_mean",
+    "per_channel_statistics.std-of-means": "latents_std",
+}
+_NATIVE_KEY_REPLACEMENTS = (
+    ("t_embedder.mlp.0.", "t_embedder.timestep_embedder.linear_1."),
+    ("t_embedder.mlp.2.", "t_embedder.timestep_embedder.linear_2."),
+    (".attn.proj.", ".attn.to_out.0."),
+    (".attn.q_norm.", ".attn.norm_q."),
+    (".attn.k_norm.", ".attn.norm_k."),
+)
+_GATE_FOLD_TARGETS = {
+    ".attn.to_out.0.weight": ".gate_msa",
+    ".attn.to_out.0.bias": ".gate_msa",
+    ".mlp.w_down.weight": ".gate_mlp",
+    ".context_proj.weight": ".gate_ctx",
+    ".context_proj.bias": ".gate_ctx",
+}
+_GATE_SUFFIXES = tuple(_GATE_FOLD_TARGETS.values())
+
+
+def _strip_native_decoder_prefix(key: str) -> str | None:
+    for prefix in _NATIVE_DECODER_PREFIXES:
+        if key.startswith(prefix):
+            return key.removeprefix(prefix)
+    return None
+
+
+def _native_statistics_target(key: str) -> str | None:
+    return _NATIVE_STATISTICS_KEYS.get(key.removeprefix("vae."))
+
+
+def _rename_native_decoder_key(key: str) -> str:
+    for source, target in _NATIVE_KEY_REPLACEMENTS:
+        key = key.replace(source, target)
+    return key
+
+
+def _fold_native_gate(key: str, value: torch.Tensor, gates: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    target_suffix = next((suffix for suffix in _GATE_FOLD_TARGETS if key.endswith(suffix)), None)
+    if target_suffix is None:
+        return value
+    gate_key = key[: -len(target_suffix)] + _GATE_FOLD_TARGETS[target_suffix]
+    gate = gates.get(gate_key)
+    if gate is None:
+        return value
+    gate = gate.to(device=value.device, dtype=torch.float32)
+    value_float = value.to(dtype=torch.float32)
+    folded = gate.unsqueeze(1) * value_float if value.ndim == 2 else gate * value_float
+    return folded.to(dtype=value.dtype)
+
+
+def convert_ltx25_native_diffusion_decoder_state_dict(
+    native_state_dict: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Convert a Native LTX-2.5 DiffVAE state dict to this decoder's layout."""
+    decoder_state_dict: dict[str, torch.Tensor] = {}
+    converted: dict[str, torch.Tensor] = {}
+    for key, value in native_state_dict.items():
+        statistics_target = _native_statistics_target(key)
+        if statistics_target is not None:
+            converted[statistics_target] = value
+            continue
+        decoder_key = _strip_native_decoder_prefix(key)
+        if decoder_key is not None:
+            decoder_state_dict[decoder_key] = value
+
+    gates = {key: value for key, value in decoder_state_dict.items() if key.endswith(_GATE_SUFFIXES)}
+    for key, value in decoder_state_dict.items():
+        # ``type_emb`` is an unused shipping-checkpoint residue. Preview heads
+        # and legacy static gates are not parameters of the runtime decoder.
+        if key == "type_emb" or key.startswith("coarse_") or ".coarse_" in key or key in gates:
+            continue
+
+        converted_key = _rename_native_decoder_key(key)
+        value = _fold_native_gate(converted_key, value, gates)
+        if converted_key.endswith((".qkv.weight", ".qkv.bias")):
+            leaf = "weight" if converted_key.endswith(".weight") else "bias"
+            prefix = converted_key[: -len(f"qkv.{leaf}")]
+            if value.shape[0] % 3 != 0:
+                raise ValueError(
+                    f"Fused LTX-2.5 DiffVAE parameter {key!r} has leading dimension "
+                    f"{value.shape[0]}, which is not divisible by 3."
+                )
+            chunk = value.shape[0] // 3
+            converted[f"decoder.{prefix}to_q.{leaf}"] = value[:chunk].clone()
+            converted[f"decoder.{prefix}to_k.{leaf}"] = value[chunk : 2 * chunk].clone()
+            converted[f"decoder.{prefix}to_v.{leaf}"] = value[2 * chunk :].clone()
+            continue
+
+        converted[f"decoder.{converted_key}"] = value
+
+    return converted
+
+
+def load_ltx25_native_diffusion_decoder_state_dict(path: str) -> dict[str, torch.Tensor]:
+    """Read and convert only DiffVAE tensors from the Native full-VAE file."""
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        native_state_dict = {
+            key: handle.get_tensor(key)
+            for key in handle.keys()
+            if _strip_native_decoder_prefix(key) is not None or _native_statistics_target(key) is not None
+        }
+    return convert_ltx25_native_diffusion_decoder_state_dict(native_state_dict)
 
 
 @dataclass(frozen=True)
@@ -763,6 +877,24 @@ class LTX2VideoDiffusionDecoderModel(ModelMixin, AttentionMixin, ConfigMixin):
     # inside either one would separate tensors that have to meet again in the same forward.
     _no_split_modules = ["LTX2VideoVaeNABlock", "LTX2VideoVaeDiffusionNABlock"]
     _supports_gradient_checkpointing = False
+
+    @classmethod
+    def from_ltx25_native_checkpoint(
+        cls,
+        checkpoint_path: str,
+        config: Mapping[str, Any],
+        dtype: torch.dtype,
+    ) -> "LTX2VideoDiffusionDecoderModel":
+        """Construct this decoder class directly from the official Native checkpoint."""
+        with torch.device("meta"):
+            model = cls.from_config(dict(config))
+        state_dict = load_ltx25_native_diffusion_decoder_state_dict(checkpoint_path)
+        try:
+            model.load_state_dict(state_dict, strict=True, assign=True)
+        except RuntimeError as exc:
+            raise ValueError(f"Invalid LTX-2.5 Native DiffVAE checkpoint {checkpoint_path!r}.") from exc
+        model.to(device="cpu", dtype=dtype)
+        return model
 
     @register_to_config
     def __init__(

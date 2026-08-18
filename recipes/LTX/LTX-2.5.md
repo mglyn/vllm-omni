@@ -10,9 +10,10 @@ checkpoint for T2V and first-frame I2V. Every output includes synchronized
 48 kHz stereo audio.
 
 The raw [`Lightricks/LTX-2.5`](https://huggingface.co/Lightricks/LTX-2.5)
-repository is not directly loadable with `--model`. It supplies the official
-upsampler and LoRA sidecars used by the Full/SFT two-stage pipeline, so accept
-both model licenses and authenticate before first use.
+repository is not directly loadable with `--model`. It supplies the canonical
+Diffusion VAE checkpoint and the official upsampler and LoRA sidecars used by
+the Full/SFT two-stage pipeline, so accept both model licenses and authenticate
+before first use.
 
 The vLLM-Omni integration code is provided under the project's
 [Apache-2.0 license](../../LICENSE). The LTX-2.5 model weights are separate
@@ -37,12 +38,13 @@ image selects I2V, while omitting it selects T2V.
 
 ## Diffusion VAE decoder selection
 
-The convolutional VAE decoder remains the default. LTX-2.5 can instead load
-the published Diffusion VAE decoder (DiffVAE) by setting the startup-only model
-extra `ltx2_use_diffusion_decoder: true` on diffusion stage 0. The choice is
-made at engine startup because it changes which weights are loaded; it is not
-a per-request sampling parameter. The same extra works with all four public
-LTX-2.5 pipeline classes listed above.
+The convolutional VAE decoder remains the default. LTX-2.5 can instead load the
+canonical Native Diffusion VAE decoder (DiffVAE) by setting the startup-only
+model extra `ltx2_use_diffusion_decoder: true` on diffusion stage 0. vLLM-Omni
+converts the decoder portion of the Native full-VAE file to the local
+Diffusers-compatible layout during startup; the encoder is not loaded. The
+choice is not a per-request sampling parameter. The same extra
+works with all four public LTX-2.5 pipeline classes listed above.
 
 For offline Python usage, pass the model extra through the stage override:
 

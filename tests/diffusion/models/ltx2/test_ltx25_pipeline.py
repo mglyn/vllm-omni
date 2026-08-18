@@ -240,9 +240,11 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
                 temporal_compression_ratio=4,
                 config=SimpleNamespace(sample_rate=16_000, mel_hop_length=160),
             )
-        if subfolder == "diffusion_decoder":
-            return FakeDiffusionDecoder()
         return object()
+
+    def fake_native_diffusion_decoder(model, **kwargs):
+        calls["native_diffusion_decoder"] = (model, kwargs)
+        return FakeDiffusionDecoder()
 
     def fake_transformer_config(model, subfolder, local_files_only, *, revision):
         calls["transformer_config"] = (model, subfolder, local_files_only, revision)
@@ -251,6 +253,7 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     monkeypatch.setattr(ltx2_components, "prefetch_subfolders", fake_prefetch)
     monkeypatch.setattr(ltx2_components.AutoTokenizer, "from_pretrained", fake_tokenizer)
     monkeypatch.setattr(ltx2_components, "_load_component", fake_component)
+    monkeypatch.setattr(ltx2_components, "_load_ltx25_native_diffusion_decoder", fake_native_diffusion_decoder)
     monkeypatch.setattr(ltx2_components, "load_transformer_config", fake_transformer_config)
     monkeypatch.setattr(
         ltx2_components,
@@ -281,10 +284,13 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         "audio_vae",
         "vocoder",
         "latent_upsampler",
-        "diffusion_decoder",
     }
     assert all(call[3]["revision"] == revision for call in calls["components"])
-    assert "diffusion_decoder" in calls["prefetch"][1]
+    assert "diffusion_decoder" not in calls["prefetch"][1]
+    assert calls["native_diffusion_decoder"] == (
+        od_config.model,
+        {"local_files_only": False, "dtype": torch.bfloat16, "revision": revision},
+    )
     assert calls["diffusion_decoder_processor"] is natten_processor
     assert calls["diffusion_decoder_tiling"] is True
     assert calls["diffusion_decoder_parallel"] == (2, "tile")
@@ -295,6 +301,66 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         revision,
     )
     assert calls["scheduler"][1]["revision"] == revision
+
+
+def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_artifact(monkeypatch):
+    revision = "diffusers-revision"
+    config = {"decoder_stage_channels": [8, 8, 8, 8, 8]}
+    calls = {}
+
+    class FakeDecoder:
+        def init_distributed(self):
+            calls["init_distributed"] = True
+
+    expected = FakeDecoder()
+
+    def fake_load_config(model, **kwargs):
+        calls["config"] = (model, kwargs)
+        return config
+
+    def fake_resolve(model, repo_id, filename):
+        calls["artifact"] = (model, repo_id, filename)
+        return "/models/native-diffvae.safetensors"
+
+    def fake_load(cls, path, passed_config, dtype):
+        calls["load"] = (path, passed_config, dtype)
+        return expected
+
+    monkeypatch.setattr(
+        ltx2_components.DistributedLTX2VideoDiffusionDecoderModel,
+        "load_config",
+        staticmethod(fake_load_config),
+    )
+    monkeypatch.setattr(ltx2_components, "resolve_ltx_artifact", fake_resolve)
+    monkeypatch.setattr(
+        ltx2_components.DistributedLTX2VideoDiffusionDecoderModel,
+        "from_ltx25_native_checkpoint",
+        classmethod(fake_load),
+    )
+
+    actual = ltx2_components._load_ltx25_native_diffusion_decoder(
+        "Lightricks/LTX-2.5-Diffusers",
+        local_files_only=False,
+        dtype=torch.bfloat16,
+        revision=revision,
+    )
+
+    assert actual is expected
+    assert calls["config"] == (
+        "Lightricks/LTX-2.5-Diffusers",
+        {
+            "subfolder": "diffusion_decoder",
+            "local_files_only": False,
+            "revision": revision,
+        },
+    )
+    assert calls["artifact"] == (
+        "Lightricks/LTX-2.5-Diffusers",
+        "Lightricks/LTX-2.5",
+        "vae/ltx-2.5-video-vae-bf16.safetensors",
+    )
+    assert calls["load"] == ("/models/native-diffvae.safetensors", config, torch.bfloat16)
+    assert calls["init_distributed"] is True
 
 
 def test_ltx_checkpoint_explicit_version_precedes_structural_heuristics(tmp_path):

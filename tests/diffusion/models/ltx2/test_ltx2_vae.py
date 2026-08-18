@@ -83,6 +83,63 @@ class TestLTXDiffusionDecoder:
         with pytest.raises(TypeError, match="ltx2_use_diffusion_decoder"):
             _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_diffusion_decoder": "true"}))
 
+    def test_native_diffusion_decoder_conversion_splits_qkv_and_folds_gates(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+            convert_ltx25_native_diffusion_decoder_state_dict,
+        )
+
+        qkv_weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        qkv_bias = torch.arange(6, dtype=torch.float32)
+        projection_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        projection_bias = torch.ones(2)
+        gate = torch.tensor([2.0, 3.0])
+        mean = torch.tensor([0.1, 0.2])
+        std = torch.tensor([0.3, 0.4])
+        native = {
+            "encoder.ignored": torch.ones(1),
+            "per_channel_statistics.mean-of-means": mean,
+            "vae.per_channel_statistics.std-of-means": std,
+            "decoder.type_emb": torch.ones(2),
+            "decoder.coarse_head.weight": torch.ones(1),
+            "decoder.det_stages.0.0.attn.qkv.weight": qkv_weight,
+            "decoder.det_stages.0.0.attn.qkv.bias": qkv_bias,
+            "decoder.det_stages.0.0.attn.q_norm.weight": torch.tensor([5.0, 6.0]),
+            "decoder.det_stages.0.0.attn.k_norm.weight": torch.tensor([7.0, 8.0]),
+            "decoder.diff_blocks.0.attn.proj.weight": projection_weight,
+            "decoder.diff_blocks.0.attn.proj.bias": projection_bias,
+            "decoder.diff_blocks.0.gate_msa": gate,
+            "vae.decoder.t_embedder.mlp.0.weight": torch.ones(2, 2),
+        }
+
+        converted = convert_ltx25_native_diffusion_decoder_state_dict(native)
+
+        torch.testing.assert_close(converted["latents_mean"], mean)
+        torch.testing.assert_close(converted["latents_std"], std)
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_q.weight"], qkv_weight[:2])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_k.weight"], qkv_weight[2:4])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_v.weight"], qkv_weight[4:])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_q.bias"], qkv_bias[:2])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_k.bias"], qkv_bias[2:4])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_v.bias"], qkv_bias[4:])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.norm_q.weight"], torch.tensor([5.0, 6.0]))
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.norm_k.weight"], torch.tensor([7.0, 8.0]))
+        torch.testing.assert_close(
+            converted["decoder.diff_blocks.0.attn.to_out.0.weight"], gate.unsqueeze(1) * projection_weight
+        )
+        torch.testing.assert_close(converted["decoder.diff_blocks.0.attn.to_out.0.bias"], gate * projection_bias)
+        assert "decoder.t_embedder.timestep_embedder.linear_1.weight" in converted
+        assert not any("type_emb" in key or "coarse" in key or "gate_msa" in key for key in converted)
+
+    def test_native_diffusion_decoder_conversion_rejects_invalid_fused_qkv(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+            convert_ltx25_native_diffusion_decoder_state_dict,
+        )
+
+        with pytest.raises(ValueError, match="not divisible by 3"):
+            convert_ltx25_native_diffusion_decoder_state_dict(
+                {"decoder.det_stages.0.0.attn.qkv.weight": torch.ones(5, 2)}
+            )
+
     def test_decode_uses_diffusion_decoder_without_conv_vae_conditioning(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
