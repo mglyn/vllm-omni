@@ -36,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--connector-model", type=Path)
     parser.add_argument(
         "--official-pipeline",
-        choices=("distilled_two_stage", "full_one_stage", "full_two_stage", "full_two_stage_hq"),
+        choices=("distilled_two_stage", "full_one_stage", "full_two_stage"),
         default="distilled_two_stage",
     )
     parser.add_argument("--enable-layerwise-offload", action="store_true")
@@ -217,9 +217,9 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
             "--video-vae-path": args.video_vae_path,
             "--audio-vae-path": args.audio_vae_path,
         }
-        if args.official_pipeline in {"distilled_two_stage", "full_two_stage", "full_two_stage_hq"}:
+        if args.official_pipeline in {"distilled_two_stage", "full_two_stage"}:
             required["--spatial-upsampler-path"] = args.spatial_upsampler_path
-        if args.official_pipeline in {"full_two_stage", "full_two_stage_hq"}:
+        if args.official_pipeline == "full_two_stage":
             required["--distilled-lora-path"] = args.distilled_lora_path
         missing = [name for name, value in required.items() if value is None]
         if missing:
@@ -253,44 +253,27 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
                 images=images,
             )
             pipeline_name = "DistilledPipeline"
-        elif args.official_pipeline in {"full_two_stage", "full_two_stage_hq"}:
+        elif args.official_pipeline == "full_two_stage":
             from ltx_core.components.guiders import MultiModalGuiderParams
             from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
             from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
-            from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
 
-            two_stage_kwargs = {
-                "model_paths": model_paths,
-                "distilled_lora": [
+            pipeline = TI2VidTwoStagesPipeline(
+                model_paths=model_paths,
+                distilled_lora=[
                     LoraPathStrengthAndSDOps(
                         path=str(args.distilled_lora_path),
                         strength=1.0,
                         sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
                     )
                 ],
-                "spatial_upsampler_path": str(args.spatial_upsampler_path),
-                "loras": [],
-                "offload_mode": offload_mode,
-            }
-            if args.official_pipeline == "full_two_stage_hq":
-                pipeline = TI2VidTwoStagesHQPipeline(
-                    **two_stage_kwargs,
-                    distilled_lora_strength_stage_1=0.25,
-                    distilled_lora_strength_stage_2=0.5,
-                )
-            else:
-                pipeline = TI2VidTwoStagesPipeline(**two_stage_kwargs)
+                spatial_upsampler_path=str(args.spatial_upsampler_path),
+                loras=[],
+                offload_mode=offload_mode,
+            )
             if args.connector_model is not None:
                 _use_diffusers_connector_weights(pipeline.prompt_encoder, args.connector_model)
             _configure_official_sdpa(pipeline)
-            schedule_kwargs = (
-                {}
-                if args.official_pipeline == "full_two_stage_hq"
-                else {
-                    "stage_1_sigmas": torch.tensor(request["stage_1_sigmas"], dtype=torch.float32),
-                    "stage_2_sigmas": torch.tensor(request["stage_2_sigmas"], dtype=torch.float32),
-                }
-            )
             video, audio, _, _ = pipeline(
                 prompt=request["prompt"],
                 negative_prompt=request["negative_prompt"],
@@ -318,13 +301,10 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
                 ),
                 images=images,
                 max_batch_size=4,
-                **schedule_kwargs,
+                stage_1_sigmas=torch.tensor(request["stage_1_sigmas"], dtype=torch.float32),
+                stage_2_sigmas=torch.tensor(request["stage_2_sigmas"], dtype=torch.float32),
             )
-            pipeline_name = (
-                "TI2VidTwoStagesHQPipeline"
-                if args.official_pipeline == "full_two_stage_hq"
-                else "TI2VidTwoStagesPipeline"
-            )
+            pipeline_name = "TI2VidTwoStagesPipeline"
         else:
             from ltx_core.components.guiders import MultiModalGuiderParams
             from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
