@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from .ltx2_diffusion_decoder import (
+    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
     LTX2VideoVaeNeighborhoodNattenProcessor,
 )
 from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
@@ -548,6 +550,34 @@ def _load_component(
     )
 
 
+def _load_ltx25_native_diffusion_decoder(
+    model: str,
+    *,
+    local_files_only: bool,
+    dtype: torch.dtype,
+    revision: str | None,
+) -> DistributedLTX2VideoDiffusionDecoderModel:
+    """Load canonical Native weights into the local Diffusers-compatible class."""
+    config = DistributedLTX2VideoDiffusionDecoderModel.load_config(
+        model,
+        subfolder=_LTX2_DIFFUSION_DECODER_SUBFOLDER,
+        local_files_only=local_files_only,
+        revision=revision,
+    )
+    checkpoint_path = resolve_ltx_artifact(
+        model,
+        LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+        LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+    )
+    decoder = DistributedLTX2VideoDiffusionDecoderModel.from_ltx25_native_checkpoint(
+        checkpoint_path,
+        config,
+        dtype,
+    )
+    decoder.init_distributed()
+    return decoder
+
+
 def _place_aux_components(pipeline: Any) -> None:
     parallel_config = getattr(pipeline.od_config, "parallel_config", None)
     use_managed_placement = bool(
@@ -573,11 +603,6 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     revision = getattr(od_config, "revision", None)
     local_files_only = os.path.exists(model)
     use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config)
-    component_subfolders = (
-        (*_LTX_COMPONENT_SUBFOLDERS, _LTX2_DIFFUSION_DECODER_SUBFOLDER)
-        if use_diffusion_decoder
-        else _LTX_COMPONENT_SUBFOLDERS
-    )
 
     pipeline.weights_sources = [
         DiffusersPipelineLoader.ComponentSource(
@@ -588,7 +613,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             fall_back_to_pt=True,
         ),
     ]
-    prefetch_subfolders(model, component_subfolders, local_files_only=local_files_only, revision=revision)
+    prefetch_subfolders(model, _LTX_COMPONENT_SUBFOLDERS, local_files_only=local_files_only, revision=revision)
 
     pipeline.tokenizer = AutoTokenizer.from_pretrained(
         model,
@@ -628,16 +653,13 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         revision=revision,
     )
     if use_diffusion_decoder:
-        pipeline.diffusion_decoder = _load_component(
-            DistributedLTX2VideoDiffusionDecoderModel,
+        pipeline.diffusion_decoder = _load_ltx25_native_diffusion_decoder(
             model,
-            _LTX2_DIFFUSION_DECODER_SUBFOLDER,
             local_files_only=local_files_only,
             dtype=dtype,
             revision=revision,
-            prefetch_list=component_subfolders,
         )
-        # The published decoder is trained and validated with NATTEN. Its
+        # The canonical decoder is trained and validated with NATTEN. Its
         # portable FlexAttention fallback materializes an impractically large
         # block mask at production video sizes, so fail early if the matching
         # Hub kernel cannot be loaded instead of failing later during decode.
