@@ -84,7 +84,6 @@ class QualityTestConfig:
     guidance_scale: float | None = None
     sigmas: list[float] | None = None
     enable_cpu_offload: bool = False
-    enforce_eager: bool = False
 
     def baseline_ref(self) -> str:
         return self.baseline_model or self.model or ""
@@ -220,7 +219,6 @@ QUALITY_CONFIGS = [
         # Do not override the recipe's negative conditioning, guidance, or
         # scheduler trajectory: this gate follows the supported LTX default.
         negative_prompt=None,
-        enforce_eager=True,
     ),
 ]
 
@@ -462,6 +460,7 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
 
 
 def test_generate_video_forwards_sigmas(monkeypatch):
+    from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
@@ -472,7 +471,12 @@ def test_generate_video_forwards_sigmas(monkeypatch):
     class DummyOmni:
         def generate(self, _prompt, sampling):
             captured.sampling = sampling
-            return [SimpleNamespace(images=[np.zeros((1, 2, 2, 3), dtype=np.float32)])]
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id="req",
+                    images=[np.zeros((1, 2, 2, 3), dtype=np.float32)],
+                )
+            ]
 
     config = QualityTestConfig(
         id="ltx-sigmas",
@@ -490,15 +494,37 @@ def test_generate_video_forwards_sigmas(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_ltx_quality_gate_uses_official_eager_defaults():
+def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 0, raising=False)
+    captured = SimpleNamespace(prompt=None, sampling=None)
+
+    class DummyOmni:
+        def generate(self, prompt, sampling):
+            captured.prompt = prompt
+            captured.sampling = sampling
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id="req",
+                    images=[np.zeros((1, 2, 2, 3), dtype=np.float32)],
+                )
+            ]
+
     config = next(config for config in QUALITY_CONFIGS if config.id == "fp8_ltx2")
+    _generate_video(DummyOmni(), config)
 
     assert (config.width, config.height, config.num_frames, config.num_inference_steps) == (512, 384, 73, 10)
     assert config.max_lpips == 0.20
     assert config.sigmas is None
     assert config.guidance_scale is None
     assert config.negative_prompt is None
-    assert config.enforce_eager
+    assert "negative_prompt" not in captured.prompt
+    assert captured.sampling.sigmas is None
+    assert captured.sampling.guidance_scale is None
 
 
 _marks = hardware_marks(res={"cuda": "H100"})
@@ -536,8 +562,6 @@ def test_quantization_quality(config: QualityTestConfig):
     bl_kwargs: dict = {"model": config.baseline_ref(), "enforce_eager": True}
     if config.enable_cpu_offload:
         bl_kwargs["enable_cpu_offload"] = True
-    if config.enforce_eager:
-        bl_kwargs["enforce_eager"] = True
     omni_bl = Omni(**bl_kwargs)
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     omni_bl.shutdown()
@@ -550,8 +574,6 @@ def test_quantization_quality(config: QualityTestConfig):
     qt_kwargs: dict = {"model": config.quantized_ref(), "enforce_eager": True}
     if config.enable_cpu_offload:
         qt_kwargs["enable_cpu_offload"] = True
-    if config.enforce_eager:
-        qt_kwargs["enforce_eager"] = True
     if quantization is None:
         omni_qt = Omni(**qt_kwargs)
     else:
