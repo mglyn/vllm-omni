@@ -31,7 +31,7 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, is_diffusion_module_graph_fixed
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.forward_context import set_forward_context
@@ -240,14 +240,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             dynamic_loras=parse_lora_adapter_specs(getattr(self.od_config, "dynamic_lora", None)),
             quantized=getattr(self.od_config, "quantization_config", None) is not None,
         )
-        graph_is_fixed = (
-            not self.od_config.enforce_eager
-            or self.od_config.enable_cpu_offload
-            or self.od_config.enable_layerwise_offload
-            or getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            or getattr(self.od_config, "cache_backend", None) not in (None, "none")
-        )
-        if graph_is_fixed:
+        if is_diffusion_module_graph_fixed(self.od_config):
             self.lora_manager.freeze()
         return self.lora_manager
 

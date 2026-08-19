@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.lora.request import LoRARequest
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -560,6 +562,66 @@ class TestDiffusionCompileConfig:
                 diffusion_compile_granularity="full",
                 **kwargs,
             )
+
+
+class TestDynamicLoRAAdmission:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @staticmethod
+    def _engine(**overrides) -> DiffusionEngine:
+        config = {
+            "enforce_eager": False,
+            "enable_cpu_offload": False,
+            "enable_layerwise_offload": False,
+            "enable_distributed_layerwise_offload": False,
+            "cache_backend": "none",
+            "prefused_lora": None,
+            "dynamic_lora": None,
+            "lora_path": None,
+        }
+        config.update(overrides)
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(**config)
+        engine.pre_process_func = None
+        return engine
+
+    @staticmethod
+    def _request(lora_request, lora_scale=1.0) -> OmniDiffusionRequest:
+        return OmniDiffusionRequest(
+            prompt="test",
+            sampling_params=OmniDiffusionSamplingParams(
+                lora_request=lora_request,
+                lora_scale=lora_scale,
+            ),
+            request_id="request",
+        )
+
+    def test_compiled_graph_rejects_first_request_dynamic_lora(self) -> None:
+        engine = self._engine()
+        request = self._request(LoRARequest(lora_name="style", lora_int_id=7, lora_path="/tmp/style"))
+
+        with pytest.raises(OmniClientError, match="--dynamic-lora.*--enforce-eager"):
+            engine._prepare_request_for_admission(request)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"enforce_eager": True},
+            {"dynamic_lora": ["/tmp/template"]},
+            {"prefused_lora": ["/tmp/template"]},
+        ],
+    )
+    def test_request_dynamic_lora_allows_mutable_or_preallocated_graph(self, overrides) -> None:
+        engine = self._engine(**overrides)
+        request = self._request(LoRARequest(lora_name="style", lora_int_id=7, lora_path="/tmp/style"))
+
+        assert engine._prepare_request_for_admission(request) is request
+
+    def test_compiled_graph_allows_explicit_empty_lora(self) -> None:
+        engine = self._engine()
+        request = self._request((), ())
+
+        assert engine._prepare_request_for_admission(request) is request
 
 
 class TestRequestBatchAdmission:

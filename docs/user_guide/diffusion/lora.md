@@ -157,6 +157,12 @@ compositions. After the graph is fixed, requests may select, disable, or
 reweight installed-compatible adapters, but they cannot introduce a new
 target layer or expand the allocated rank.
 
+A non-empty request-level LoRA is rejected before scheduler admission when the
+graph is fixed and no startup adapter reserved any LoRA capacity. Configure a
+compatible `--dynamic-lora` preload, or use `--enforce-eager` without an
+offload/cache feature that also fixes the graph. An explicit empty composition
+remains valid because it does not install or resize anything.
+
 `--max-cpu-loras` controls the per-worker adapter cache. Startup dynamic
 adapters are pinned, while request-loaded adapters use LRU eviction. Set the
 value to at least the number of pinned startup adapters plus the largest

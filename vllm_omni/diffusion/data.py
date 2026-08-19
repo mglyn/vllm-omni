@@ -53,6 +53,18 @@ def normalize_deployment_lora_specs(value: Any, field_name: str) -> list[str] | 
     raise TypeError(f"{field_name} must be a string, a sequence of strings, or None")
 
 
+def is_diffusion_module_graph_fixed(config: Any) -> bool:
+    """Whether runtime features prohibit changing the diffusion module graph."""
+
+    return (
+        not bool(getattr(config, "enforce_eager", False))
+        or bool(getattr(config, "enable_cpu_offload", False))
+        or bool(getattr(config, "enable_layerwise_offload", False))
+        or bool(getattr(config, "enable_distributed_layerwise_offload", False))
+        or getattr(config, "cache_backend", None) not in (None, "none")
+    )
+
+
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)

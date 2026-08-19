@@ -28,6 +28,7 @@ from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
+    is_diffusion_module_graph_fixed,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
@@ -39,6 +40,7 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.lora.types import normalize_lora_composition
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
@@ -53,7 +55,7 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
-from vllm_omni.errors import client_error_from_metadata, is_client_error_status
+from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 if TYPE_CHECKING:
@@ -749,11 +751,31 @@ class DiffusionEngine:
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
+        self._validate_request_lora_capacity(request)
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:
             request = pre_process_func(request)
         self._validate_diffusion_kv_profile_limits(request)
         return request
+
+    def _validate_request_lora_capacity(self, request: OmniDiffusionRequest) -> None:
+        """Reject request-only LoRA when a fixed graph has no startup capacity."""
+
+        sampling = request.sampling_params
+        composition = normalize_lora_composition(sampling.lora_request, sampling.lora_scale)
+        if not composition or not is_diffusion_module_graph_fixed(self.od_config):
+            return
+        has_startup_capacity = any(
+            bool(getattr(self.od_config, field_name, None))
+            for field_name in ("prefused_lora", "dynamic_lora", "lora_path")
+        )
+        if has_startup_capacity:
+            return
+        raise OmniClientError(
+            "Request-level dynamic LoRA cannot install its first adapter after torch.compile, offload, or "
+            "diffusion cache has fixed the module graph. Preload a compatible adapter with --dynamic-lora, "
+            "or use --enforce-eager without graph-fixing offload/cache features."
+        )
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
         """Keep admitted paged-KV requests within the profiled activation shape."""
