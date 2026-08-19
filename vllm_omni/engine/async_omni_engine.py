@@ -1169,6 +1169,16 @@ class AsyncOmniEngine:
             if legacy_arg in kwargs:
                 raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
 
+        removed_lora_args = tuple(
+            name for name in ("lora_path", "lora_backend", "lora_scale") if kwargs.get(name) is not None
+        )
+        if removed_lora_args:
+            names = ", ".join(f"`{name}`" for name in removed_lora_args)
+            raise ValueError(
+                f"Legacy diffusion LoRA argument(s) {names} are no longer supported; "
+                "use `prefused_lora` or `dynamic_lora` with `PATH=SCALE` entries."
+            )
+
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
@@ -1209,22 +1219,12 @@ class AsyncOmniEngine:
                     current_additional_config = getattr(cfg.engine_args, "additional_config", None)
                     if current_additional_config in (None, {}):
                         cfg.engine_args.additional_config = additional_config
-                if kwargs.get("lora_path") is not None:
-                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
-                        cfg.engine_args.lora_path = kwargs["lora_path"]
                 for field_name in ("prefused_lora", "dynamic_lora", "max_cpu_loras"):
                     field_value = kwargs.get(field_name)
                     if field_value is not None:
                         current_value = getattr(cfg.engine_args, field_name, None)
                         if current_value is None:
                             setattr(cfg.engine_args, field_name, field_value)
-                lora_scale = kwargs.get("lora_scale")
-                if lora_scale is None:
-                    # Backwards compatibility for older callers.
-                    lora_scale = kwargs.get("static_lora_scale")
-                if lora_scale is not None:
-                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
-                        cfg.engine_args.lora_scale = lora_scale
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None

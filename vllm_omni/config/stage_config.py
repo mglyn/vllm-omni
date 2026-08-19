@@ -480,6 +480,20 @@ _STAGE_RESERVED_KEYS = frozenset(
     }
 )
 
+_REMOVED_DIFFUSION_LORA_FIELDS = frozenset({"lora_path", "lora_backend", "lora_scale"})
+
+
+def _reject_removed_diffusion_lora_fields(values: dict[str, Any], context: str) -> None:
+    removed = sorted(_REMOVED_DIFFUSION_LORA_FIELDS.intersection(values))
+    if not removed:
+        return
+    names = ", ".join(f"`{name}`" for name in removed)
+    raise ValueError(
+        f"{context} uses removed diffusion LoRA field(s) {names}; "
+        "use `prefused_lora` or `dynamic_lora` with `PATH=SCALE` entries."
+    )
+
+
 # Fields on StageDeployConfig that are populated from engine_args dict
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 
@@ -513,6 +527,9 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
                 flat_args[k] = _get_recursively_merged_dict(existing, v)
             else:
                 flat_args[k] = v
+
+    _reject_removed_diffusion_lora_fields(flat_args, f"Stage {stage_data['stage_id']}")
+    _reject_removed_diffusion_lora_fields(explicit_engine_extras, f"Stage {stage_data['stage_id']} engine_extras")
 
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
@@ -693,8 +710,10 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
         runtime_cfg = ps.get("runtime", {})
         if "num_replicas" in runtime_cfg:
             overrides["num_replicas"] = runtime_cfg["num_replicas"]
+        _reject_removed_diffusion_lora_fields(overrides, f"Platform override for stage {ps['stage_id']}")
         return PlatformOverrides(overrides, runtime_cfg.get("devices"), runtime_cfg.get("env"))
     overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices", "env")}
+    _reject_removed_diffusion_lora_fields(overrides, f"Platform override for stage {ps['stage_id']}")
     return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 

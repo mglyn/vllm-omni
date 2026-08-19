@@ -534,6 +534,10 @@ class TestDiffusionCompileConfig:
         with pytest.raises(TypeError, match="diffusion_compile_dynamic"):
             OmniDiffusionConfig(model="test", diffusion_compile_dynamic="false")
 
+    def test_config_rejects_legacy_lora_path_list_early(self) -> None:
+        with pytest.raises(TypeError, match="lora_path.*one string path"):
+            OmniDiffusionConfig(model="test", lora_path=["/tmp/a", "/tmp/b"])
+
     @pytest.mark.parametrize(
         "kwargs, feature",
         [

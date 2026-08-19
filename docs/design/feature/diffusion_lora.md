@@ -86,6 +86,9 @@ performance guarantee for other models or adapter ranks.
   later target modules and sufficient total rank.
 - Requests with different canonical compositions use different diffusion batch
   keys.
+- When diffusion prefix K/V becomes publishable across requests, its block-hash
+  identity must also include the canonical LoRA composition. Current requests
+  without canonical block hashes remain request-local and are not published.
 - Prefused and dynamic adapters may coexist; specifying the same adapter in
   both sets intentionally applies it twice.
 - Unknown typed updates and unsupported nonzero dense deltas are rejected.

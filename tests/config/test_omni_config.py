@@ -72,6 +72,18 @@ def _load_default_deploy(pipeline: PipelineConfig) -> DeployConfig:
     return DeployConfig()
 
 
+@pytest.mark.parametrize(
+    "legacy_field",
+    ["lora_path: /tmp/legacy", "lora_backend: peft", "lora_scale: 0.5"],
+)
+def test_load_deploy_config_rejects_removed_stage_lora_fields(tmp_path: Path, legacy_field: str) -> None:
+    deploy_path = tmp_path / "legacy-lora.yaml"
+    deploy_path.write_text(f"stages:\n  - stage_id: 0\n    {legacy_field}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="removed diffusion LoRA field"):
+        load_deploy_config(deploy_path)
+
+
 def _resolve_pipeline_or_skip(model_type: str, hf_config=None) -> PipelineConfig:
     pipeline = resolve_pipeline_config(model_type, hf_config)
     if pipeline is None:

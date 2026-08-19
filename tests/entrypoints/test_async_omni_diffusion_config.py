@@ -525,6 +525,25 @@ def test_resolve_stage_configs_rejects_legacy_config_arguments(legacy_arg, value
         )
 
 
+@pytest.mark.parametrize(
+    ("legacy_arg", "value"),
+    [
+        ("lora_path", ["/tmp/legacy"]),
+        ("lora_backend", "peft"),
+        ("lora_scale", 0.5),
+    ],
+)
+def test_resolve_stage_configs_rejects_legacy_lora_arguments(legacy_arg, value):
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+
+    with pytest.raises(ValueError, match=rf"`{legacy_arg}`.*`prefused_lora`.*`dynamic_lora`"):
+        engine._resolve_stage_configs(
+            "dummy-model",
+            {legacy_arg: value},
+            trust_remote_code=False,
+        )
+
+
 def test_default_stage_config_includes_quantization_config():
     """Ensure structured quantization_config survives default diffusion-stage creation."""
     quantization_config = {

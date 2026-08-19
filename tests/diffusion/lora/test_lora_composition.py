@@ -83,3 +83,12 @@ def test_request_parser_accepts_weighted_list_and_explicit_empty() -> None:
     assert [request.lora_int_id for request in requests] == [2, 8]
     assert scales == (0.2, 0.8)
     assert parse_lora_request([]) == ((), ())
+
+
+def test_request_parser_preserves_scale_cancellation_as_explicit_empty() -> None:
+    assert parse_lora_request(
+        [
+            {"name": "style", "path": "/tmp/style", "scale": 1.0, "int_id": 2},
+            {"name": "style", "path": "/tmp/style", "scale": -1.0, "int_id": 2},
+        ]
+    ) == ((), ())

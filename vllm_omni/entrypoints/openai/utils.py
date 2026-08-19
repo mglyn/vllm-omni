@@ -71,6 +71,11 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequestInput, LoRAScaleInput
         tuple(request for request, _ in parsed),
         tuple(1.0 if scale is None else scale for _, scale in parsed),
     )
+    if not composition:
+        # A non-empty request can normalize to an empty composition when
+        # duplicate adapter scales cancel. Preserve that explicit disable
+        # instead of projecting it to the omitted-request sentinel.
+        return (), ()
     return split_lora_composition(composition)
 
 

@@ -997,6 +997,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.lora_path is not None and not isinstance(self.lora_path, str):
+            raise TypeError(
+                "Legacy lora_path accepts only one string path; use dynamic_lora or prefused_lora "
+                "for one or more weighted adapters."
+            )
         self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
         self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
