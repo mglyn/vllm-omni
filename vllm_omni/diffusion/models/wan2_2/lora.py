@@ -16,6 +16,7 @@ from vllm_omni.diffusion.lora.plan import (
     DiffusionLoRAApplyPlan,
     DiffusionLoRALoadPlan,
 )
+from vllm_omni.diffusion.lora.utils import fold_diffusers_lora_alpha
 
 _WAN_LORA_TARGETS = (
     "to_q",
@@ -61,6 +62,11 @@ def convert_wan_lora_state_dict(
     component_name: str,
 ) -> ConvertedLoRAState:
     """Normalize one published Wan LoRA for the selected transformer."""
+
+    if any(key.endswith(".alpha") for key in state_dict) and any(
+        key.endswith((".lora_A.weight", ".lora_B.weight")) for key in state_dict
+    ):
+        state_dict = fold_diffusers_lora_alpha(state_dict)
 
     # Diffusers silently drops unsupported ``.diff`` tensors such as norm
     # deltas because published adapters normally store them as zero-valued

@@ -624,11 +624,11 @@ def test_prefused_bf16_weight_uses_single_rounding():
     torch.testing.assert_close(layer.base_layer.weight, expected, rtol=0, atol=0)
 
 
-def _dummy_lora_request(adapter_id: int) -> LoRARequest:
+def _dummy_lora_request(adapter_id: int, path: str | None = None) -> LoRARequest:
     return LoRARequest(
         lora_name=f"adapter_{adapter_id}",
         lora_int_id=adapter_id,
-        lora_path=f"/tmp/adapter_{adapter_id}",
+        lora_path=path or f"/tmp/adapter_{adapter_id}",
     )
 
 
@@ -663,8 +663,21 @@ def test_lora_manager_evicts_lru_adapter_when_cache_full(monkeypatch):
     manager.set_active_adapter(req1, lora_scale=1.0)
 
     manager.set_active_adapter(req3, lora_scale=1.0)
-
     assert set(manager.list_adapters()) == {1, 3}
+
+
+def test_lora_manager_validates_adapter_path_before_active_fast_path() -> None:
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    existing = _dummy_lora_request(7, "/tmp/a")
+    manager._adapter_requests[7] = existing
+    manager._active_composition = (WeightedLoRA(request=existing, scale=1.0),)
+
+    with pytest.raises(ValueError, match="already registered from '/tmp/a'.*not '/tmp/b'"):
+        manager.set_active_adapter(_dummy_lora_request(7, "/tmp/b"), lora_scale=1.0)
 
 
 def test_lora_manager_does_not_evict_pinned_adapter(monkeypatch):

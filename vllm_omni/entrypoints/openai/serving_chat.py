@@ -3138,7 +3138,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if lora_body and isinstance(lora_body, dict):
+                if lora_body is not None:
                     try:
                         lora_req, lora_scale = parse_lora_request(lora_body)
                         if lora_req is not None:
@@ -3200,7 +3200,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             strength=extra_body.get("strength"),
         )
 
-        if lora_body and isinstance(lora_body, dict):
+        if lora_body is not None:
             try:
                 lora_req, lora_scale = parse_lora_request(lora_body)
                 if lora_req is not None:
@@ -3605,7 +3605,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.resolution = resolution
 
             # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
+            if lora_body is not None:
                 try:
                     lora_req, lora_scale = parse_lora_request(lora_body)
                     if lora_req is not None:

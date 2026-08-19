@@ -309,6 +309,8 @@ class DiffusionLoRAManager:
             if lora_request is None
             else normalize_lora_composition(lora_request, lora_scale)
         )
+        for adapter in composition:
+            self._validate_adapter_identity(adapter.request)
         if lora_composition_key(composition) == lora_composition_key(self._active_composition):
             for adapter in composition:
                 self._touch_adapter_info(adapter.adapter_id)
@@ -835,19 +837,22 @@ class DiffusionLoRAManager:
             )
             self.remove_adapter(lru_adapter_id)
 
+    def _validate_adapter_identity(self, lora_request: LoRARequest) -> None:
+        existing = self._adapter_requests.get(lora_request.lora_int_id)
+        if existing is not None and existing.lora_path != lora_request.lora_path:
+            raise ValueError(
+                f"LoRA adapter ID {lora_request.lora_int_id} is already registered from {existing.lora_path!r}, "
+                f"not {lora_request.lora_path!r}"
+            )
+
     def add_adapter(self, lora_request: LoRARequest) -> bool:
         """
         Add a new adapter to the cache without activating it.
         """
         adapter_id = lora_request.lora_int_id
 
+        self._validate_adapter_identity(lora_request)
         if adapter_id in self._registered_adapters:
-            existing = self._adapter_requests.get(adapter_id)
-            if existing is not None and existing.lora_path != lora_request.lora_path:
-                raise ValueError(
-                    f"LoRA adapter ID {adapter_id} is already registered from {existing.lora_path!r}, "
-                    f"not {lora_request.lora_path!r}"
-                )
             logger.debug("Adapter %d already registered, skipping", adapter_id)
             return False
 

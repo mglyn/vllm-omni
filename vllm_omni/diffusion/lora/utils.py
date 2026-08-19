@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 from vllm.config.lora import LoRAConfig
@@ -16,6 +17,22 @@ from vllm_omni.diffusion.lora.layers import (
     DiffusionRowParallelLinearWithLoRA,
     DiffusionTorchLinearWithLoRA,
 )
+
+
+def fold_diffusers_lora_alpha(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Fold per-module Diffusers alpha values into their B matrices."""
+
+    converted = dict(state_dict)
+    for alpha_key in (key for key in state_dict if key.endswith(".alpha")):
+        base_key = alpha_key.removesuffix(".alpha")
+        lora_a_key = f"{base_key}.lora_A.weight"
+        lora_b_key = f"{base_key}.lora_B.weight"
+        if lora_a_key not in state_dict or lora_b_key not in state_dict:
+            raise ValueError(f"LoRA alpha key {alpha_key!r} does not have matching A/B weights")
+        rank = state_dict[lora_a_key].shape[0]
+        converted[lora_b_key] = state_dict[lora_b_key] * (state_dict[alpha_key].item() / rank)
+        converted.pop(alpha_key)
+    return converted
 
 
 def _match_target_modules(module_name: str, target_modules: list[str]) -> bool:

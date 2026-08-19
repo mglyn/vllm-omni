@@ -12,6 +12,7 @@ from vllm_omni.diffusion.lora.plan import (
     DiffusionLoRAApplyPlan,
     DiffusionLoRALoadPlan,
 )
+from vllm_omni.diffusion.lora.utils import fold_diffusers_lora_alpha
 
 _QWEN_IMAGE_LORA_TARGETS = (
     "to_q",
@@ -36,22 +37,6 @@ QWEN_IMAGE_LORA_APPLY_PLAN = DiffusionLoRAApplyPlan(
 )
 
 
-def _fold_diffusers_alpha(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Fold per-layer Diffusers alpha values into the B matrices."""
-
-    converted = dict(state_dict)
-    for alpha_key in (key for key in state_dict if key.endswith(".alpha")):
-        base_key = alpha_key.removesuffix(".alpha")
-        lora_a_key = f"{base_key}.lora_A.weight"
-        lora_b_key = f"{base_key}.lora_B.weight"
-        if lora_a_key not in state_dict or lora_b_key not in state_dict:
-            raise ValueError(f"LoRA alpha key {alpha_key!r} does not have matching A/B weights")
-        rank = state_dict[lora_a_key].shape[0]
-        converted[lora_b_key] = state_dict[lora_b_key] * (state_dict[alpha_key].item() / rank)
-        converted.pop(alpha_key)
-    return converted
-
-
 def convert_qwen_image_lora_state_dict(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -64,7 +49,7 @@ def convert_qwen_image_lora_state_dict(
         raise ValueError("Qwen-Image LoRA mixes component-prefixed and unprefixed Diffusers keys")
     is_component_prefixed = component_prefixes == {True}
     if has_alpha and diffusers_lora_keys:
-        state_dict = _fold_diffusers_alpha(state_dict)
+        state_dict = fold_diffusers_lora_alpha(state_dict)
 
     if (has_alpha and not is_component_prefixed) or any(
         key.startswith(("diffusion_model.", "lora_unet_")) or ".lora_down.weight" in key for key in state_dict

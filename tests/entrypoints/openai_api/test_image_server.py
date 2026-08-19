@@ -650,6 +650,36 @@ def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     assert captured[1].seed == 7
 
 
+def test_generate_images_async_omni_accepts_weighted_lora_list(async_omni_test_client):
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "lora": [
+                {"name": "turbo", "path": "/tmp/turbo", "scale": 0.8, "int_id": 8},
+                {"name": "style", "path": "/tmp/style", "scale": 0.2, "int_id": 2},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    captured = async_omni_test_client.app.state.engine_client.captured_sampling_params_list
+    assert tuple(request.lora_int_id for request in captured[1].lora_request) == (2, 8)
+    assert captured[1].lora_scale == (0.2, 0.8)
+
+
+def test_generate_images_async_omni_preserves_explicit_empty_lora(async_omni_test_client):
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "lora": []},
+    )
+
+    assert response.status_code == 200
+    captured = async_omni_test_client.app.state.engine_client.captured_sampling_params_list
+    assert captured[1].lora_request == ()
+    assert captured[1].lora_scale == ()
+
+
 def test_generate_images_async_omni_stage_configs_only(async_omni_stage_configs_only_client):
     """Regression: image generation accepts refactored AsyncOmni without stage_list."""
     response = async_omni_stage_configs_only_client.post(

@@ -63,6 +63,28 @@ def test_wan_single_transformer_does_not_require_noise_range_name() -> None:
     assert all(key.startswith("transformer.") for key in converted.lora_tensors)
 
 
+def test_wan_diffusers_alpha_is_folded_into_lora_b() -> None:
+    lora_a = torch.ones(2, 3)
+    lora_b = torch.ones(4, 2)
+    converted = convert_wan_lora_state_dict(
+        {
+            "transformer.blocks.0.attn1.to_q.lora_A.weight": lora_a,
+            "transformer.blocks.0.attn1.to_q.lora_B.weight": lora_b,
+            "transformer.blocks.0.attn1.to_q.alpha": torch.tensor(1.0),
+        },
+        component_name="transformer",
+    )
+
+    assert set(converted.lora_tensors) == {
+        "transformer.blocks.0.attn1.to_q.lora_A.weight",
+        "transformer.blocks.0.attn1.to_q.lora_B.weight",
+    }
+    torch.testing.assert_close(
+        converted.lora_tensors["transformer.blocks.0.attn1.to_q.lora_B.weight"],
+        lora_b * 0.5,
+    )
+
+
 def test_wan22_ambiguous_adapter_target_is_rejected() -> None:
     with pytest.raises(ValueError, match="high_noise.*low_noise"):
         wan_lora_load_plan(
