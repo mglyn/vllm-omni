@@ -241,6 +241,20 @@ def test_torch_linear_wrapper_moves_cpu_sidecars_to_input_device():
     assert output.device.type == "cuda"
 
 
+def test_lora_runtime_can_move_without_moving_dense_base():
+    base_layer = torch.nn.Linear(3, 2)
+    layer = DiffusionTorchLinearWithLoRA(base_layer)
+    layer.create_lora_weights(1, _DummyLoRAConfig())
+    layer.set_additive_bias(torch.ones(2))
+
+    layer.move_lora_runtime_to(torch.device("meta"))
+
+    assert base_layer.weight.device.type == "cpu"
+    assert all(tensor.device.type == "meta" for tensor in layer.lora_a_stacked)
+    assert all(tensor.device.type == "meta" for tensor in layer.lora_b_stacked)
+    assert all(bias is None or bias.device.type == "meta" for bias in layer._diffusion_additive_bias)
+
+
 @pytest.mark.parametrize(("tp_rank", "expects_bias"), [(0, True), (1, False)])
 def test_row_parallel_additive_bias_is_contributed_once(monkeypatch, tp_rank: int, expects_bias: bool):
     received: list[torch.Tensor | list[torch.Tensor | None] | None] = []

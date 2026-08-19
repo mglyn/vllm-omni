@@ -540,6 +540,14 @@ class TestDiffusionCompileConfig:
         with pytest.raises(TypeError, match="lora_path.*one string path"):
             OmniDiffusionConfig(model="test", lora_path=["/tmp/a", "/tmp/b"])
 
+    def test_config_rejects_prefused_lora_with_dlo(self) -> None:
+        with pytest.raises(ValueError, match="prefused_lora.*distributed layerwise offload.*dynamic_lora"):
+            OmniDiffusionConfig(
+                model="test",
+                prefused_lora=["/tmp/turbo.safetensors=1.0"],
+                enable_distributed_layerwise_offload=True,
+            )
+
     @pytest.mark.parametrize(
         "kwargs, feature",
         [

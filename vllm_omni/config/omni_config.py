@@ -830,6 +830,8 @@ class _DiffusionConfigProjection:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
         if self.prefused_lora and self.quantization_config is not None:
             raise ValueError("prefused_lora is not supported with quantized diffusion weights; use dynamic_lora")
+        if self.prefused_lora and self.enable_distributed_layerwise_offload:
+            raise ValueError("prefused_lora is not supported with distributed layerwise offload; use dynamic_lora")
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(

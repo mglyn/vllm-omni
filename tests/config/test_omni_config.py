@@ -920,6 +920,14 @@ def test_structured_diffusion_config_rejects_invalid_compile_granularity():
         omni_config_module._DiffusionConfigProjection(diffusion_compile_granularity="block")
 
 
+def test_structured_diffusion_config_rejects_prefused_lora_with_dlo():
+    with pytest.raises(ValueError, match="prefused_lora.*distributed layerwise offload.*dynamic_lora"):
+        omni_config_module._DiffusionConfigProjection(
+            prefused_lora=["/tmp/turbo.safetensors=1.0"],
+            enable_distributed_layerwise_offload=True,
+        )
+
+
 def test_from_pipeline_config_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]

@@ -84,6 +84,9 @@ performance guarantee for other models or adapter ranks.
 
 - Compile and offload freeze the module graph; preload adapters that cover all
   later target modules and sufficient total rank.
+- DLO supports startup dynamic LoRA through ordinary CPU loading; A/B slots
+  remain device-resident while DLO streams the base weights. Prefused LoRA with
+  DLO is rejected.
 - Requests with different canonical compositions use different diffusion batch
   keys.
 - When diffusion prefix K/V becomes publishable across requests, its block-hash

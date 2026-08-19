@@ -173,6 +173,12 @@ method and adds the low-rank branch separately, so it can be combined with a
 quantized base model. This does not imply bitwise equality with an unquantized
 reference.
 
+Distributed layerwise offload supports startup-preloaded dynamic LoRA. It uses
+the ordinary CPU loader before installing LoRA wrappers, then DLO streams only
+the dense base weights while the small A/B runtime slots remain on the
+execution device. This combination does not use DLO's direct-mmap startup
+optimization. Prefused LoRA with DLO is rejected; use `--dynamic-lora`.
+
 ## Sampling remains model-owned
 
 Loading an acceleration or distilled LoRA does not change timesteps, guidance,

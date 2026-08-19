@@ -150,6 +150,8 @@ class DiffusionLoRAManager:
             self._pinned_adapters.update(adapter.adapter_id for adapter in startup_dynamic)
             self._activate_composition(startup_dynamic)
 
+        self._move_runtime_buffers_to_device()
+
     def _resolve_apply_plan(self) -> DiffusionLoRAApplyPlan:
         resolver = getattr(self.pipeline, "get_lora_apply_plan", None)
         if callable(resolver):
@@ -166,6 +168,15 @@ class DiffusionLoRAManager:
         """Prevent graph-changing layer replacement or buffer growth."""
 
         self._frozen = True
+
+    def _move_runtime_buffers_to_device(self) -> None:
+        """Move only low-rank runtime slots, leaving dense base weights alone."""
+
+        for lora_layer in self._lora_modules.values():
+            move_runtime = getattr(lora_layer, "move_lora_runtime_to", None)
+            if not callable(move_runtime):
+                raise TypeError(f"{type(lora_layer).__name__} cannot place LoRA runtime buffers explicitly")
+            move_runtime(self.device)
 
     def _compute_supported_lora_modules(self) -> set[str]:
         """Compute supported LoRA module suffixes for this pipeline.

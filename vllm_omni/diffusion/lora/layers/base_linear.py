@@ -135,6 +135,17 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             bias.to(device=device, dtype=dtype, non_blocking=True) if bias is not None else None for bias in bias_slices
         )
 
+    def move_lora_runtime_to(self, device: torch.device) -> None:
+        """Keep request-dependent LoRA state resident on its execution device."""
+
+        self.lora_a_stacked = tuple(tensor.to(device=device) for tensor in self.lora_a_stacked)
+        self.lora_b_stacked = tuple(tensor.to(device=device) for tensor in self.lora_b_stacked)
+        self._diffusion_additive_bias = tuple(
+            bias.to(device=device) if bias is not None else None
+            for bias in getattr(self, "_diffusion_additive_bias", ())
+        )
+        self.device = device
+
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """
         override: Use simple matmul instead of punica_wrapper.add_lora_linear().
