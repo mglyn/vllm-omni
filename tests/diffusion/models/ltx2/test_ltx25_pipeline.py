@@ -170,7 +170,10 @@ def _resolve_request_inputs_for_test(
 
 
 def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatch):
-    pipe = SimpleNamespace(component_profile=replace(LTX25_FULL_COMPONENT_PROFILE, text_encoder_cls=None))
+    pipe = SimpleNamespace(
+        component_profile=replace(LTX25_FULL_COMPONENT_PROFILE, text_encoder_cls=None),
+        use_diffusion_decoder=True,
+    )
     od_config = SimpleNamespace(model="Lightricks/LTX-2.5-Diffusers", dtype=torch.bfloat16)
 
     monkeypatch.setattr(ltx2_components, "get_local_device", lambda: torch.device("cpu"))
@@ -208,13 +211,17 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         vocoder_fallback_cls=None,
         scheduler_use_dynamic_shifting=False,
     )
-    pipeline = SimpleNamespace(component_profile=profile, pipeline_kind="distilled_two_stage")
+    pipeline = SimpleNamespace(
+        component_profile=profile,
+        pipeline_kind="distilled_two_stage",
+        use_diffusion_decoder=True,
+    )
     od_config = SimpleNamespace(
         model="org/converted-ltx25",
         revision=revision,
         dtype=torch.bfloat16,
         quantization_config=None,
-        extras={"ltx2_use_diffusion_decoder": True},
+        extras={},
         vae_use_tiling=False,
         parallel_config=SimpleNamespace(vae_patch_parallel_size=2, vae_parallel_mode="tile"),
     )
@@ -513,7 +520,13 @@ def test_ltx25_four_public_pipeline_semantics_are_disjoint():
         LTX2DistilledTwoStagePipeline,
     ],
 )
-def test_ltx25_all_public_pipelines_accept_diffusion_decoder_opt_in(tmp_path, monkeypatch, pipeline_cls):
+@pytest.mark.parametrize(
+    ("extras", "use_diffusion_decoder"),
+    [({}, True), ({"ltx2_use_conv_vae": True}, False)],
+)
+def test_ltx25_all_public_pipelines_default_to_diffvae_with_conv_opt_in(
+    tmp_path, monkeypatch, pipeline_cls, extras, use_diffusion_decoder
+):
     (tmp_path / "model_index.json").write_text(
         json.dumps({"text_encoder": ["transformers", "Gemma4UnifiedForConditionalGeneration"]})
     )
@@ -529,13 +542,13 @@ def test_ltx25_all_public_pipelines_accept_diffusion_decoder_opt_in(tmp_path, mo
     pipe = pipeline_cls(
         od_config=SimpleNamespace(
             model=str(tmp_path),
-            extras={"ltx2_use_diffusion_decoder": True},
+            extras=extras,
             enable_diffusion_pipeline_profiler=False,
         )
     )
 
-    assert pipe.use_diffusion_decoder is True
-    assert pipe._vae_modules.count("diffusion_decoder") == 1
+    assert pipe.use_diffusion_decoder is use_diffusion_decoder
+    assert pipe._vae_modules.count("diffusion_decoder") == int(use_diffusion_decoder)
 
 
 @pytest.mark.parametrize(

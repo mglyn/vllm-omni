@@ -146,9 +146,7 @@ class LTXRuntime(
                 "Use the default ulysses_mode='strict' for LTX sequence parallelism."
             )
         self.model_version = detect_ltx_model_version(od_config.model, revision=getattr(od_config, "revision", None))
-        self.use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config)
-        if self.use_diffusion_decoder and self.model_version != "2.5":
-            raise ValueError("ltx2_use_diffusion_decoder is supported only by LTX-2.5 checkpoints.")
+        self.use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config, self.model_version)
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
         if getattr(od_config, "cache_backend", "none") == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:

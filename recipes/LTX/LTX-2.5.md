@@ -36,50 +36,37 @@ latent upsampler, and run a three-step refinement stage. Select the class with
 `--model-class-name`; no `--task-type` flag is required. Supplying one initial
 image selects I2V, while omitting it selects T2V.
 
-## Diffusion VAE decoder selection
+## Video decoder
 
-The convolutional VAE decoder remains the default. LTX-2.5 can instead load the
-canonical Native Diffusion VAE decoder (DiffVAE) by setting the startup-only
-model extra `ltx2_use_diffusion_decoder: true` on diffusion stage 0. vLLM-Omni
-converts the decoder portion of the Native full-VAE file to the local
-Diffusers-compatible layout during startup; the encoder is not loaded. The
-choice is not a per-request sampling parameter. The same extra
-works with all four public LTX-2.5 pipeline classes listed above.
+LTX-2.5 uses the canonical Native Diffusion VAE decoder by default. To opt in
+to the legacy convolutional VAE, set the startup-only stage-0 model extra
+`ltx2_use_conv_vae: true`. The choice applies to all requests and all four
+pipeline classes above.
 
-For offline Python usage, pass the model extra through the stage override:
+For offline Python usage:
 
 ```python
 omni = Omni(
     model="Lightricks/LTX-2.5-Diffusers",
     model_class_name="LTX2Pipeline",
-    stage_overrides='{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}',
+    stage_overrides='{"0":{"extras":{"ltx2_use_conv_vae":true}}}',
 )
 ```
 
-For online serving, use the same stage override at startup:
+For online serving:
 
 ```bash
 vllm serve Lightricks/LTX-2.5-Diffusers \
   --omni \
   --model-class-name LTX2Pipeline \
-  --stage-overrides '{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}'
+  --stage-overrides '{"0":{"extras":{"ltx2_use_conv_vae":true}}}'
 ```
 
-Both decoders are untiled by default. Choose the decode mode based on memory
-and latency:
-
-| Settings | Decode mode | Choose when |
-|---|---|---|
-| PP=1 without `vae_use_tiling` | One full decode | It fits memory; this is the fastest single-GPU path |
-| PP=1 with `vae_use_tiling` | Serial overlapping tiles | Lower peak memory is worth extra tile/blend work |
-| `--usp N --vae-patch-parallel-size N` | Tiles distributed over N ranks | Multiple DiT ranks are available and decode latency matters |
-
-For DiffVAE, tiling activates when frames exceed 80 or either spatial dimension
-exceeds 768 pixels. Setting `vae_patch_parallel_size>1` enables it automatically;
-the option reuses existing DiT ranks rather than launching workers. DiffVAE
-stages 1-3 still process the full low-resolution feature volume on every rank,
-while stage 4 and the diffusion stage run per tile and rank 0 blends the result.
-DiffVAE is decoder-only, so the convolutional VAE remains loaded for I2V encoding.
+Both decoders are untiled by default. Set `vae_use_tiling` for memory-saving
+serial tiling; DiffVAE tiles only above 80 frames or 768 pixels in either spatial
+dimension. For distributed decode, use matching `--usp N` and
+`--vae-patch-parallel-size N`; this enables tiling and reuses the existing DiT
+ranks. DiffVAE is decoder-only, so I2V still uses the convolutional VAE encoder.
 
 ## Prerequisites
 
