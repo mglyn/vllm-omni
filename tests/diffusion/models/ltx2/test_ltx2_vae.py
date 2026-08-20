@@ -94,19 +94,23 @@ class TestLTXDiffusionDecoder:
         assert output.shape == (1, 3, 1, 4, 6)
 
     @pytest.mark.parametrize(
-        ("extras", "expected"),
-        [({}, False), ({"ltx2_use_diffusion_decoder": True}, True)],
+        ("model_version", "extras", "expected"),
+        [
+            ("2.5", {}, True),
+            ("2.5", {"ltx2_use_conv_vae": True}, False),
+            ("2.3", {}, False),
+        ],
     )
-    def test_diffusion_decoder_opt_in_is_ltx2_model_extra(self, extras, expected):
+    def test_ltx25_diffusion_decoder_is_default_with_conv_vae_opt_in(self, model_version, extras, expected):
         from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder
 
-        assert _ltx2_use_diffusion_decoder(SimpleNamespace(extras=extras)) is expected
+        assert _ltx2_use_diffusion_decoder(SimpleNamespace(extras=extras), model_version) is expected
 
-    def test_diffusion_decoder_opt_in_rejects_non_boolean_model_extra(self):
+    def test_conv_vae_opt_in_rejects_non_boolean_model_extra(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder
 
-        with pytest.raises(TypeError, match="ltx2_use_diffusion_decoder"):
-            _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_diffusion_decoder": "true"}))
+        with pytest.raises(TypeError, match="ltx2_use_conv_vae"):
+            _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_conv_vae": "true"}), "2.5")
 
     def test_native_diffusion_decoder_conversion_splits_qkv_and_folds_gates(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (

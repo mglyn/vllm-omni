@@ -75,17 +75,17 @@ _LTX_COMPONENT_SUBFOLDERS = (
 )
 logger = logging.getLogger(__name__)
 
-_LTX2_DIFFUSION_DECODER_EXTRA = "ltx2_use_diffusion_decoder"
+_LTX2_CONV_VAE_EXTRA = "ltx2_use_conv_vae"
 _LTX2_DIFFUSION_DECODER_SUBFOLDER = "diffusion_decoder"
 
 
-def _ltx2_use_diffusion_decoder(od_config: Any) -> bool:
-    """Read the LTX-2.5 diffusion-decoder opt-in from model extras."""
+def _ltx2_use_diffusion_decoder(od_config: Any, model_version: str) -> bool:
+    """Select DiffVAE by default for LTX-2.5, with an explicit ConvVAE opt-in."""
     extras = getattr(od_config, "extras", {}) or {}
-    enabled = extras.get(_LTX2_DIFFUSION_DECODER_EXTRA, False)
-    if not isinstance(enabled, bool):
-        raise TypeError(f"{_LTX2_DIFFUSION_DECODER_EXTRA} must be a bool, got {type(enabled)!r}")
-    return enabled
+    use_conv_vae = extras.get(_LTX2_CONV_VAE_EXTRA, False)
+    if not isinstance(use_conv_vae, bool):
+        raise TypeError(f"{_LTX2_CONV_VAE_EXTRA} must be a bool, got {type(use_conv_vae)!r}")
+    return model_version == "2.5" and not use_conv_vae
 
 
 @dataclass(frozen=True)
@@ -602,7 +602,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     model = od_config.model
     revision = getattr(od_config, "revision", None)
     local_files_only = os.path.exists(model)
-    use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config)
+    use_diffusion_decoder = pipeline.use_diffusion_decoder
 
     pipeline.weights_sources = [
         DiffusersPipelineLoader.ComponentSource(

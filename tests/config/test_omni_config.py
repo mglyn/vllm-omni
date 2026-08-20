@@ -936,7 +936,7 @@ def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
         omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")
 
 
-def test_from_pipeline_config_routes_ltx2_diffusion_decoder_extra(tmp_path):
+def test_from_pipeline_config_routes_ltx2_conv_vae_extra(tmp_path):
     deploy_path = tmp_path / "dreamzero_ltx2_extras.yaml"
     deploy_path.write_text(
         "\n".join(
@@ -946,23 +946,23 @@ def test_from_pipeline_config_routes_ltx2_diffusion_decoder_extra(tmp_path):
                 "stages:",
                 "  - stage_id: 0",
                 "    extras:",
-                "      ltx2_use_diffusion_decoder: true",
+                "      ltx2_use_conv_vae: true",
             ]
         )
     )
 
     stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
 
-    assert stage.diffusion_config.extras["ltx2_use_diffusion_decoder"] is True
+    assert stage.diffusion_config.extras["ltx2_use_conv_vae"] is True
 
 
-def test_stage_override_routes_ltx2_diffusion_decoder_extra():
+def test_stage_override_routes_ltx2_conv_vae_extra():
     stage = _from_pipeline_key(
         "dreamzero",
-        cli_overrides={"stage_0_extras": {"ltx2_use_diffusion_decoder": True}},
+        cli_overrides={"stage_0_extras": {"ltx2_use_conv_vae": True}},
     ).stage_by_id(0)
 
-    assert stage.diffusion_config.extras["ltx2_use_diffusion_decoder"] is True
+    assert stage.diffusion_config.extras["ltx2_use_conv_vae"] is True
 
 
 def test_structured_diffusion_config_rejects_invalid_compile_granularity():

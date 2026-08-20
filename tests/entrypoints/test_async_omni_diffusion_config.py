@@ -34,9 +34,9 @@ def test_default_stage_config_includes_cache_backend():
 
 
 def test_default_stage_config_preserves_model_extras():
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"extras": {"ltx2_use_diffusion_decoder": True}})[0]
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"extras": {"ltx2_use_conv_vae": True}})[0]
 
-    assert stage_cfg["engine_args"]["extras"]["ltx2_use_diffusion_decoder"] is True
+    assert stage_cfg["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
 
 
 def test_default_stage_config_preserves_and_overrides_promoted_extras():
@@ -84,11 +84,11 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
 
     _, stage_configs = engine._resolve_stage_configs(
         "/models/LTX-2.5-Diffusers",
-        {"stage_overrides": '{"0":{"extras":{"ltx2_use_diffusion_decoder":true}}}'},
+        {"stage_overrides": '{"0":{"extras":{"ltx2_use_conv_vae":true}}}'},
         trust_remote_code=False,
     )
 
-    assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_diffusion_decoder"] is True
+    assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
 
 
 def test_default_cache_config_used_when_missing():
