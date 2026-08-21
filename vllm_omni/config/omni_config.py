@@ -753,6 +753,7 @@ class _DiffusionConfigProjection:
             TransformerConfig,
             build_attention_config,
             normalize_deployment_lora_specs,
+            normalize_legacy_startup_lora,
             parse_kv_cache_skip_selector,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
@@ -764,7 +765,10 @@ class _DiffusionConfigProjection:
             self.tf_model_config = TransformerConfig.from_dict(dict(self.tf_model_config))
 
         self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
-        self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
+        self.dynamic_lora = normalize_legacy_startup_lora(self.lora_path, self.lora_scale, self.dynamic_lora)
+        if self.lora_path is not None:
+            self.lora_path = None
+            self.lora_scale = 1.0
 
         if self.additional_config is None:
             self.additional_config = {}

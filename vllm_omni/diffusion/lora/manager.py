@@ -38,7 +38,6 @@ from vllm_omni.diffusion.lora.utils import (
     _match_target_modules,
     from_layer_diffusion,
 )
-from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 
@@ -59,8 +58,6 @@ class DiffusionLoRAManager:
         device: torch.device,
         dtype: torch.dtype,
         max_cached_adapters: int = 1,
-        lora_path: str | None = None,
-        lora_scale: float = 1.0,
         prefused_loras: LoRAComposition = (),
         dynamic_loras: LoRAComposition = (),
         quantized: bool = False,
@@ -98,16 +95,6 @@ class DiffusionLoRAManager:
 
         # LRU-style cache management
         startup_dynamic = dynamic_loras
-        if lora_path is not None:
-            legacy_request = LoRARequest(
-                lora_name="static",
-                lora_int_id=stable_lora_int_id(lora_path),
-                lora_path=lora_path,
-            )
-            startup_dynamic = normalize_lora_composition(
-                tuple(adapter.request for adapter in dynamic_loras) + (legacy_request,),
-                tuple(adapter.scale for adapter in dynamic_loras) + (lora_scale,),
-            )
         self.max_cached_adapters = max(max_cached_adapters, len(prefused_loras), len(startup_dynamic), 1)
         self._registered_adapters: dict[int, LoadedDiffusionLoRA] = {}
         self._adapter_requests: dict[int, LoRARequest] = {}

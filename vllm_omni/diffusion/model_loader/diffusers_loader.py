@@ -443,9 +443,7 @@ class DiffusersPipelineLoader:
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
-                _startup_dynamic_lora = bool(
-                    getattr(self.od_config, "dynamic_lora", None) or getattr(self.od_config, "lora_path", None)
-                )
+                _startup_dynamic_lora = bool(getattr(self.od_config, "dynamic_lora", None))
                 if _dist_offload and not _startup_dynamic_lora:
                     modules = ModuleDiscovery.discover(model)
                     plan_result = build_checkpoint_mmap_plan(

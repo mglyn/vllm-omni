@@ -434,6 +434,18 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--lora-path",
+            type=str,
+            default=None,
+            help="Single dynamic diffusion LoRA to load and activate at startup.",
+        )
+        omni_config_group.add_argument(
+            "--lora-scale",
+            type=float,
+            default=None,
+            help="Scale for --lora-path (default: 1.0).",
+        )
+        omni_config_group.add_argument(
             "--prefused-lora",
             action="append",
             default=None,

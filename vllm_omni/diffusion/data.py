@@ -53,6 +53,27 @@ def normalize_deployment_lora_specs(value: Any, field_name: str) -> list[str] | 
     raise TypeError(f"{field_name} must be a string, a sequence of strings, or None")
 
 
+def normalize_legacy_startup_lora(
+    lora_path: Any,
+    lora_scale: Any,
+    dynamic_lora: Any,
+) -> list[str] | None:
+    """Fold the legacy single startup LoRA into the dynamic composition."""
+
+    normalized = normalize_deployment_lora_specs(dynamic_lora, "dynamic_lora")
+    if lora_path is None:
+        return normalized
+    if not isinstance(lora_path, str):
+        raise TypeError(
+            "lora_path accepts only one string path; use dynamic_lora or prefused_lora "
+            "for one or more weighted adapters."
+        )
+    scale = 1.0 if lora_scale is None else float(lora_scale)
+    if not math.isfinite(scale):
+        raise ValueError(f"lora_scale must be finite, got {scale!r}")
+    return [*(normalized or []), f"{lora_path}={scale}"]
+
+
 def is_diffusion_module_graph_fixed(config: Any) -> bool:
     """Whether runtime features prohibit changing the diffusion module graph."""
 
@@ -1009,13 +1030,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        if self.lora_path is not None and not isinstance(self.lora_path, str):
-            raise TypeError(
-                "Legacy lora_path accepts only one string path; use dynamic_lora or prefused_lora "
-                "for one or more weighted adapters."
-            )
         self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
-        self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
+        self.dynamic_lora = normalize_legacy_startup_lora(self.lora_path, self.lora_scale, self.dynamic_lora)
+        if self.lora_path is not None:
+            self.lora_path = None
+            self.lora_scale = 1.0
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "

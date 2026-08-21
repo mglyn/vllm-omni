@@ -540,6 +540,18 @@ class TestDiffusionCompileConfig:
         with pytest.raises(TypeError, match="lora_path.*one string path"):
             OmniDiffusionConfig(model="test", lora_path=["/tmp/a", "/tmp/b"])
 
+    def test_config_routes_single_startup_lora_to_dynamic_composition(self) -> None:
+        config = OmniDiffusionConfig(
+            model=".",
+            lora_path="/tmp/style",
+            lora_scale=0.25,
+            dynamic_lora=["/tmp/detail=0.5"],
+        )
+
+        assert config.dynamic_lora == ["/tmp/detail=0.5", "/tmp/style=0.25"]
+        assert config.lora_path is None
+        assert config.lora_scale == 1.0
+
     def test_config_rejects_prefused_lora_with_dlo(self) -> None:
         with pytest.raises(ValueError, match="prefused_lora.*distributed layerwise offload.*dynamic_lora"):
             OmniDiffusionConfig(

@@ -234,8 +234,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             device=self.device,
             dtype=getattr(self.od_config, "dtype", torch.bfloat16),
             max_cached_adapters=getattr(self.od_config, "max_cpu_loras", None) or 1,
-            lora_path=getattr(self.od_config, "lora_path", None),
-            lora_scale=getattr(self.od_config, "lora_scale", 1.0),
             prefused_loras=parse_lora_adapter_specs(getattr(self.od_config, "prefused_lora", None)),
             dynamic_loras=parse_lora_adapter_specs(getattr(self.od_config, "dynamic_lora", None)),
             quantized=getattr(self.od_config, "quantization_config", None) is not None,

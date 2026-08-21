@@ -22,6 +22,9 @@ Dynamic LoRA is the recommended default for serving. Prefusion is useful only
 when permanent dense weights are required and its output quality has been
 validated for the model and dtype.
 
+`--lora-path PATH --lora-scale SCALE` is also supported as the single-adapter
+form of `--dynamic-lora PATH=SCALE`.
+
 ## Adapter formats
 
 The generic loader accepts a PEFT directory containing `adapter_config.json`

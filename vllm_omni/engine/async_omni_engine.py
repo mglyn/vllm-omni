@@ -1059,6 +1059,8 @@ class AsyncOmniEngine:
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+            "lora_path": kwargs.get("lora_path"),
+            "lora_scale": kwargs.get("lora_scale"),
             "prefused_lora": kwargs.get("prefused_lora"),
             "dynamic_lora": kwargs.get("dynamic_lora"),
             "max_cpu_loras": kwargs.get("max_cpu_loras"),
@@ -1169,9 +1171,7 @@ class AsyncOmniEngine:
             if legacy_arg in kwargs:
                 raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
 
-        removed_lora_args = tuple(
-            name for name in ("lora_path", "lora_backend", "lora_scale") if kwargs.get(name) is not None
-        )
+        removed_lora_args = tuple(name for name in ("lora_backend",) if kwargs.get(name) is not None)
         if removed_lora_args:
             names = ", ".join(f"`{name}`" for name in removed_lora_args)
             raise ValueError(
@@ -1219,7 +1219,7 @@ class AsyncOmniEngine:
                     current_additional_config = getattr(cfg.engine_args, "additional_config", None)
                     if current_additional_config in (None, {}):
                         cfg.engine_args.additional_config = additional_config
-                for field_name in ("prefused_lora", "dynamic_lora", "max_cpu_loras"):
+                for field_name in ("lora_path", "lora_scale", "prefused_lora", "dynamic_lora", "max_cpu_loras"):
                     field_value = kwargs.get(field_name)
                     if field_value is not None:
                         current_value = getattr(cfg.engine_args, field_name, None)

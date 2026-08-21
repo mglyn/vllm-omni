@@ -349,6 +349,8 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    lora_path: str | None = None
+    lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None
@@ -480,7 +482,7 @@ _STAGE_RESERVED_KEYS = frozenset(
     }
 )
 
-_REMOVED_DIFFUSION_LORA_FIELDS = frozenset({"lora_path", "lora_backend", "lora_scale"})
+_REMOVED_DIFFUSION_LORA_FIELDS = frozenset({"lora_backend"})
 
 
 def _reject_removed_diffusion_lora_fields(values: dict[str, Any], context: str) -> None:

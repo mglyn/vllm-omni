@@ -766,8 +766,7 @@ class DiffusionEngine:
         if not composition or not is_diffusion_module_graph_fixed(self.od_config):
             return
         has_startup_capacity = any(
-            bool(getattr(self.od_config, field_name, None))
-            for field_name in ("prefused_lora", "dynamic_lora", "lora_path")
+            bool(getattr(self.od_config, field_name, None)) for field_name in ("prefused_lora", "dynamic_lora")
         )
         if has_startup_capacity:
             return

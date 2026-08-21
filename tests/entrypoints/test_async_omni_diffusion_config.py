@@ -330,6 +330,30 @@ def test_serve_cli_forwards_prefused_loras_to_diffusion_stage():
     assert engine_args["prefused_lora"] == explicit_kwargs["prefused_lora"]
 
 
+def test_serve_cli_forwards_single_startup_lora_alias():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--lora-path",
+            "/models/style",
+            "--lora-scale",
+            "0.25",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    engine_args = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]["engine_args"]
+
+    assert engine_args["lora_path"] == "/models/style"
+    assert engine_args["lora_scale"] == 0.25
+
+
 def test_serve_cli_forwards_distributed_offload_residency():
     """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
@@ -525,23 +549,33 @@ def test_resolve_stage_configs_rejects_legacy_config_arguments(legacy_arg, value
         )
 
 
-@pytest.mark.parametrize(
-    ("legacy_arg", "value"),
-    [
-        ("lora_path", ["/tmp/legacy"]),
-        ("lora_backend", "peft"),
-        ("lora_scale", 0.5),
-    ],
-)
-def test_resolve_stage_configs_rejects_legacy_lora_arguments(legacy_arg, value):
+def test_resolve_stage_configs_rejects_removed_lora_backend():
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
 
-    with pytest.raises(ValueError, match=rf"`{legacy_arg}`.*`prefused_lora`.*`dynamic_lora`"):
+    with pytest.raises(ValueError, match=r"`lora_backend`.*`prefused_lora`.*`dynamic_lora`"):
         engine._resolve_stage_configs(
             "dummy-model",
-            {legacy_arg: value},
+            {"lora_backend": "peft"},
             trust_remote_code=False,
         )
+
+
+def test_resolve_stage_configs_injects_single_startup_lora_alias(mocker):
+    fake_diffusion_stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        return_value=("dummy.yaml", [fake_diffusion_stage], None),
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "dummy-model",
+        {"deploy_config": "dummy.yaml", "lora_path": "/tmp/style", "lora_scale": 0.25},
+        trust_remote_code=False,
+    )
+
+    assert stage_configs[0].engine_args.lora_path == "/tmp/style"
+    assert stage_configs[0].engine_args.lora_scale == 0.25
 
 
 def test_default_stage_config_includes_quantization_config():

@@ -72,16 +72,25 @@ def _load_default_deploy(pipeline: PipelineConfig) -> DeployConfig:
     return DeployConfig()
 
 
-@pytest.mark.parametrize(
-    "legacy_field",
-    ["lora_path: /tmp/legacy", "lora_backend: peft", "lora_scale: 0.5"],
-)
-def test_load_deploy_config_rejects_removed_stage_lora_fields(tmp_path: Path, legacy_field: str) -> None:
+def test_load_deploy_config_rejects_removed_stage_lora_backend(tmp_path: Path) -> None:
     deploy_path = tmp_path / "legacy-lora.yaml"
-    deploy_path.write_text(f"stages:\n  - stage_id: 0\n    {legacy_field}\n", encoding="utf-8")
+    deploy_path.write_text("stages:\n  - stage_id: 0\n    lora_backend: peft\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="removed diffusion LoRA field"):
         load_deploy_config(deploy_path)
+
+
+def test_load_deploy_config_accepts_single_startup_lora_alias(tmp_path: Path) -> None:
+    deploy_path = tmp_path / "startup-lora.yaml"
+    deploy_path.write_text(
+        "stages:\n  - stage_id: 0\n    lora_path: /tmp/style\n    lora_scale: 0.25\n",
+        encoding="utf-8",
+    )
+
+    stage = load_deploy_config(deploy_path).stages[0]
+
+    assert stage.lora_path == "/tmp/style"
+    assert stage.lora_scale == 0.25
 
 
 def _resolve_pipeline_or_skip(model_type: str, hf_config=None) -> PipelineConfig:
@@ -1134,6 +1143,31 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert cfg.diffusers_load_kwargs == {}
     assert cfg.diffusers_call_kwargs == {}
+
+
+def test_diffusion_config_routes_single_startup_lora_to_dynamic_composition():
+    from vllm_omni.diffusion.lora.types import parse_lora_adapter_specs
+
+    cfg = omni_config_module._DiffusionConfigProjection(
+        lora_path="/tmp/style",
+        lora_scale=0.25,
+        dynamic_lora=["/tmp/detail=0.5"],
+    )
+
+    composition = parse_lora_adapter_specs(cfg.dynamic_lora)
+    assert {adapter.request.lora_path: adapter.scale for adapter in composition} == {
+        "/tmp/style": 0.25,
+        "/tmp/detail": 0.5,
+    }
+    assert cfg.lora_path is None
+    assert cfg.lora_scale == 1.0
+
+    roundtrip = omni_config_module._DiffusionConfigProjection(
+        lora_path=cfg.lora_path,
+        lora_scale=cfg.lora_scale,
+        dynamic_lora=cfg.dynamic_lora,
+    )
+    assert roundtrip.dynamic_lora == cfg.dynamic_lora
 
 
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
