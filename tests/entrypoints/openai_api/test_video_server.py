@@ -1532,7 +1532,7 @@ def test_invalid_lora_returns_400(test_client):
         "/v1/videos",
         data={
             "prompt": "lora test",
-            "lora": '{"name": "bad-lora"}',
+            "lora": '{"int_id": 7}',
         },
     )
     assert response.status_code == 200
@@ -2002,8 +2002,8 @@ def test_sync_accepts_weighted_lora_list(test_client, mocker: MockerFixture):
             "prompt": "weighted adapters",
             "lora": json.dumps(
                 [
-                    {"name": "turbo", "path": "/tmp/turbo", "scale": 0.8, "int_id": 8},
-                    {"name": "style", "path": "/tmp/style", "scale": 0.2, "int_id": 2},
+                    {"name": "cinematic", "scale": 0.8},
+                    {"name": "style", "scale": 0.2},
                 ]
             ),
         },
@@ -2012,8 +2012,13 @@ def test_sync_accepts_weighted_lora_list(test_client, mocker: MockerFixture):
     assert response.status_code == 200
     engine = test_client.app.state.openai_serving_video._engine_client
     sampling = engine.captured_sampling_params_list[0]
-    assert tuple(request.lora_int_id for request in sampling.lora_request) == (2, 8)
-    assert sampling.lora_scale == (0.2, 0.8)
+    assert dict(
+        zip(
+            (request.lora_name for request in sampling.lora_request),
+            sampling.lora_scale,
+            strict=True,
+        )
+    ) == {"cinematic": 0.8, "style": 0.2}
 
 
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):

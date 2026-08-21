@@ -605,12 +605,18 @@ class DiffusionWorker:
         self.lora_manager.set_active_adapter(lora_request, lora_scale)
 
     def remove_lora(self, adapter_id: int) -> bool:
-        return self.lora_manager.remove_adapter(adapter_id)
+        del adapter_id
+        raise RuntimeError(
+            "Runtime diffusion LoRA registry mutation is not supported; "
+            "configure adapters with --dynamic-lora before starting the server."
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        # NOTE (Alex): We have not implemented the API routing
-        # for the frontend server yet.
-        return self.lora_manager.add_adapter(lora_request)
+        del lora_request
+        raise RuntimeError(
+            "Runtime diffusion LoRA loading is not supported; "
+            "configure adapters with --dynamic-lora before starting the server."
+        )
 
     def submit_interaction(
         self,
@@ -625,7 +631,8 @@ class DiffusionWorker:
         return self.lora_manager.list_adapters()
 
     def pin_lora(self, adapter_id: int) -> bool:
-        return self.lora_manager.pin_adapter(adapter_id)
+        del adapter_id
+        raise RuntimeError("Diffusion LoRA registrations are immutable and resident for the server lifetime.")
 
     def sleep(self, level: int = 1) -> int:
         """

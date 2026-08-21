@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from vllm_omni.diffusion.lora.types import (
     LoRARequestInput,
     LoRAScaleInput,
     normalize_lora_composition,
+    registered_lora_request,
     split_lora_composition,
 )
 from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 
 
 def get_stage_type(stage_cfg: Any) -> str:
@@ -30,27 +31,30 @@ def _parse_single_lora_request(lora_body: Any) -> tuple[LoRARequest, float | Non
     if not isinstance(lora_body, dict):
         raise ValueError("Invalid lora field: expected an object or an array of objects.")
 
-    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
-    lora_path = (
-        lora_body.get("local_path")
-        or lora_body.get("path")
-        or lora_body.get("lora_path")
-        or lora_body.get("lora_local_path")
-    )
+    path_fields = ("local_path", "path", "lora_path", "lora_local_path")
+    if any(lora_body.get(field) is not None for field in path_fields):
+        raise ValueError(
+            "Request-level LoRA paths are not accepted. Register the adapter with "
+            "--dynamic-lora at server startup, then select it by name."
+        )
+
     lora_scale = lora_body.get("scale")
     if lora_scale is None:
         lora_scale = lora_body.get("lora_scale")
-    lora_int_id = lora_body.get("int_id")
-    if lora_int_id is None:
-        lora_int_id = lora_body.get("lora_int_id")
-    if lora_int_id is None and lora_path:
-        lora_int_id = stable_lora_int_id(str(lora_path))
+    if any(lora_body.get(field) is not None for field in ("int_id", "lora_int_id")):
+        raise ValueError("Invalid lora object: int_id is internal; select a registered adapter by name.")
+    lora_name = lora_body.get("name")
+    if not isinstance(lora_name, str) or not lora_name.strip():
+        raise ValueError("Invalid lora object: name must be a non-empty string.")
+    request = registered_lora_request(lora_name)
 
-    if not lora_name or not lora_path:
-        raise ValueError("Invalid lora object: both name and path are required.")
-
-    scale = float(lora_scale) if lora_scale is not None else None
-    return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
+    try:
+        scale = float(lora_scale) if lora_scale is not None else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid lora object: scale must be a finite number.") from exc
+    if scale is not None and not math.isfinite(scale):
+        raise ValueError("Invalid lora object: scale must be a finite number.")
+    return request, scale
 
 
 def parse_lora_request(lora_body: Any) -> tuple[LoRARequestInput, LoRAScaleInput | None]:

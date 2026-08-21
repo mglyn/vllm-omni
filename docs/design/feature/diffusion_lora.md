@@ -1,4 +1,4 @@
-# Diffusion LoRA
+# Diffusion LoRA architecture
 
 This document defines the shared diffusion LoRA loading and execution
 contract. For commands and request examples, see the
@@ -6,23 +6,27 @@ contract. For commands and request examples, see the
 
 ## Ownership and data flow
 
-The common backend owns adapter download, validation, caching, weighted
-composition, layer installation, dynamic execution, and startup fusion. A
-model owns only the checkpoint-specific knowledge needed to normalize and bind
-its adapters:
+The common backend owns startup adapter loading, immutable registration,
+weighted composition, layer installation, dynamic execution, and prefusion.
+A model owns only the checkpoint-specific knowledge needed to
+normalize and bind its adapters:
 
 | Extension | Model describes | Backend performs |
 | --- | --- | --- |
-| `get_lora_load_plan()` | PEFT metadata, key mapping, tensor conversion, and typed auxiliary updates | Download, deserialize, validate, and cache |
+| `get_lora_load_plan()` | PEFT metadata, key mapping, tensor conversion, and typed auxiliary updates | Load, deserialize, validate, and register at startup |
 | `get_lora_apply_plan()` | Target components/modules and packed-projection layout | Install layers, activate compositions, and fuse weights |
 
 ```text
-CLI or request adapters
-        -> canonical weighted composition
+startup prefusion / dynamic registration
         -> model load/apply plans
         -> validated A/B tensors and typed updates
-        -> dynamic branches or startup-fused dense weights
+        -> fused dense weights / immutable dynamic registry
+        -> request-selected weighted composition
 ```
+
+Requests select dynamic adapters by their unique deployment name. Admission
+resolves that name to the canonical server-owned adapter record before
+scheduling; request payloads neither contain server paths nor invoke the loader.
 
 Sampling remains outside the LoRA backend. Acceleration adapters may require a
 particular scheduler, guidance setting, or number of steps, but deployments and
@@ -58,32 +62,17 @@ model-owned while execution is shared:
 | Wan2.1/2.2 | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Routes high/low-noise adapters and converts supported bias updates into typed updates | Both |
 
 New models should implement plans only when the generic PEFT path and inferred
-module mapping are insufficient. Model code must not duplicate cache,
-composition, or fusion lifecycle logic.
-
-## Performance reference
-
-MiniMax-H3 Turbo was measured on 4× H200 with USP4/Ring1, VAE TP4, regional
-`torch.compile`, identical 768×1344/107-frame requests, two full-shape warmups,
-and five measured runs. Values are median `stage_0_gen_ms`:
-
-| Case | NFE | Stage 0 p50 |
-| --- | ---: | ---: |
-| Base, no LoRA | 49 | 70.634 s |
-| No-LoRA control | 4 | 9.256 s |
-| Turbo prefused | 4 | 9.245 s |
-| Turbo dynamic | 4 | 9.520 s |
-
-Dynamic Turbo is 7.42× faster than the 49-NFE reference because the Turbo
-recipe reduces Transformer evaluations. At the same four NFE, dynamic execution
-cost 2.97% relative to prefusion and remained close to the no-LoRA control.
-The result supports dynamic LoRA as the serving default; it is not a universal
-performance guarantee for other models or adapter ranks.
+module mapping are insufficient. Model code must not duplicate registration,
+composition, or fusion logic.
 
 ## Runtime boundaries
 
-- Compile and offload freeze the module graph; preload adapters that cover all
-  later target modules and sufficient total rank.
+- Every request-selectable adapter is registered with `--dynamic-lora` before
+  serving. Request processing selects and reweights registered tensors; it
+  never invokes the loader or downloads from the Hub.
+- The diffusion registry is immutable while serving; runtime add, remove, and
+  pin operations are rejected.
+- Compile and offload freeze the module graph after startup registration.
 - DLO supports startup dynamic LoRA through ordinary CPU loading; A/B slots
   remain device-resident while DLO streams the base weights. Prefused LoRA with
   DLO is rejected.

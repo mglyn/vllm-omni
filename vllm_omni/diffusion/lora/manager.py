@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import time
-from collections import OrderedDict
 from typing import get_args
 
 import torch
@@ -28,8 +26,10 @@ from vllm_omni.diffusion.lora.loader import (
 from vllm_omni.diffusion.lora.plan import AdditiveBiasUpdate, DiffusionLoRAApplyPlan
 from vllm_omni.diffusion.lora.types import (
     LoRAComposition,
+    LoRARegistry,
     LoRARequestInput,
     LoRAScaleInput,
+    WeightedLoRA,
     lora_composition_key,
     normalize_lora_composition,
 )
@@ -45,8 +45,8 @@ logger = init_logger(__name__)
 class DiffusionLoRAManager:
     """Manager for LoRA adapters in diffusion models.
 
-    Reuses vLLM's LoRA infrastructure, adapted for diffusion pipelines.
-    Uses LRU cache management similar to LRUCacheLoRAModelManager.
+    All weights are loaded during construction. Runtime requests may only
+    select and compose adapters from the immutable dynamic registry.
     """
 
     # Valid max allowed ranks for LoRA in vLLM
@@ -57,18 +57,18 @@ class DiffusionLoRAManager:
         pipeline: nn.Module,
         device: torch.device,
         dtype: torch.dtype,
-        max_cached_adapters: int = 1,
+        max_registered_adapters: int = 1,
         prefused_loras: LoRAComposition = (),
-        dynamic_loras: LoRAComposition = (),
+        dynamic_loras: LoRARegistry = (),
         quantized: bool = False,
     ):
         """
         Initialize the DiffusionLoRAManager.
 
         Args:
-            max_cached_adapters: Maximum number of LoRA adapters to keep in the
-                CPU-side cache (LRU). This mirrors vLLM's `max_cpu_loras` and is
-                exposed to users via `OmniDiffusionConfig.max_cpu_loras`.
+            max_registered_adapters: Maximum number of request-selectable LoRA
+                adapters loaded at startup. This is exposed through
+                ``OmniDiffusionConfig.max_cpu_loras``.
         """
         self.pipeline = pipeline
         self.device = device
@@ -93,18 +93,17 @@ class DiffusionLoRAManager:
             component_names=self._component_names(),
         )
 
-        # LRU-style cache management
-        startup_dynamic = dynamic_loras
-        self.max_cached_adapters = max(max_cached_adapters, len(prefused_loras), len(startup_dynamic), 1)
+        if max_registered_adapters < 1:
+            raise ValueError("max_registered_adapters must be at least 1")
+        self.max_registered_adapters = max_registered_adapters
+        if len(dynamic_loras) > self.max_registered_adapters:
+            raise ValueError(
+                "Dynamic LoRA registry exceeds max_cpu_loras: "
+                f"registered={len(dynamic_loras)}, max_cpu_loras={self.max_registered_adapters}"
+            )
         self._registered_adapters: dict[int, LoadedDiffusionLoRA] = {}
         self._adapter_requests: dict[int, LoRARequest] = {}
         self._active_composition: LoRAComposition = ()
-        self._default_dynamic_composition: LoRAComposition = ()
-
-        # LRU cache tracking (adapter_id -> last_used_time)
-        self._adapter_access_order: OrderedDict[int, float] = OrderedDict()
-        # Pinned adapters are not evicted
-        self._pinned_adapters: set[int] = set()
 
         # track replaced modules
         # key: full module name (component.module.path); value: LoRA layer
@@ -114,29 +113,37 @@ class DiffusionLoRAManager:
         self._frozen = False
 
         logger.info(
-            "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, prefused=%d, dynamic=%d",
+            "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_registered_adapters=%d, "
+            "prefused=%d, dynamic=%d",
             device,
             dtype,
-            self.max_cached_adapters,
+            self.max_registered_adapters,
             len(prefused_loras),
-            len(startup_dynamic),
+            len(dynamic_loras),
         )
 
         if prefused_loras:
             if quantized:
                 raise ValueError("Prefused LoRA is not supported with quantized diffusion weights")
-            self._load_composition(prefused_loras)
+            self._load_startup_composition(prefused_loras)
             self._activate_composition(prefused_loras)
             self._fuse_active_composition()
             for adapter in prefused_loras:
-                self.remove_adapter(adapter.adapter_id)
+                self._discard_startup_adapter(adapter.adapter_id)
 
-        if startup_dynamic:
-            self._load_composition(startup_dynamic)
-            self._default_dynamic_composition = startup_dynamic
-            self._pinned_adapters.update(adapter.adapter_id for adapter in startup_dynamic)
-            self._activate_composition(startup_dynamic)
+        if dynamic_loras:
+            registered_composition = tuple(WeightedLoRA(request=request) for request in dynamic_loras)
+            self._load_startup_composition(registered_composition)
+            # Pre-size buffers for every legal combination before freezing the
+            # graph. This transient bind is cleared before serving begins.
+            self._activate_composition(registered_composition)
+            self._deactivate_all_adapters()
 
+        self._frozen = True
+        # Loading is a construction-only concern. Dropping the loader closes
+        # the last manager-owned path that could read a new checkpoint while
+        # requests are being served.
+        self._loader = None
         self._move_runtime_buffers_to_device()
 
     def _resolve_apply_plan(self) -> DiffusionLoRAApplyPlan:
@@ -150,11 +157,6 @@ class DiffusionLoRAManager:
                 )
             return plan
         return DiffusionLoRAApplyPlan()
-
-    def freeze(self) -> None:
-        """Prevent graph-changing layer replacement or buffer growth."""
-
-        self._frozen = True
 
     def _move_runtime_buffers_to_device(self) -> None:
         """Move only low-rank runtime slots, leaving dense base weights alone."""
@@ -296,54 +298,36 @@ class DiffusionLoRAManager:
     ) -> None:
         """Activate one or more request adapters as a single composition.
 
-        An omitted request restores the deployment's default dynamic
-        composition. An explicitly supplied zero-scale request disables the
-        dynamic contribution for that request; prefused weights remain part of
-        the base model.
+        An omitted or explicitly empty request disables the dynamic
+        contribution. Prefused weights remain part of the base model.
         """
 
-        composition = (
-            self._default_dynamic_composition
-            if lora_request is None
-            else normalize_lora_composition(lora_request, lora_scale)
-        )
+        composition = normalize_lora_composition(lora_request, lora_scale)
         for adapter in composition:
             self._validate_adapter_identity(adapter.request)
         if lora_composition_key(composition) == lora_composition_key(self._active_composition):
-            for adapter in composition:
-                self._touch_adapter_info(adapter.adapter_id)
             return
 
-        self._load_composition(composition)
+        self._require_registered_composition(composition)
         self._deactivate_all_adapters()
         self._activate_composition(composition)
 
-    def _load_composition(self, composition: LoRAComposition) -> None:
-        required_ids = {adapter.adapter_id for adapter in composition}
-        resident_after_load = set(self._pinned_adapters) | required_ids
-        if len(resident_after_load) > self.max_cached_adapters:
-            raise ValueError(
-                "LoRA composition exceeds the CPU adapter cache: "
-                f"required={len(resident_after_load)}, max_cpu_loras={self.max_cached_adapters}"
-            )
-        previous_pins = set(self._pinned_adapters)
-        try:
-            # Keep the requested set resident while its later members load.
-            # Otherwise LRU eviction may discard an earlier member before the
-            # complete composition can be activated.
-            for adapter in composition:
-                if adapter.adapter_id not in self._registered_adapters:
-                    self.add_adapter(adapter.request)
-                else:
-                    self._touch_adapter_info(adapter.adapter_id)
-                self._pinned_adapters.add(adapter.adapter_id)
-        finally:
-            self._pinned_adapters.intersection_update(previous_pins)
+    def _load_startup_composition(self, composition: LoRAComposition) -> None:
+        """Load a trusted composition before request serving begins."""
 
-    def _touch_adapter_info(self, adapter_id):
-        """Update the current caching ordering info."""
-        self._adapter_access_order[adapter_id] = time.time()
-        self._adapter_access_order.move_to_end(adapter_id)
+        for adapter in composition:
+            self._load_startup_adapter(adapter.request)
+
+    def _require_registered_composition(self, composition: LoRAComposition) -> None:
+        """Validate that request activation cannot load a new adapter."""
+
+        missing = [adapter for adapter in composition if adapter.adapter_id not in self._registered_adapters]
+        if missing:
+            specs = ", ".join(f"{adapter.request.lora_path!r} (ID {adapter.adapter_id})" for adapter in missing)
+            raise ValueError(
+                "Request LoRA adapter(s) are not registered: "
+                f"{specs}. Configure every request-selectable adapter with --dynamic-lora before serving."
+            )
 
     def _get_packed_modules_list(self, module: nn.Module) -> list[str]:
         """Return a packed_modules_list suitable for vLLM LoRA can_replace_layer().
@@ -385,7 +369,7 @@ class DiffusionLoRAManager:
         lora_config = LoRAConfig(
             max_lora_rank=self._max_lora_rank,
             max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
+            max_cpu_loras=self.max_registered_adapters,
             lora_dtype=self.dtype,
             fully_sharded_loras=False,
         )
@@ -477,7 +461,7 @@ class DiffusionLoRAManager:
         lora_config = LoRAConfig(
             max_lora_rank=self._max_lora_rank,
             max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
+            max_cpu_loras=self.max_registered_adapters,
             lora_dtype=self.dtype,
             fully_sharded_loras=False,
         )
@@ -814,27 +798,6 @@ class DiffusionLoRAManager:
         self._active_composition = ()
         logger.debug("All adapters deactivated")
 
-    def _evict_for_new_adapter(self) -> None:
-        """Evict unpinned registered adapters until we have room for a new
-        adapter to be loaded."""
-        while len(self._registered_adapters) > (self.max_cached_adapters - 1):
-            # Pick LRU among non-pinned adapters
-            evict_candidates = [aid for aid in self._adapter_access_order.keys() if aid not in self._pinned_adapters]
-            if not evict_candidates:
-                raise ValueError(
-                    f"LoRA CPU cache is full ({self.max_cached_adapters}) and all adapters are pinned; "
-                    "increase max_cpu_loras or unpin an adapter"
-                )
-
-            lru_adapter_id = evict_candidates[0]
-            logger.info(
-                "Evicting LRU adapter: id=%d (cache: %d/%d)",
-                lru_adapter_id,
-                len(self._registered_adapters),
-                self.max_cached_adapters,
-            )
-            self.remove_adapter(lru_adapter_id)
-
     def _validate_adapter_identity(self, lora_request: LoRARequest) -> None:
         existing = self._adapter_requests.get(lora_request.lora_int_id)
         if existing is not None and existing.lora_path != lora_request.lora_path:
@@ -843,71 +806,38 @@ class DiffusionLoRAManager:
                 f"not {lora_request.lora_path!r}"
             )
 
-    def add_adapter(self, lora_request: LoRARequest) -> bool:
-        """
-        Add a new adapter to the cache without activating it.
-        """
+    def _load_startup_adapter(self, lora_request: LoRARequest) -> None:
+        """Load one adapter while constructing the immutable registry."""
+
+        if self._frozen or self._loader is None:
+            raise RuntimeError("Diffusion LoRA checkpoints may only be loaded during manager construction")
+
         adapter_id = lora_request.lora_int_id
 
         self._validate_adapter_identity(lora_request)
         if adapter_id in self._registered_adapters:
-            logger.debug("Adapter %d already registered, skipping", adapter_id)
-            return False
+            return
 
-        logger.info("Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
-
-        # evict if cache full before adding the new adapter
-        # so that we don't go over capacity on the new load
-        self._evict_for_new_adapter()
+        logger.info("Loading startup LoRA adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
 
         loaded = self._loader.load_adapter(lora_request)
         self._replace_layers_with_lora(loaded.peft_helper)
         self._validate_auxiliary_update_bindings(loaded)
         self._registered_adapters[adapter_id] = loaded
         self._adapter_requests[adapter_id] = lora_request
-        self._touch_adapter_info(adapter_id)
 
-        logger.debug(
-            "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters
-        )
-        return True
+    def _discard_startup_adapter(self, adapter_id: int) -> None:
+        """Discard a temporary prefusion adapter before serving starts."""
 
-    def remove_adapter(self, adapter_id: int) -> bool:
-        """
-        Remove an adapter from the cache.
-        """
         if adapter_id not in self._registered_adapters:
-            logger.debug("Adapter %d not found, cannot remove", adapter_id)
-            return False
+            return
 
-        logger.info("Removing adapter: id=%d", adapter_id)
         if any(adapter.adapter_id == adapter_id for adapter in self._active_composition):
             self._deactivate_all_adapters()
 
         del self._registered_adapters[adapter_id]
         self._adapter_requests.pop(adapter_id, None)
-        self._adapter_access_order.pop(adapter_id, None)
-        self._pinned_adapters.discard(adapter_id)
-        logger.debug(
-            "Adapter %d removed, cache size: %d/%d",
-            adapter_id,
-            len(self._registered_adapters),
-            self.max_cached_adapters,
-        )
-        return True
 
     def list_adapters(self) -> list[int]:
         """Return list of registered adapter ids."""
         return list(self._registered_adapters.keys())
-
-    def pin_adapter(self, adapter_id: int) -> bool:
-        """Mark an adapter as pinned so it will not be evicted."""
-        if adapter_id not in self._registered_adapters:
-            logger.debug("Adapter %d not found, cannot pin", adapter_id)
-            return False
-        self._pinned_adapters.add(adapter_id)
-        # Touch access order so it is most recently used
-        self._adapter_access_order[adapter_id] = time.time()
-        self._adapter_access_order.move_to_end(adapter_id)
-        logger.info("Pinned adapter id=%d (won't be evicted)", adapter_id)
-        return True

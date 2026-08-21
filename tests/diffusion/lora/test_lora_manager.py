@@ -169,7 +169,7 @@ def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypat
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     assert "foo" in manager._supported_lora_modules
@@ -203,11 +203,12 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     peft_helper = type("_PH", (), {"r": 1})()
 
+    manager._frozen = False
     manager._replace_layers_with_lora(peft_helper)
     manager._replace_layers_with_lora(peft_helper)
 
@@ -246,7 +247,7 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     # Treat the dummy layer as a packed 3-slice projection so the manager uses
@@ -254,6 +255,7 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
     monkeypatch.setattr(manager, "_get_packed_modules_list", lambda _module: ["q", "k", "v"])
 
     peft_helper = type("_PH", (), {"r": 1, "target_modules": ["to_q"]})()
+    manager._frozen = False
     manager._replace_layers_with_lora(peft_helper)
 
     assert replace_calls == ["to_qkv"]
@@ -264,7 +266,7 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
         pipeline=torch.nn.Module(),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     packed_layer = _DummyLoRALayer(n_slices=3, output_slices=(2, 1, 1))
@@ -316,7 +318,7 @@ def test_lora_manager_splits_fused_checkpoint_with_global_tp_sizes():
         pipeline=torch.nn.Module(),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     # Runtime buffers are rank-local, while the checkpoint B tensor is global.
@@ -369,7 +371,7 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     packed_layer = _DummyLoRALayer(n_slices=3, output_slices=(2, 1, 1))
@@ -411,7 +413,7 @@ def test_lora_manager_composes_multiple_adapters_with_exact_math():
         pipeline=torch.nn.Module(),
         device=torch.device("cpu"),
         dtype=torch.float32,
-        max_cached_adapters=2,
+        max_registered_adapters=2,
     )
     layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
     manager._lora_modules = {"transformer.proj": layer}
@@ -461,7 +463,7 @@ def test_prefused_and_dynamic_routes_share_the_same_delta_math():
         pipeline=torch.nn.Module(),
         device=torch.device("cpu"),
         dtype=torch.float32,
-        max_cached_adapters=2,
+        max_registered_adapters=2,
     )
     layer = _FusableLoRALayer(in_features=2, out_features=2, max_rank=8)
     manager._lora_modules = {"transformer.proj": layer}
@@ -636,34 +638,37 @@ def _activate_single_composition(manager: DiffusionLoRAManager, adapter_id: int,
     manager._activate_composition((WeightedLoRA(request=_dummy_lora_request(adapter_id), scale=scale),))
 
 
-def test_lora_manager_evicts_lru_adapter_when_cache_full(monkeypatch):
+def test_lora_manager_request_activation_never_loads_adapter():
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=2,
     )
+    assert manager._loader is None
 
-    def _fake_load(_req: LoRARequest):
-        lora_model = type("LM", (), {"id": _req.lora_int_id})()
-        peft_helper = type("PH", (), {})()
-        return LoadedDiffusionLoRA(lora_model, peft_helper)
+    with pytest.raises(ValueError, match="not registered.*--dynamic-lora"):
+        manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
 
-    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
-    monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
 
-    req1 = _dummy_lora_request(1)
-    req2 = _dummy_lora_request(2)
-    req3 = _dummy_lora_request(3)
+def test_lora_manager_rejects_registry_larger_than_startup_capacity() -> None:
+    with pytest.raises(ValueError, match="registry exceeds max_cpu_loras"):
+        DiffusionLoRAManager(
+            pipeline=torch.nn.Module(),
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            max_registered_adapters=1,
+            dynamic_loras=(_dummy_lora_request(1), _dummy_lora_request(2)),
+        )
 
-    manager.set_active_adapter(req1, lora_scale=1.0)
-    manager.set_active_adapter(req2, lora_scale=1.0)
 
-    # Touch adapter 1 so adapter 2 becomes LRU.
-    manager.set_active_adapter(req1, lora_scale=1.0)
-
-    manager.set_active_adapter(req3, lora_scale=1.0)
-    assert set(manager.list_adapters()) == {1, 3}
+def test_lora_manager_rejects_nonpositive_registry_capacity() -> None:
+    with pytest.raises(ValueError, match="must be at least 1"):
+        DiffusionLoRAManager(
+            pipeline=torch.nn.Module(),
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            max_registered_adapters=0,
+        )
 
 
 def test_lora_manager_validates_adapter_path_before_active_fast_path() -> None:
@@ -678,60 +683,6 @@ def test_lora_manager_validates_adapter_path_before_active_fast_path() -> None:
 
     with pytest.raises(ValueError, match="already registered from '/tmp/a'.*not '/tmp/b'"):
         manager.set_active_adapter(_dummy_lora_request(7, "/tmp/b"), lora_scale=1.0)
-
-
-def test_lora_manager_does_not_evict_pinned_adapter(monkeypatch):
-    manager = DiffusionLoRAManager(
-        pipeline=torch.nn.Module(),
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-        max_cached_adapters=2,
-    )
-
-    def _fake_load(_req: LoRARequest):
-        lora_model = type("LM", (), {"id": _req.lora_int_id})()
-        peft_helper = type("PH", (), {})()
-        return LoadedDiffusionLoRA(lora_model, peft_helper)
-
-    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
-    monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-
-    manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
-    assert manager.pin_adapter(1)
-
-    manager.set_active_adapter(_dummy_lora_request(2), lora_scale=1.0)
-    manager.set_active_adapter(_dummy_lora_request(3), lora_scale=1.0)
-
-    assert set(manager.list_adapters()) == {1, 3}
-
-
-def test_lora_manager_rejects_when_all_adapters_pinned(monkeypatch):
-    manager = DiffusionLoRAManager(
-        pipeline=torch.nn.Module(),
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-        max_cached_adapters=2,
-    )
-
-    def _fake_load(_req: LoRARequest):
-        lora_model = type("LM", (), {"id": _req.lora_int_id})()
-        peft_helper = type("PH", (), {})()
-        return LoadedDiffusionLoRA(lora_model, peft_helper)
-
-    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
-    monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-
-    manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
-    manager.set_active_adapter(_dummy_lora_request(2), lora_scale=1.0)
-
-    assert manager.pin_adapter(1)
-    assert manager.pin_adapter(2)
-
-    manager.max_cached_adapters = 1
-    with pytest.raises(ValueError, match="all adapters are pinned"):
-        manager._evict_for_new_adapter()
-
-    assert set(manager.list_adapters()) == {1, 2}
 
 
 def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
@@ -755,11 +706,6 @@ def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
         dtype=torch.bfloat16,
     )
 
-    def _fake_load(_req: LoRARequest):
-        peft_helper = type("PH", (), {"r": rank})()
-        return LoadedDiffusionLoRA(lora_model, peft_helper)
-
-    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     manager._registered_adapters = {
         adapter_id: _loaded_lora(lora_model),
     }
@@ -802,11 +748,6 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
         dtype=torch.bfloat16,
     )
 
-    def _fake_load(_req: LoRARequest):
-        peft_helper = type("PH", (), {"r": rank})()
-        return LoadedDiffusionLoRA(lora_model, peft_helper)
-
-    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
     manager._registered_adapters = {
         adapter_id: _loaded_lora(lora_model),
     }
@@ -823,6 +764,7 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
 
     # Increase the rank; this resets the buffers, so the adapter is activated again
     expanded_rank = next(valid_rank for valid_rank in manager._VALID_MAX_RANKS if valid_rank > manager._max_lora_rank)
+    manager._frozen = False
     manager._ensure_max_lora_rank(expanded_rank)
 
     # Ensure we actually took the rank expansion path, which recreates
@@ -834,7 +776,7 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
     assert torch.all(lora_b == initial_scale)
 
 
-def test_lora_manager_uses_valid_max_rank(monkeypatch):
+def test_lora_manager_uses_valid_max_rank():
     """Ensure that the LoRA manager uses a valid max rank for vLLM."""
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),
@@ -848,19 +790,13 @@ def test_lora_manager_uses_valid_max_rank(monkeypatch):
     assert supported_max_rank in DiffusionLoRAManager._VALID_MAX_RANKS
     assert unsupported_max_rank not in DiffusionLoRAManager._VALID_MAX_RANKS
 
-    def _fake_load(_req: LoRARequest):
-        lora_model = type("LM", (), {"id": _req.lora_int_id})()
-        peft_helper = type("PH", (), {"r": unsupported_max_rank})()
-        return LoadedDiffusionLoRA(lora_model, peft_helper)
-
-    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
-    req1 = _dummy_lora_request(1)
-    manager.add_adapter(req1)
+    manager._frozen = False
+    manager._replace_layers_with_lora(type("PH", (), {"r": unsupported_max_rank})())
     assert manager._max_lora_rank == supported_max_rank
 
 
 @pytest.mark.parametrize("rank", [-1, 0, DiffusionLoRAManager._VALID_MAX_RANKS[-1] + 1])
-def test_lora_manager_max_rank_validation(monkeypatch, rank):
+def test_lora_manager_max_rank_validation(rank):
     """Check that invalid max ranks are handled correctly."""
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),
@@ -868,17 +804,9 @@ def test_lora_manager_max_rank_validation(monkeypatch, rank):
         dtype=torch.bfloat16,
     )
 
-    lora_rank = rank
-
-    def _fake_load(_req: LoRARequest):
-        lora_model = type("LM", (), {"id": _req.lora_int_id})()
-        peft_helper = type("PH", (), {"r": lora_rank})()
-        return LoadedDiffusionLoRA(lora_model, peft_helper)
-
-    monkeypatch.setattr(manager._loader, "load_adapter", _fake_load)
-    req1 = _dummy_lora_request(1)
+    manager._frozen = False
     with pytest.raises(ValueError):
-        manager.add_adapter(req1)
+        manager._replace_layers_with_lora(type("PH", (), {"r": rank})())
 
 
 def test_lora_manager_discovers_bagel_component(monkeypatch):
@@ -911,10 +839,11 @@ def test_lora_manager_discovers_bagel_component(monkeypatch):
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     peft_helper = type("_PH", (), {"r": 1})()
+    manager._frozen = False
     manager._replace_layers_with_lora(peft_helper)
 
     assert "language_model.qkv_proj" in replace_calls
@@ -953,10 +882,11 @@ def test_lora_manager_discovers_unet_component(monkeypatch):
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        max_cached_adapters=1,
+        max_registered_adapters=1,
     )
 
     peft_helper = type("_PH", (), {"r": 1})()
+    manager._frozen = False
     manager._replace_layers_with_lora(peft_helper)
 
     assert "down_block.proj" in replace_calls

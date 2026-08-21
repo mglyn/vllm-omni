@@ -656,16 +656,21 @@ def test_generate_images_async_omni_accepts_weighted_lora_list(async_omni_test_c
         json={
             "prompt": "a cat",
             "lora": [
-                {"name": "turbo", "path": "/tmp/turbo", "scale": 0.8, "int_id": 8},
-                {"name": "style", "path": "/tmp/style", "scale": 0.2, "int_id": 2},
+                {"name": "cinematic", "scale": 0.8},
+                {"name": "style", "scale": 0.2},
             ],
         },
     )
 
     assert response.status_code == 200
     captured = async_omni_test_client.app.state.engine_client.captured_sampling_params_list
-    assert tuple(request.lora_int_id for request in captured[1].lora_request) == (2, 8)
-    assert captured[1].lora_scale == (0.2, 0.8)
+    assert dict(
+        zip(
+            (request.lora_name for request in captured[1].lora_request),
+            captured[1].lora_scale,
+            strict=True,
+        )
+    ) == {"cinematic": 0.8, "style": 0.2}
 
 
 def test_generate_images_async_omni_preserves_explicit_empty_lora(async_omni_test_client):

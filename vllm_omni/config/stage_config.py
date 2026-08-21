@@ -349,8 +349,6 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
-    lora_path: str | None = None
-    lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None
@@ -482,7 +480,7 @@ _STAGE_RESERVED_KEYS = frozenset(
     }
 )
 
-_REMOVED_DIFFUSION_LORA_FIELDS = frozenset({"lora_backend"})
+_REMOVED_DIFFUSION_LORA_FIELDS = frozenset({"lora_backend", "lora_path", "lora_scale", "static_lora_scale"})
 
 
 def _reject_removed_diffusion_lora_fields(values: dict[str, Any], context: str) -> None:
@@ -492,7 +490,7 @@ def _reject_removed_diffusion_lora_fields(values: dict[str, Any], context: str) 
     names = ", ".join(f"`{name}`" for name in removed)
     raise ValueError(
         f"{context} uses removed diffusion LoRA field(s) {names}; "
-        "use `prefused_lora` or `dynamic_lora` with `PATH=SCALE` entries."
+        "use `prefused_lora` for startup fusion or `dynamic_lora` for startup registration."
     )
 
 

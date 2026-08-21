@@ -486,7 +486,7 @@ def test_dlo_dynamic_lora_uses_ordinary_loader_before_wrapping(monkeypatch):
         quantization_config=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
-        dynamic_lora=["/tmp/turbo.safetensors=1.0"],
+        dynamic_lora=["/tmp/turbo.safetensors"],
         model="unused",
     )
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)

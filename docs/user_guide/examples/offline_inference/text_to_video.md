@@ -145,10 +145,8 @@ python text_to_video.py \
 - `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
 - `--flow-shift`: scheduler flow_shift parameter.
-- `--lora-path`: path to one request-time LoRA adapter.
-- `--lora-scale`: scale factor for LoRA weights.
-- `--prefused-lora`: `PATH[=SCALE]` adapter to fuse at startup; repeat to compose adapters.
-- `--dynamic-lora`: `PATH[=SCALE]` adapter to install dynamically at startup; repeat to compose adapters.
+- LoRA deployment and request selection: see the
+  [Diffusion LoRA guide](../../diffusion/lora.md).
 
 ### Wan2.2-specific
 

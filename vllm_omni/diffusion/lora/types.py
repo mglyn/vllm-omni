@@ -31,9 +31,34 @@ class WeightedLoRA:
 
 
 LoRAComposition: TypeAlias = tuple[WeightedLoRA, ...]
+LoRARegistry: TypeAlias = tuple[LoRARequest, ...]
 LoRACompositionKey: TypeAlias = tuple[tuple[int, float], ...]
 LoRABatchAdapterKey: TypeAlias = int | tuple[int, ...] | None
 LoRABatchScaleKey: TypeAlias = float | tuple[float, ...]
+
+# Upstream LoRARequest requires a non-empty path.  ID-only API selectors use
+# this internal placeholder until DiffusionEngine replaces them with the
+# deployment-owned request before scheduler admission.
+_REGISTERED_LORA_PATH_PREFIX = "vllm-omni://registered-lora/"
+
+
+def registered_lora_request(name: str) -> LoRARequest:
+    """Build a name-only request reference for deployment-time resolution."""
+
+    name = name.strip()
+    if not name:
+        raise ValueError("Registered LoRA name must not be empty")
+    adapter_id = stable_lora_int_id(name)
+
+    return LoRARequest(
+        lora_name=name,
+        lora_int_id=adapter_id,
+        lora_path=f"{_REGISTERED_LORA_PATH_PREFIX}{adapter_id}",
+    )
+
+
+def is_registered_lora_request(request: LoRARequest) -> bool:
+    return request.lora_path == f"{_REGISTERED_LORA_PATH_PREFIX}{request.lora_int_id}"
 
 
 def normalize_lora_composition(
@@ -102,10 +127,6 @@ def lora_batch_key_fields(
     """Return canonical adapter identity and scale fields for batching."""
 
     composition = normalize_lora_composition(requests, scales)
-    if requests is not None and not composition:
-        # An explicit empty composition disables a deployment default and must
-        # remain distinct from an omitted request.
-        return (), ()
     if not composition:
         return None, 1.0
     adapter_ids: LoRABatchAdapterKey = (
@@ -143,6 +164,8 @@ def parse_lora_adapter_spec(value: str | Mapping[str, Any]) -> WeightedLoRA:
     path_value = value.get("path") or value.get("lora_path") or value.get("local_path")
     if not isinstance(path_value, str) or not path_value:
         raise ValueError("LoRA adapter specification requires a non-empty path")
+    if path_value.startswith(_REGISTERED_LORA_PATH_PREFIX):
+        raise ValueError(f"LoRA adapter path uses the reserved prefix {_REGISTERED_LORA_PATH_PREFIX!r}")
     name_value = value.get("name") or value.get("lora_name") or Path(path_value).stem
     int_id_value = value.get("int_id") or value.get("lora_int_id") or stable_lora_int_id(path_value)
     scale_value = float(value.get("scale", value.get("lora_scale", 1.0)))
@@ -167,3 +190,55 @@ def parse_lora_adapter_specs(values: Sequence[str | Mapping[str, Any]] | None) -
         tuple(adapter.request for adapter in adapters),
         tuple(adapter.scale for adapter in adapters),
     )
+
+
+def parse_lora_registration_specs(values: Sequence[str | Mapping[str, Any]] | None) -> LoRARegistry:
+    """Parse startup registrations, which deliberately have no default scale."""
+
+    if not values:
+        return ()
+    for value in values:
+        registration = value
+        if isinstance(value, str) and value.strip().startswith("{"):
+            registration = json.loads(value)
+        if isinstance(registration, Mapping) and any(
+            registration.get(field) is not None for field in ("int_id", "lora_int_id")
+        ):
+            raise ValueError(
+                "Dynamic LoRA registration does not accept int_id; the request-facing name is the adapter identity."
+            )
+
+    adapters = tuple(parse_lora_adapter_spec(value) for value in values)
+    weighted = [adapter for adapter in adapters if adapter.scale != 1.0]
+    if weighted:
+        paths = ", ".join(repr(adapter.request.lora_path) for adapter in weighted)
+        raise ValueError(
+            f"Dynamic LoRA registration does not accept startup scales: {paths}. Set each adapter scale in the request."
+        )
+
+    registry: dict[str, LoRARequest] = {}
+    internal_ids: dict[int, str] = {}
+    for adapter in adapters:
+        request = adapter.request
+        name = request.lora_name.strip()
+        if not name:
+            raise ValueError("Dynamic LoRA registration requires a non-empty name")
+        previous = registry.get(name)
+        if previous is not None:
+            raise ValueError(
+                f"Dynamic LoRA adapter name {name!r} is registered more than once: "
+                f"{previous.lora_path!r} and {request.lora_path!r}"
+            )
+        internal_id = stable_lora_int_id(name)
+        colliding_name = internal_ids.get(internal_id)
+        if colliding_name is not None and colliding_name != name:
+            raise ValueError(
+                f"Dynamic LoRA names {colliding_name!r} and {name!r} produce the same internal ID; rename one adapter."
+            )
+        registry[name] = LoRARequest(
+            lora_name=name,
+            lora_int_id=internal_id,
+            lora_path=request.lora_path,
+        )
+        internal_ids[internal_id] = name
+    return tuple(registry[name] for name in sorted(registry))

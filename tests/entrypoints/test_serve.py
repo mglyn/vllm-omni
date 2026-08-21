@@ -89,14 +89,14 @@ def test_serve_parser_accepts_repeated_startup_loras() -> None:
             "--prefused-lora",
             "/tmp/base-style=0.25",
             "--dynamic-lora",
-            "/tmp/turbo=0.8",
+            "/tmp/turbo",
             "--dynamic-lora",
-            "/tmp/detail=0.2",
+            "/tmp/detail",
         ]
     )
 
     assert args.prefused_lora == ["/tmp/base-style=0.25"]
-    assert args.dynamic_lora == ["/tmp/turbo=0.8", "/tmp/detail=0.2"]
+    assert args.dynamic_lora == ["/tmp/turbo", "/tmp/detail"]
 
 
 def _make_headless_args(**kwargs) -> TrackingNamespace:

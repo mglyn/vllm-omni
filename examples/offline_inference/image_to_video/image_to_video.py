@@ -56,11 +56,11 @@ import numpy as np
 import PIL.Image
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
     build_image_to_video_prompt as build_model_image_to_video_prompt,
 )
@@ -315,16 +315,16 @@ def parse_args() -> argparse.Namespace:
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     parser.add_argument(
-        "--lora-path",
+        "--request-lora-name",
         type=str,
         default=None,
-        help="Path to one request-time LoRA adapter.",
+        help="Name of one --dynamic-lora registration to select for this request.",
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         default=1.0,
-        help="Scale factor for PEFT LoRA weights (default: 1.0).",
+        help="Request scale for --request-lora-name (default: 1.0).",
     )
     parser.add_argument(
         "--prefused-lora",
@@ -337,8 +337,8 @@ def parse_args() -> argparse.Namespace:
         "--dynamic-lora",
         action="append",
         default=None,
-        metavar="PATH[=SCALE]",
-        help="LoRA to install dynamically at startup. Repeat to compose adapters.",
+        metavar="PATH|JSON",
+        help="LoRA to register at startup for request selection. Repeat to register adapters.",
     )
     parser.add_argument(
         "--extra-body",
@@ -536,8 +536,6 @@ def main():
         omni_kwargs["flow_shift"] = flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
-    if args.lora_path is not None:
-        omni_kwargs["lora_path"] = args.lora_path
     if args.prefused_lora:
         omni_kwargs["prefused_lora"] = args.prefused_lora
     if args.dynamic_lora:
@@ -572,14 +570,7 @@ def main():
     print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
-    lora_request = None
-    if args.lora_path:
-        lora_path = args.lora_path
-        lora_request = LoRARequest(
-            lora_name=Path(lora_path).stem,
-            lora_int_id=stable_lora_int_id(lora_path),
-            lora_path=lora_path,
-        )
+    lora_request = registered_lora_request(args.request_lora_name) if args.request_lora_name is not None else None
 
     negative_prompt = args.negative_prompt
     if negative_prompt is None and not is_ltx2:

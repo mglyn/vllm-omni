@@ -685,8 +685,6 @@ class _DiffusionConfigProjection:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
-    lora_path: str | None = None
-    lora_scale: float = 1.0
     prefused_lora: list[str] | None = None
     dynamic_lora: list[str] | None = None
     max_cpu_loras: int | None = None
@@ -753,7 +751,6 @@ class _DiffusionConfigProjection:
             TransformerConfig,
             build_attention_config,
             normalize_deployment_lora_specs,
-            normalize_legacy_startup_lora,
             parse_kv_cache_skip_selector,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
@@ -765,10 +762,12 @@ class _DiffusionConfigProjection:
             self.tf_model_config = TransformerConfig.from_dict(dict(self.tf_model_config))
 
         self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
-        self.dynamic_lora = normalize_legacy_startup_lora(self.lora_path, self.lora_scale, self.dynamic_lora)
-        if self.lora_path is not None:
-            self.lora_path = None
-            self.lora_scale = 1.0
+        self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
+        dynamic_lora_count = 0
+        if self.dynamic_lora:
+            from vllm_omni.diffusion.lora.types import parse_lora_registration_specs
+
+            dynamic_lora_count = len(parse_lora_registration_specs(self.dynamic_lora))
 
         if self.additional_config is None:
             self.additional_config = {}
@@ -832,6 +831,11 @@ class _DiffusionConfigProjection:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+        if dynamic_lora_count > self.max_cpu_loras:
+            raise ValueError(
+                "dynamic_lora registrations exceed max_cpu_loras: "
+                f"registered={dynamic_lora_count}, max_cpu_loras={self.max_cpu_loras}"
+            )
         if self.prefused_lora and self.quantization_config is not None:
             raise ValueError("prefused_lora is not supported with quantized diffusion weights; use dynamic_lora")
         if self.prefused_lora and self.enable_distributed_layerwise_offload:
@@ -966,7 +970,6 @@ _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
         "kv_cache_dtype",
         "kv_cache_skip_layers",
         "kv_cache_skip_steps",
-        "static_lora_scale",
     }
 )
 _DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS) - {

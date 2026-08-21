@@ -10,11 +10,11 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import get_extra_body_params, get_model_class_name, get_output_tensor_range
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -371,16 +371,16 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
-        "--lora-path",
+        "--request-lora-name",
         type=str,
         default=None,
-        help="Path to one request-time LoRA adapter.",
+        help="Name of one --dynamic-lora registration to select for this request.",
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         default=1.0,
-        help="Scale factor for LoRA weights (default: 1.0).",
+        help="Request scale for --request-lora-name (default: 1.0).",
     )
     parser.add_argument(
         "--prefused-lora",
@@ -393,8 +393,8 @@ def parse_args() -> argparse.Namespace:
         "--dynamic-lora",
         action="append",
         default=None,
-        metavar="PATH[=SCALE]",
-        help="LoRA to install dynamically at startup. Repeat to compose adapters.",
+        metavar="PATH|JSON",
+        help="LoRA to register at startup for request selection. Repeat to register adapters.",
     )
     parser.add_argument(
         "--use-hsdp",
@@ -498,8 +498,6 @@ def main():
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
-    if args.lora_path is not None:
-        omni_kwargs["lora_path"] = args.lora_path
     if args.prefused_lora:
         omni_kwargs["prefused_lora"] = args.prefused_lora
     if args.dynamic_lora:
@@ -534,15 +532,7 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
-    lora_request = None
-    if args.lora_path:
-        lora_path = args.lora_path
-        lora_request_id = stable_lora_int_id(lora_path)
-        lora_request = LoRARequest(
-            lora_name=Path(lora_path).stem,
-            lora_int_id=lora_request_id,
-            lora_path=lora_path,
-        )
+    lora_request = registered_lora_request(args.request_lora_name) if args.request_lora_name is not None else None
 
     negative_prompt = args.negative_prompt
     if negative_prompt is None and all(preset is not _MODEL_PRESETS[name] for name in ("lingbot", "ltx2", "ltx23")):

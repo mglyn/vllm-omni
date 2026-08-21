@@ -46,7 +46,7 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
         "guidance_scale_2": 1.25,
         "layers": 6,
         "resolution": 1024,
-        "lora": {"name": "adapter-a", "path": "/tmp/adapter-a", "scale": 0.6},
+        "lora": {"name": "style", "scale": 0.6},
     }
     gen_params = OmniDiffusionSamplingParams(height=768, width=1024, seed=0, num_outputs_per_prompt=2)
 
@@ -79,13 +79,13 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert sampling_params_list[1].guidance_scale == 7.5
     assert sampling_params_list[1].num_outputs_per_prompt == 2
     assert sampling_params_list[1].true_cfg_scale == 5.0
-    assert sampling_params_list[1].lora_request.name == "adapter-a"
+    assert sampling_params_list[1].lora_request.lora_name == "style"
     assert sampling_params_list[1].lora_scale == 0.6
     assert sampling_params_list[2].height == 768
     assert sampling_params_list[2].width == 1024
     assert sampling_params_list[2].seed == 0
     assert sampling_params_list[2].num_inference_steps == 28
-    assert sampling_params_list[2].lora_request.name == "adapter-a"
+    assert sampling_params_list[2].lora_request.lora_name == "style"
     assert sampling_params_list[2].lora_scale == 0.6
     assert gen_params.lora_request is None
     assert engine.default_sampling_params_list[1].height is None

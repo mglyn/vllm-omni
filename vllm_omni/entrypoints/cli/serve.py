@@ -434,18 +434,6 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--lora-path",
-            type=str,
-            default=None,
-            help="Single dynamic diffusion LoRA to load and activate at startup.",
-        )
-        omni_config_group.add_argument(
-            "--lora-scale",
-            type=float,
-            default=None,
-            help="Scale for --lora-path (default: 1.0).",
-        )
-        omni_config_group.add_argument(
             "--prefused-lora",
             action="append",
             default=None,
@@ -459,10 +447,11 @@ class OmniServeCommand(CLISubcommand):
             "--dynamic-lora",
             action="append",
             default=None,
-            metavar="PATH[=SCALE]",
+            metavar="PATH|JSON",
             help=(
-                "LoRA adapter to install and enable dynamically at startup. "
-                "Repeat for a weighted composition; requests may replace this default composition."
+                "LoRA adapter to register and load at startup for request-level use. "
+                "Repeat to register multiple adapters; a JSON spec may assign the request-facing name. "
+                "Registration does not activate an adapter or set its scale."
             ),
         )
         omni_config_group.add_argument(

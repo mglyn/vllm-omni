@@ -53,52 +53,23 @@ def normalize_deployment_lora_specs(value: Any, field_name: str) -> list[str] | 
     raise TypeError(f"{field_name} must be a string, a sequence of strings, or None")
 
 
-def normalize_legacy_startup_lora(
-    lora_path: Any,
-    lora_scale: Any,
-    dynamic_lora: Any,
-) -> list[str] | None:
-    """Fold the legacy single startup LoRA into the dynamic composition."""
-
-    normalized = normalize_deployment_lora_specs(dynamic_lora, "dynamic_lora")
-    if lora_path is None:
-        return normalized
-    if not isinstance(lora_path, str):
-        raise TypeError(
-            "lora_path accepts only one string path; use dynamic_lora or prefused_lora "
-            "for one or more weighted adapters."
-        )
-    scale = 1.0 if lora_scale is None else float(lora_scale)
-    if not math.isfinite(scale):
-        raise ValueError(f"lora_scale must be finite, got {scale!r}")
-    return [*(normalized or []), f"{lora_path}={scale}"]
-
-
-def is_diffusion_module_graph_fixed(config: Any) -> bool:
-    """Whether runtime features prohibit changing the diffusion module graph."""
-
-    return (
-        not bool(getattr(config, "enforce_eager", False))
-        or bool(getattr(config, "enable_cpu_offload", False))
-        or bool(getattr(config, "enable_layerwise_offload", False))
-        or bool(getattr(config, "enable_distributed_layerwise_offload", False))
-        or getattr(config, "cache_backend", None) not in (None, "none")
-    )
-
-
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
+    removed_lora_args = [
+        name
+        for name in ("lora_path", "lora_scale", "static_lora_scale", "lora_backend")
+        if normalized.get(name) is not None
+    ]
+    if removed_lora_args:
+        names = ", ".join(f"`{name}`" for name in removed_lora_args)
+        raise ValueError(
+            f"Legacy diffusion LoRA argument(s) {names} are no longer supported; "
+            "use `prefused_lora` for startup fusion or `dynamic_lora` for startup registration."
+        )
     for field_name in ("prefused_lora", "dynamic_lora"):
         if field_name in normalized:
             normalized[field_name] = normalize_deployment_lora_specs(normalized[field_name], field_name)
-
-    # Backwards-compatibility: older callers may use a diffusion-specific
-    # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
-    if "static_lora_scale" in normalized:
-        if "lora_scale" not in normalized:
-            normalized["lora_scale"] = normalized["static_lora_scale"]
-        normalized.pop("static_lora_scale", None)
 
     # Backwards-compatibility: map "quantization" to "quantization_config"
     # so callers using the old field name still work.
@@ -779,8 +750,6 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    lora_path: str | None = None
-    lora_scale: float = 1.0
     prefused_lora: list[str] | None = None
     dynamic_lora: list[str] | None = None
     max_cpu_loras: int | None = None
@@ -1031,10 +1000,12 @@ class OmniDiffusionConfig:
 
     def __post_init__(self):
         self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
-        self.dynamic_lora = normalize_legacy_startup_lora(self.lora_path, self.lora_scale, self.dynamic_lora)
-        if self.lora_path is not None:
-            self.lora_path = None
-            self.lora_scale = 1.0
+        self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
+        dynamic_lora_count = 0
+        if self.dynamic_lora:
+            from vllm_omni.diffusion.lora.types import parse_lora_registration_specs
+
+            dynamic_lora_count = len(parse_lora_registration_specs(self.dynamic_lora))
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1174,6 +1145,11 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+        if dynamic_lora_count > self.max_cpu_loras:
+            raise ValueError(
+                "dynamic_lora registrations exceed max_cpu_loras: "
+                f"registered={dynamic_lora_count}, max_cpu_loras={self.max_cpu_loras}"
+            )
         if self.prefused_lora and self.quantization_config is not None:
             raise ValueError("prefused_lora is not supported with quantized diffusion weights; use dynamic_lora")
         if self.prefused_lora and self.enable_distributed_layerwise_offload:

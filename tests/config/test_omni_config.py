@@ -80,17 +80,15 @@ def test_load_deploy_config_rejects_removed_stage_lora_backend(tmp_path: Path) -
         load_deploy_config(deploy_path)
 
 
-def test_load_deploy_config_accepts_single_startup_lora_alias(tmp_path: Path) -> None:
+def test_load_deploy_config_rejects_single_startup_lora_alias(tmp_path: Path) -> None:
     deploy_path = tmp_path / "startup-lora.yaml"
     deploy_path.write_text(
         "stages:\n  - stage_id: 0\n    lora_path: /tmp/style\n    lora_scale: 0.25\n",
         encoding="utf-8",
     )
 
-    stage = load_deploy_config(deploy_path).stages[0]
-
-    assert stage.lora_path == "/tmp/style"
-    assert stage.lora_scale == 0.25
+    with pytest.raises(ValueError, match="removed diffusion LoRA field"):
+        load_deploy_config(deploy_path)
 
 
 def _resolve_pipeline_or_skip(model_type: str, hf_config=None) -> PipelineConfig:
@@ -1127,7 +1125,6 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
         kv_cache_dtype="fp8",
         kv_cache_skip_steps="0-1",
         kv_cache_skip_layers=[2],
-        static_lora_scale=0.25,
         diffusion_kv_mode="paged_scheduler",
         diffusers_load_kwargs=None,
         diffusers_call_kwargs=None,
@@ -1138,36 +1135,24 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusion_kv_cache_dtype == "fp8"
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1}
     assert cfg.diffusion_kv_cache_skip_layer_indices == {2}
-    assert cfg.lora_scale == 0.25
     assert cfg.cache_backend == "tea_cache"
     assert cfg.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert cfg.diffusers_load_kwargs == {}
     assert cfg.diffusers_call_kwargs == {}
 
 
-def test_diffusion_config_routes_single_startup_lora_to_dynamic_composition():
-    from vllm_omni.diffusion.lora.types import parse_lora_adapter_specs
+@pytest.mark.parametrize("legacy_field", ["lora_path", "lora_scale", "static_lora_scale", "lora_backend"])
+def test_diffusion_config_rejects_legacy_lora_fields(legacy_field):
+    with pytest.raises(ValueError, match="Legacy diffusion LoRA argument"):
+        omni_config_module._DiffusionConfigProjection.from_kwargs(**{legacy_field: "/tmp/style"})
 
-    cfg = omni_config_module._DiffusionConfigProjection(
-        lora_path="/tmp/style",
-        lora_scale=0.25,
-        dynamic_lora=["/tmp/detail=0.5"],
-    )
 
-    composition = parse_lora_adapter_specs(cfg.dynamic_lora)
-    assert {adapter.request.lora_path: adapter.scale for adapter in composition} == {
-        "/tmp/style": 0.25,
-        "/tmp/detail": 0.5,
-    }
-    assert cfg.lora_path is None
-    assert cfg.lora_scale == 1.0
+def test_diffusion_config_validates_dynamic_registration_specs():
+    with pytest.raises(ValueError, match="does not accept startup scales"):
+        omni_config_module._DiffusionConfigProjection(dynamic_lora=["/tmp/detail=0.5"])
 
-    roundtrip = omni_config_module._DiffusionConfigProjection(
-        lora_path=cfg.lora_path,
-        lora_scale=cfg.lora_scale,
-        dynamic_lora=cfg.dynamic_lora,
-    )
-    assert roundtrip.dynamic_lora == cfg.dynamic_lora
+    with pytest.raises(ValueError, match="registrations exceed max_cpu_loras"):
+        omni_config_module._DiffusionConfigProjection(dynamic_lora=["/tmp/one", "/tmp/two"])
 
 
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):

@@ -2,7 +2,7 @@
 
 vLLM-Omni provides a shared LoRA backend for diffusion pipelines. It supports
 startup fusion, dynamic execution, request-scoped adapter selection, weighted
-multi-adapter composition, and common adapter lifecycle management.
+multi-adapter composition, and an immutable startup registry.
 
 For a linear layer with base weight $W$, adapter matrices $A_i$ and $B_i$, and
 user scales $s_i$, both execution modes implement:
@@ -15,15 +15,12 @@ The modes differ in when this expression is evaluated:
 
 | Mode | Startup option | Weight lifecycle | Request switching | Quantized base weights |
 |---|---|---|---|---|
-| Dynamic | `--dynamic-lora PATH=SCALE` | Keeps $W$ unchanged and evaluates the low-rank branch during each forward | Yes | Yes |
+| Dynamic | `--dynamic-lora PATH` | Loads an inactive adapter at startup and evaluates the low-rank branch only when selected | Yes | Yes |
 | Prefused | `--prefused-lora PATH=SCALE` | Merges the delta into dense weights once at startup | No | No |
 
 Dynamic LoRA is the recommended default for serving. Prefusion is useful only
 when permanent dense weights are required and its output quality has been
 validated for the model and dtype.
-
-`--lora-path PATH --lora-scale SCALE` is also supported as the single-adapter
-form of `--dynamic-lora PATH=SCALE`.
 
 ## Adapter formats
 
@@ -37,8 +34,9 @@ lora_adapter/
 ```
 
 The PEFT configuration describes the rank, alpha, and target modules. A local
-path or Hugging Face repository ID may be used at startup or in a request.
-Paths in API requests are resolved by the server, not uploaded by the client.
+path or Hugging Face repository ID may be registered at startup. Requests may
+only select adapters registered with `--dynamic-lora`; they never resolve a
+new local path or trigger a Hugging Face download.
 
 Single-file `.safetensors` adapters are also supported when their checkpoint
 layout is compatible with the selected pipeline. Check the corresponding
@@ -53,39 +51,42 @@ assembly workflow below because those tensors are not low-rank LoRA terms.
 
 ## Dynamic serving
 
-Install one adapter at startup and make it the deployment default:
+Register one request-selectable adapter at startup:
 
 ```bash
 vllm serve BASE_MODEL \
   --omni \
-  --dynamic-lora /path/to/adapter=1.0 \
+  --dynamic-lora '{"path":"/path/to/adapter","name":"accelerator"}' \
   --max-cpu-loras 1
 ```
 
-Repeat `--dynamic-lora` to install a weighted default composition. The cache
-must have room for every adapter that must remain resident:
+Repeat `--dynamic-lora` to register multiple adapters. The registry capacity
+must cover all of them:
 
 ```bash
 vllm serve BASE_MODEL \
   --omni \
-  --dynamic-lora /path/to/accelerator.safetensors=1.0 \
-  --dynamic-lora org/style-adapter=0.6 \
+  --dynamic-lora '{"path":"/path/to/accelerator.safetensors","name":"accelerator"}' \
+  --dynamic-lora '{"path":"org/style-adapter","name":"style"}' \
   --max-cpu-loras 2
 ```
 
-Startup specifications accept `PATH` or `PATH=SCALE`. When a path itself ends
-in text that cannot be parsed as a number, the whole value remains the path.
+Dynamic specifications accept `PATH` or a JSON object with `path` and optional
+`name`. A bare path derives its name from the final path component. Registered
+names must be unique. Registration never activates an adapter and does not
+accept a scale; clients set composition scales per request. Every selectable
+adapter must be listed before the server starts.
 
 ### Request selection
 
-The Images and Videos APIs accept a `lora` object or list. Each entry requires
-`name` and `path`; `scale` defaults to `1.0`, and `int_id` is optional:
+The Images and Videos APIs accept a `lora` object or list. Each entry selects a
+startup `--dynamic-lora` adapter by `name`; `scale` defaults to `1.0`:
 
 ```json
 {
   "lora": [
-    {"name": "accelerator", "path": "/path/to/accelerator.safetensors", "scale": 1.0},
-    {"name": "style", "path": "org/style-adapter", "scale": 0.6}
+    {"name": "accelerator", "scale": 1.0},
+    {"name": "style", "scale": 0.6}
   ]
 }
 ```
@@ -94,26 +95,27 @@ Request behavior is explicit:
 
 | Request `lora` value | Dynamic adapters used by the request |
 |---|---|
-| Field omitted or `null` | Startup `--dynamic-lora` composition |
+| Field omitted or `null` | None |
 | `[]` | None |
-| One object | That adapter only |
-| List of objects | That weighted composition; it replaces the startup default |
+| One object | That registered adapter only |
+| List of objects | That registered weighted composition |
 
-For example, a synchronous video request can reweight the startup adapter:
+For example, a synchronous video request can select and scale an adapter:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/v1/videos/sync \
   -F 'model=BASE_MODEL' \
   -F 'prompt=A cinematic wide shot of a singer on an open-air stage.' \
-  -F 'lora={"name":"accelerator","path":"/path/to/accelerator.safetensors","scale":0.8}'
+  -F 'lora={"name":"accelerator","scale":0.8}'
 ```
 
 The same object or list can be passed as the `lora` field of an Images API
-JSON request. Adapter names are labels; the path-derived stable integer ID is
-the default cache identity. If `int_id` is supplied explicitly, do not reuse
-that ID for a different path.
+JSON request. Unknown names are rejected before scheduler admission, and
+request handling resolves names to server-owned canonical paths without
+invoking the loader. Request paths are rejected even when they match a
+registration.
 
-Duplicate adapter IDs in one composition have their scales added, zero-scale
+Duplicate adapter names in one composition have their scales added, zero-scale
 results are removed, and non-finite scales are rejected. Requests with
 different adapter compositions are scheduled in separate diffusion batches.
 
@@ -151,25 +153,17 @@ is intentional. Prefusion is rejected for quantized diffusion weights because
 their serialized or runtime representation is not a dense floating-point
 weight that can safely receive an in-place LoRA delta.
 
-## Compile, offload, and cache capacity
+## Compile, offload, and registry capacity
 
 Dynamic adapters are installed before compilation, CPU/layerwise offload, and
-diffusion cache wrapping. These features fix the module graph, so preload an
-adapter that covers every target layer and enough total rank for later request
-compositions. After the graph is fixed, requests may select, disable, or
-reweight installed-compatible adapters, but they cannot introduce a new
-target layer or expand the allocated rank.
+diffusion cache wrapping. Requests may select, disable, compose, or reweight
+those registered adapters, but cannot load another adapter, introduce a new
+target layer, or expand the allocated rank. This rule is the same in eager and
+compiled deployments. An explicit empty composition remains valid.
 
-A non-empty request-level LoRA is rejected before scheduler admission when the
-graph is fixed and no startup adapter reserved any LoRA capacity. Configure a
-compatible `--dynamic-lora` preload, or use `--enforce-eager` without an
-offload/cache feature that also fixes the graph. An explicit empty composition
-remains valid because it does not install or resize anything.
-
-`--max-cpu-loras` controls the per-worker adapter cache. Startup dynamic
-adapters are pinned, while request-loaded adapters use LRU eviction. Set the
-value to at least the number of pinned startup adapters plus the largest
-request-only composition that must coexist with them.
+`--max-cpu-loras` bounds the immutable per-worker dynamic registry. Registered
+adapters remain resident; request handling never inserts, removes, or evicts
+them. Set it to at least the number of `--dynamic-lora` entries.
 
 Dynamic LoRA executes the dense base layer through its configured quantization
 method and adds the low-rank branch separately, so it can be combined with a
@@ -196,27 +190,23 @@ The same request types are available through the Python API:
 ```python
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.request import LoRARequest
+from vllm_omni.diffusion.lora.types import registered_lora_request
 
 adapter_path = "/path/to/lora_adapter"
 omni = Omni(
     model="stabilityai/stable-diffusion-3.5-medium",
-    dynamic_lora=[f"{adapter_path}=1.0"],
+    dynamic_lora=[f'{{"path":"{adapter_path}","name":"style"}}'],
 )
 
 params = OmniDiffusionSamplingParams(
     num_inference_steps=28,
-    lora_request=LoRARequest(
-        lora_name="style",
-        lora_int_id=1,
-        lora_path=adapter_path,
-    ),
+    lora_request=registered_lora_request("style"),
     lora_scale=0.8,
 )
 outputs = omni.generate("A piece of cheesecake", params)
 ```
 
-For multiple adapters, pass matching tuples of `LoRARequest` and scales.
+For multiple adapters, pass matching tuples of registered name selectors and scales.
 
 ## Wan2.2 LightX2V Offline Assembly
 
