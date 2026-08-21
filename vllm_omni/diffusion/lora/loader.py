@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from vllm_omni.diffusion.lora.plan import (
     DiffusionAdapterUpdate,
     DiffusionLoRALoadPlan,
 )
+from vllm_omni.diffusion.lora.utils import _get_submodule
 
 logger = init_logger(__name__)
 
@@ -56,7 +57,7 @@ class DiffusionLoRAAdapterLoader:
         providers.extend(
             component
             for component_name in self.component_names
-            if isinstance((component := getattr(self.pipeline, component_name, None)), nn.Module)
+            if (component := _get_submodule(self.pipeline, component_name)) is not None
         )
         plans: list[DiffusionLoRALoadPlan] = []
         for provider in providers:

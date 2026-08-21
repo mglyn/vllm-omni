@@ -53,6 +53,30 @@ def normalize_deployment_lora_specs(value: Any, field_name: str) -> list[str] | 
     raise TypeError(f"{field_name} must be a string, a sequence of strings, or None")
 
 
+def normalize_deployment_lora_config(
+    prefused_lora: Any,
+    dynamic_lora: Any,
+    max_cpu_loras: int | None,
+) -> tuple[list[str] | None, list[str] | None, int]:
+    """Normalize startup LoRAs and validate the immutable registry capacity."""
+
+    prefused = normalize_deployment_lora_specs(prefused_lora, "prefused_lora")
+    dynamic = normalize_deployment_lora_specs(dynamic_lora, "dynamic_lora")
+    capacity = 1 if max_cpu_loras is None else max_cpu_loras
+    if capacity < 1:
+        raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+    if dynamic:
+        from vllm_omni.diffusion.lora.types import parse_lora_registration_specs
+
+        registered = len(parse_lora_registration_specs(dynamic))
+        if registered > capacity:
+            raise ValueError(
+                f"dynamic_lora registrations exceed max_cpu_loras: registered={registered}, max_cpu_loras={capacity}"
+            )
+    return prefused, dynamic, capacity
+
+
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
@@ -999,13 +1023,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        self.prefused_lora = normalize_deployment_lora_specs(self.prefused_lora, "prefused_lora")
-        self.dynamic_lora = normalize_deployment_lora_specs(self.dynamic_lora, "dynamic_lora")
-        dynamic_lora_count = 0
-        if self.dynamic_lora:
-            from vllm_omni.diffusion.lora.types import parse_lora_registration_specs
-
-            dynamic_lora_count = len(parse_lora_registration_specs(self.dynamic_lora))
+        self.prefused_lora, self.dynamic_lora, self.max_cpu_loras = normalize_deployment_lora_config(
+            self.prefused_lora,
+            self.dynamic_lora,
+            self.max_cpu_loras,
+        )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1141,15 +1163,6 @@ class OmniDiffusionConfig:
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
-        if self.max_cpu_loras is None:
-            self.max_cpu_loras = 1
-        elif self.max_cpu_loras < 1:
-            raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
-        if dynamic_lora_count > self.max_cpu_loras:
-            raise ValueError(
-                "dynamic_lora registrations exceed max_cpu_loras: "
-                f"registered={dynamic_lora_count}, max_cpu_loras={self.max_cpu_loras}"
-            )
         if self.prefused_lora and self.quantization_config is not None:
             raise ValueError("prefused_lora is not supported with quantized diffusion weights; use dynamic_lora")
         if self.prefused_lora and self.enable_distributed_layerwise_offload:

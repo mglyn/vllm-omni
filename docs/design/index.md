@@ -70,7 +70,6 @@ The design contracts separate selection mechanics from backend algorithms:
 
 - [Cache-DiT](feature/cache_dit.md)
 - [TeaCache](feature/teacache.md)
-- [Diffusion LoRA](feature/diffusion_lora.md)
 - [Diffusion Continuous Batching](feature/diffusion_continuous_batching.md)
 
 ## Infrastructure and Performance

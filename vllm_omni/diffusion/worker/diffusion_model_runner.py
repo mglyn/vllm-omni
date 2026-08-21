@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Diffusion Model Runner for vLLM-Omni.
 
@@ -321,7 +321,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
-        self.init_lora_manager()
+        with get_memory_context():
+            self.init_lora_manager()
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(

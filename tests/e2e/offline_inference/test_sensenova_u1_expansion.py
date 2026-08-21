@@ -139,7 +139,7 @@ def test_sensenova_u1_lora_scale_and_deactivation(tmp_path) -> None:
 
     with OmniRunner(
         MODEL,
-        dynamic_lora=[{"path": lora_request.lora_path, "name": lora_request.lora_name}],
+        dynamic_lora=[json.dumps({"path": lora_request.lora_path, "name": lora_request.lora_name})],
     ) as runner:
         omni = runner.omni
         baseline = _generate(omni, (), ())

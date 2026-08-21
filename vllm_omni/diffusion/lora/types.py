@@ -40,6 +40,31 @@ LoRABatchScaleKey: TypeAlias = float | tuple[float, ...]
 # this internal placeholder until DiffusionEngine replaces them with the
 # deployment-owned request before scheduler admission.
 _REGISTERED_LORA_PATH_PREFIX = "vllm-omni://registered-lora/"
+_STARTUP_LORA_FIELDS = frozenset(
+    {
+        "path",
+        "lora_path",
+        "local_path",
+        "name",
+        "lora_name",
+        "int_id",
+        "lora_int_id",
+        "scale",
+        "lora_scale",
+    }
+)
+
+
+def _get_single_alias(
+    value: Mapping[str, Any],
+    fields: tuple[str, ...],
+    label: str,
+    default: Any = None,
+) -> Any:
+    present = [field for field in fields if value.get(field) is not None]
+    if len(present) > 1:
+        raise ValueError(f"LoRA adapter specification provides multiple {label} fields: {present}")
+    return value[present[0]] if present else default
 
 
 def registered_lora_request(name: str) -> LoRARequest:
@@ -161,14 +186,27 @@ def parse_lora_adapter_spec(value: str | Mapping[str, Any]) -> WeightedLoRA:
                     path = maybe_path
             value = {"path": path, "scale": scale}
 
-    path_value = value.get("path") or value.get("lora_path") or value.get("local_path")
+    unknown_fields = set(value) - _STARTUP_LORA_FIELDS
+    if unknown_fields:
+        fields = ", ".join(sorted(map(repr, unknown_fields)))
+        raise ValueError(f"LoRA adapter specification contains unknown field(s): {fields}")
+
+    path_value = _get_single_alias(value, ("path", "lora_path", "local_path"), "path")
     if not isinstance(path_value, str) or not path_value:
         raise ValueError("LoRA adapter specification requires a non-empty path")
     if path_value.startswith(_REGISTERED_LORA_PATH_PREFIX):
         raise ValueError(f"LoRA adapter path uses the reserved prefix {_REGISTERED_LORA_PATH_PREFIX!r}")
-    name_value = value.get("name") or value.get("lora_name") or Path(path_value).stem
-    int_id_value = value.get("int_id") or value.get("lora_int_id") or stable_lora_int_id(path_value)
-    scale_value = float(value.get("scale", value.get("lora_scale", 1.0)))
+    name_value = _get_single_alias(value, ("name", "lora_name"), "name", Path(path_value).stem)
+    if not isinstance(name_value, str) or not name_value.strip():
+        raise ValueError("LoRA adapter specification requires a non-empty name")
+    name_value = name_value.strip()
+    int_id_value = _get_single_alias(
+        value,
+        ("int_id", "lora_int_id"),
+        "integer ID",
+        stable_lora_int_id(path_value),
+    )
+    scale_value = float(_get_single_alias(value, ("scale", "lora_scale"), "scale", 1.0))
     composition = normalize_lora_composition(
         LoRARequest(
             lora_name=str(name_value),

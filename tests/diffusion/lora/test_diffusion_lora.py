@@ -74,7 +74,7 @@ def test_diffusion_model(tmp_path: Path):
         return str(adapter_dir)
 
     lora_dir = _write_zimage_lora(tmp_path / "zimage_lora")
-    with OmniRunner(MODEL, dynamic_lora=[{"path": lora_dir, "name": "test"}]) as runner:
+    with OmniRunner(MODEL, dynamic_lora=[json.dumps({"path": lora_dir, "name": "test"})]) as runner:
         m = runner.omni
         # High resolution may cause OOM on L4.
         height = 256

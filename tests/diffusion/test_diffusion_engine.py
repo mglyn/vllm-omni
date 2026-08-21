@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -643,8 +643,29 @@ class TestDynamicLoRAAdmission:
         assert resolved.lora_path == path
         assert request.sampling_params.lora_scale == 0.25
 
+    def test_dynamic_lora_registry_is_parsed_once(self, monkeypatch) -> None:
+        import vllm_omni.diffusion.diffusion_engine as engine_module
+
+        parse = engine_module.parse_lora_registration_specs
+        calls = 0
+
+        def _counted_parse(values):
+            nonlocal calls
+            calls += 1
+            return parse(values)
+
+        monkeypatch.setattr(engine_module, "parse_lora_registration_specs", _counted_parse)
+        engine = self._engine(dynamic_lora=["/tmp/style"])
+
+        for request_id in ("first", "second"):
+            request = self._request(registered_lora_request("style"))
+            request.request_id = request_id
+            engine._prepare_request_for_admission(request)
+
+        assert calls == 1
+
     def test_request_rejects_paths_even_when_id_and_path_match(self) -> None:
-        engine = self._engine(dynamic_lora=[{"path": "/tmp/style", "name": "style"}])
+        engine = self._engine(dynamic_lora=['{"path":"/tmp/style","name":"style"}'])
         adapter_request = LoRARequest(
             lora_name="style",
             lora_int_id=stable_lora_int_id("style"),
@@ -912,7 +933,7 @@ async def test_async_add_req_and_stream_response():
     await engine._check_and_start_background_loop()
 
     async def run_task(rid):
-        req = SimpleNamespace(request_id=rid)
+        req = SimpleNamespace(request_id=rid, sampling_params=OmniDiffusionSamplingParams())
         start = time.time()
         res = await _consume_final_output(engine.async_add_req_and_stream_response(req))
         return rid, res, time.time() - start

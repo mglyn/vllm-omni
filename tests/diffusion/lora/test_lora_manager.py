@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -101,12 +101,13 @@ class _DummyPipeline(torch.nn.Module):
 class _CustomApplyPlanPipeline(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.custom_dit = torch.nn.Module()
-        self.custom_dit.proj = _FakeLinearBase()
+        self.container = torch.nn.Module()
+        self.container.custom_dit = torch.nn.Module()
+        self.container.custom_dit.proj = _FakeLinearBase()
 
     def get_lora_apply_plan(self) -> DiffusionLoRAApplyPlan:
         return DiffusionLoRAApplyPlan(
-            component_names=("custom_dit",),
+            component_names=("container.custom_dit",),
             target_modules=("proj",),
             packed_modules_mapping={"proj": ("query", "key")},
         )
@@ -149,8 +150,26 @@ def test_model_owned_apply_plan_describes_custom_application() -> None:
         dtype=torch.bfloat16,
     )
 
-    assert manager._component_names() == ("custom_dit",)
+    assert manager._component_names() == ("container.custom_dit",)
     assert manager._packed_modules_mapping == {"proj": ["query", "key"]}
+    assert manager._component_relative_name("container.custom_dit.block.proj") == "block.proj"
+
+
+@pytest.mark.parametrize(
+    ("lora_names", "module_names", "match"),
+    [
+        (("transformer.typo.proj",), ("transformer.block.proj",), "unbound"),
+        (("proj",), ("transformer.a.proj", "transformer.b.proj"), "ambiguous"),
+    ],
+)
+def test_lora_manager_rejects_non_unique_weight_bindings(lora_names, module_names, match) -> None:
+    manager = DiffusionLoRAManager(torch.nn.Module(), torch.device("cpu"), torch.bfloat16)
+    manager._lora_modules = {name: _DummyLoRALayer(1, (2,)) for name in module_names}
+    loras = dict.fromkeys(lora_names, object())
+    model = type("LM", (), {"loras": loras, "get_lora": lambda self, name: self.loras.get(name)})()
+
+    with pytest.raises(ValueError, match=match):
+        manager._validate_lora_bindings(_loaded_lora(model))
 
 
 def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypatch):
@@ -624,6 +643,42 @@ def test_prefused_bf16_weight_uses_single_rounding():
     manager._fuse_active_composition()
 
     torch.testing.assert_close(layer.base_layer.weight, expected, rtol=0, atol=0)
+
+
+def test_prefused_only_restores_dense_layers_and_releases_runtime_slots(monkeypatch):
+    pipeline = _DummyPipeline()
+    base_layer = pipeline.transformer.foo
+    wrapper = _DummyBaseLayerWithLoRA(base_layer)
+    prefused = (WeightedLoRA(request=_dummy_lora_request(1)),)
+
+    def _load_prefused(manager, _composition):
+        pipeline.transformer.foo = wrapper
+        manager._lora_modules = {"transformer.foo": wrapper}
+        manager._max_lora_rank = 8
+
+    monkeypatch.setattr(DiffusionLoRAManager, "_load_startup_composition", _load_prefused)
+    monkeypatch.setattr(
+        DiffusionLoRAManager,
+        "_activate_composition",
+        lambda manager, composition: setattr(manager, "_active_composition", composition),
+    )
+    monkeypatch.setattr(
+        DiffusionLoRAManager,
+        "_fuse_active_composition",
+        lambda manager: setattr(manager, "_active_composition", ()),
+    )
+    monkeypatch.setattr(DiffusionLoRAManager, "_discard_startup_adapter", lambda *_args: None)
+
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        prefused_loras=prefused,
+    )
+
+    assert pipeline.transformer.foo is base_layer
+    assert manager._lora_modules == {}
+    assert manager._max_lora_rank == 0
 
 
 def _dummy_lora_request(adapter_id: int, path: str | None = None) -> LoRARequest:

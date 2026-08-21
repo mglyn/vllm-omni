@@ -93,6 +93,17 @@ def test_dynamic_registration_rejects_scale_ids_and_duplicate_names() -> None:
         )
 
 
+def test_lora_specs_reject_unknown_and_ambiguous_fields() -> None:
+    with pytest.raises(ValueError, match="unknown field.*sclae"):
+        parse_lora_adapter_specs(['{"path":"/tmp/adapter-a","sclae":0.5}'])
+    with pytest.raises(ValueError, match="multiple path fields"):
+        parse_lora_adapter_specs(['{"path":"/tmp/adapter-a","lora_path":"/tmp/adapter-b"}'])
+    with pytest.raises(ValueError, match="unknown field.*sclae"):
+        parse_lora_request({"name": "style", "sclae": 0.5})
+    with pytest.raises(ValueError, match="multiple scale fields"):
+        parse_lora_request({"name": "style", "scale": 1.0, "lora_scale": 0.5})
+
+
 def test_dynamic_registration_uses_unique_names_and_private_ids() -> None:
     registry = parse_lora_registration_specs(
         [

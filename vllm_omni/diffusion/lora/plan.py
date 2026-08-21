@@ -59,7 +59,7 @@ class SupportsDiffusionLoRAPlan(Protocol):
     """Optional model/pipeline extension point consumed by the shared backend.
 
     The model describes checkpoint normalization and logical-to-physical layer
-    binding. The backend remains the sole owner of caching, composition,
+    binding. The backend remains the sole owner of registration, composition,
     dynamic execution, and prefusion mathematics.
     """
 

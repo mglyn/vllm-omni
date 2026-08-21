@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import get_args
 
@@ -35,6 +35,7 @@ from vllm_omni.diffusion.lora.types import (
 )
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
+    _get_submodule,
     _match_target_modules,
     from_layer_diffusion,
 )
@@ -130,6 +131,8 @@ class DiffusionLoRAManager:
             self._fuse_active_composition()
             for adapter in prefused_loras:
                 self._discard_startup_adapter(adapter.adapter_id)
+            if not dynamic_loras:
+                self._unwrap_lora_modules()
 
         if dynamic_loras:
             registered_composition = tuple(WeightedLoRA(request=request) for request in dynamic_loras)
@@ -166,6 +169,24 @@ class DiffusionLoRAManager:
             if not callable(move_runtime):
                 raise TypeError(f"{type(lora_layer).__name__} cannot place LoRA runtime buffers explicitly")
             move_runtime(self.device)
+
+    def _unwrap_lora_modules(self) -> None:
+        """Restore dense layers after prefusion when no runtime LoRA is needed."""
+
+        for full_module_name, lora_layer in tuple(self._lora_modules.items()):
+            component_name, separator, module_name = full_module_name.partition(".")
+            if not separator or not module_name:
+                raise RuntimeError(f"Invalid managed LoRA module name: {full_module_name!r}")
+            component = getattr(self.pipeline, component_name)
+            if component.get_submodule(module_name) is not lora_layer:
+                raise RuntimeError(f"Managed LoRA module {full_module_name!r} no longer matches the pipeline")
+            base_layer = getattr(lora_layer, "base_layer", None)
+            if not isinstance(base_layer, nn.Module):
+                raise TypeError(f"Managed LoRA module {full_module_name!r} has no base layer to restore")
+            replace_submodule(component, module_name, base_layer)
+
+        self._lora_modules.clear()
+        self._max_lora_rank = 0
 
     def _compute_supported_lora_modules(self) -> set[str]:
         """Compute supported LoRA module suffixes for this pipeline.
@@ -375,10 +396,8 @@ class DiffusionLoRAManager:
         )
 
         for component_name in self._component_names():
-            if not hasattr(self.pipeline, component_name):
-                continue
-            component = getattr(self.pipeline, component_name)
-            if not isinstance(component, nn.Module):
+            component = _get_submodule(self.pipeline, component_name)
+            if component is None:
                 continue
 
             # Collect replacements first to avoid mutating the module tree
@@ -488,29 +507,57 @@ class DiffusionLoRAManager:
 
         return min(allowed_ranks)
 
+    def _component_relative_name(self, full_module_name: str) -> str:
+        for component_name in sorted(self._component_names(), key=len, reverse=True):
+            if full_module_name.startswith(f"{component_name}."):
+                return full_module_name[len(component_name) + 1 :]
+        return full_module_name
+
+    def _find_lora_weights(
+        self,
+        lora_model: LoRAModel,
+        full_module_name: str,
+    ) -> tuple[str | None, LoRALayerWeights | PackedLoRALayerWeights | None]:
+        names = (
+            full_module_name,
+            self._component_relative_name(full_module_name),
+            full_module_name.rsplit(".", 1)[-1],
+        )
+        for name in dict.fromkeys(names):
+            if (weights := lora_model.get_lora(name)) is not None:
+                return name, weights
+        return None, None
+
     def _get_lora_weights(
         self,
         lora_model: LoRAModel,
         full_module_name: str,
     ) -> LoRALayerWeights | PackedLoRALayerWeights | None:
-        """Best-effort lookup for LoRA weights by name.
+        return self._find_lora_weights(lora_model, full_module_name)[1]
 
-        Tries:
-        - Full module name (e.g. transformer.blocks.0.attn.to_qkv)
-        - Relative name without the top-level component (e.g. blocks.0.attn.to_qkv)
-        - Suffix-only name (e.g. to_qkv)
-        """
-        lora_weights = lora_model.get_lora(full_module_name)
-        if lora_weights is not None:
-            return lora_weights
+    def _validate_lora_bindings(self, loaded: LoadedDiffusionLoRA) -> None:
+        bindings: dict[str, list[str]] = {}
+        for full_module_name, lora_layer in self._lora_modules.items():
+            name, _ = self._find_lora_weights(loaded.model, full_module_name)
+            if name is not None:
+                bindings.setdefault(name, []).append(full_module_name)
+                continue
 
-        component_relative_name = full_module_name.split(".", 1)[-1] if "." in full_module_name else full_module_name
-        lora_weights = lora_model.get_lora(component_relative_name)
-        if lora_weights is not None:
-            return lora_weights
+            n_slices = int(getattr(lora_layer, "n_slices", 1))
+            prefix, _, packed_suffix = full_module_name.rpartition(".")
+            for slice_idx, suffix in enumerate(self._get_packed_sublayer_suffixes(packed_suffix, n_slices) or ()):
+                sub_name = f"{prefix}.{suffix}" if prefix else suffix
+                name, _ = self._find_lora_weights(loaded.model, sub_name)
+                if name is not None:
+                    bindings.setdefault(name, []).append(f"{full_module_name}[{slice_idx}]")
 
-        module_suffix = full_module_name.split(".")[-1]
-        return lora_model.get_lora(module_suffix)
+        unbound = [name for name in loaded.model.loras if name not in bindings]
+        ambiguous = {name: targets for name, targets in bindings.items() if len(targets) > 1}
+        if unbound or ambiguous:
+            raise ValueError(
+                "LoRA weights must each bind to exactly one installed module or packed slice: "
+                f"unbound={unbound[:3]}, ambiguous={dict(list(ambiguous.items())[:3])}"
+            )
 
     def _get_layer_slices(
         self,
@@ -822,6 +869,7 @@ class DiffusionLoRAManager:
 
         loaded = self._loader.load_adapter(lora_request)
         self._replace_layers_with_lora(loaded.peft_helper)
+        self._validate_lora_bindings(loaded)
         self._validate_auxiliary_update_bindings(loaded)
         self._registered_adapters[adapter_id] = loaded
         self._adapter_requests[adapter_id] = lora_request

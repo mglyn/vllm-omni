@@ -32,16 +32,23 @@ def _parse_single_lora_request(lora_body: Any) -> tuple[LoRARequest, float | Non
         raise ValueError("Invalid lora field: expected an object or an array of objects.")
 
     path_fields = ("local_path", "path", "lora_path", "lora_local_path")
+    int_id_fields = ("int_id", "lora_int_id")
+    allowed_fields = {"name", "scale", "lora_scale", *path_fields, *int_id_fields}
+    unknown_fields = set(lora_body) - allowed_fields
+    if unknown_fields:
+        fields = ", ".join(sorted(map(repr, unknown_fields)))
+        raise ValueError(f"Invalid lora object: unknown field(s): {fields}.")
     if any(lora_body.get(field) is not None for field in path_fields):
         raise ValueError(
             "Request-level LoRA paths are not accepted. Register the adapter with "
             "--dynamic-lora at server startup, then select it by name."
         )
 
-    lora_scale = lora_body.get("scale")
-    if lora_scale is None:
-        lora_scale = lora_body.get("lora_scale")
-    if any(lora_body.get(field) is not None for field in ("int_id", "lora_int_id")):
+    scale_fields = [field for field in ("scale", "lora_scale") if lora_body.get(field) is not None]
+    if len(scale_fields) > 1:
+        raise ValueError(f"Invalid lora object: multiple scale fields were provided: {scale_fields}.")
+    lora_scale = lora_body[scale_fields[0]] if scale_fields else None
+    if any(lora_body.get(field) is not None for field in int_id_fields):
         raise ValueError("Invalid lora object: int_id is internal; select a registered adapter by name.")
     lora_name = lora_body.get("name")
     if not isinstance(lora_name, str) or not lora_name.strip():

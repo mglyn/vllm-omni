@@ -20,6 +20,7 @@ import PIL.Image
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -197,6 +198,7 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        self._get_dynamic_lora_registry()
         # Set after the paged-KV profile request has gone through model-owned
         # preprocessing. Real requests are admitted only within this measured
         # activation envelope: (max execution sequences, max seq_len,
@@ -771,10 +773,7 @@ class DiffusionEngine:
         if not composition:
             return
 
-        registered = {
-            request.lora_name: request
-            for request in parse_lora_registration_specs(getattr(self.od_config, "dynamic_lora", None))
-        }
+        registered = self._get_dynamic_lora_registry()
         unavailable = [
             adapter
             for adapter in composition
@@ -795,6 +794,18 @@ class DiffusionEngine:
             for adapter in composition
         )
         sampling.lora_request, sampling.lora_scale = split_lora_composition(resolved)
+
+    def _get_dynamic_lora_registry(self) -> dict[str, LoRARequest]:
+        """Return the deployment registry, parsing immutable config only once."""
+
+        registry = getattr(self, "_dynamic_lora_registry", None)
+        if registry is None:
+            registry = {
+                request.lora_name: request
+                for request in parse_lora_registration_specs(getattr(self.od_config, "dynamic_lora", None))
+            }
+            self._dynamic_lora_registry = registry
+        return registry
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
         """Keep admitted paged-KV requests within the profiled activation shape."""

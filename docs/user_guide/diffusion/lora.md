@@ -4,12 +4,18 @@ vLLM-Omni provides a shared LoRA backend for diffusion pipelines. It supports
 startup fusion, dynamic execution, request-scoped adapter selection, weighted
 multi-adapter composition, and an immutable startup registry.
 
-For a linear layer with base weight $W$, adapter matrices $A_i$ and $B_i$, and
-user scales $s_i$, both execution modes implement:
+For one linear layer, adapter $i$ may provide a low-rank update $B_iA_i$ and an
+optional per-layer bias update $d_i$. For prefused adapters $P$ and dynamic
+adapters $D$, both execution modes share this definition:
 
 $$
-y = \left(W + \sum_i s_i B_i A_i\right)x
+y = \left(W + \sum_{i \in P} s_i B_i A_i\right)x
+  + \left(b + \sum_{i \in P} s_i d_i\right)
+  + \sum_{j \in D} s_j\left(B_j A_j x + d_j\right)
 $$
+
+An adapter without a bias update has $d_i = 0$. One adapter may carry separate
+bias updates for many target layers; $d_i$ is not one global bias.
 
 The modes differ in when this expression is evaluated:
 
@@ -136,22 +142,11 @@ to the base dtype once. The fused contribution is permanent for the lifetime
 of the process: request-level `lora=[]` disables only dynamic adapters and
 cannot remove a prefused delta.
 
-Prefused and dynamic adapters may be used together. The resulting weight is:
-
-$$
-W' = W + \sum_{i \in P} s_i B_i A_i
-$$
-
-and a request evaluates:
-
-$$
-y = W'x + \sum_{j \in D} s_j B_j A_j x
-$$
-
-Do not specify the same adapter in both sets unless applying its delta twice
-is intentional. Prefusion is rejected for quantized diffusion weights because
-their serialized or runtime representation is not a dense floating-point
-weight that can safely receive an in-place LoRA delta.
+Prefused and dynamic adapters may be used together according to the equation
+above. Do not specify the same adapter in both sets unless applying its delta
+twice is intentional. Prefusion is rejected for quantized diffusion weights
+because their serialized or runtime representation is not a dense
+floating-point weight that can safely receive an in-place LoRA delta.
 
 ## Compile, offload, and registry capacity
 
@@ -182,6 +177,80 @@ Loading an acceleration or distilled LoRA does not change timesteps, guidance,
 the scheduler, or the number of denoising steps. Set those independently
 through deployment defaults or request sampling parameters according to the
 adapter's published usage instructions.
+
+## Model integration and extension points
+
+The shared backend owns startup loading, immutable registration, weighted
+composition, layer installation, dynamic execution, and prefusion. Models only
+describe checkpoint normalization and how logical adapter tensors bind to their
+modules:
+
+| Model interface | Model-provided fields | Shared backend behavior |
+|---|---|---|
+| `get_lora_load_plan(adapter_path, tensor_keys)` | PEFT metadata, `weights_mapper`, `state_dict_converter` | Download, deserialize, validate, and register |
+| `get_lora_apply_plan()` | `component_names`, `target_modules`, `packed_modules_mapping` | Install TP-aware layers, bind packed slices, compose, activate, and fuse |
+
+The generic PEFT-directory path normally needs no model-specific load plan. A
+raw single-file checkpoint can return `DiffusionLoRALoadPlan` when its keys or
+layout need conversion. Its `state_dict_converter` returns either normalized A/B
+tensors or `ConvertedLoRAState`, which additionally carries a tuple of typed
+auxiliary updates.
+
+`get_lora_load_plan()` may be implemented by the pipeline or one of its declared
+components; incompatible plans are rejected. `get_lora_apply_plan()` is the
+pipeline's declarative binding contract. These plans customize checkpoint
+recognition, alpha handling, tensor conversion, component routing, target
+selection, and packed-projection mapping. They do not inject arbitrary forward
+callbacks or take ownership of registration and composition.
+
+The backend currently implements `AdditiveBiasUpdate`. A converter may return
+any number of these updates, one for each affected module or packed slice. Each
+is shape-checked, scaled with its adapter, and supported by both dynamic and
+prefused execution. New auxiliary mathematics requires a new typed update plus
+shared validation and application support; unknown update types and unsupported
+nonzero dense deltas are rejected.
+
+### Wan example
+
+Wan uses both plans without adding a separate backend. The load plan recognizes
+the publication format, folds alpha, converts keys, and routes Wan2.2
+`high_noise` and `low_noise` files to `transformer` and `transformer_2`. Its
+converter returns ordinary A/B tensors plus every supported `.lora_B.bias` as a
+separate typed update:
+
+```python
+def convert(state_dict):
+    # Wan-specific alpha, key, and component normalization occurs first.
+    lora_tensors = {}
+    auxiliary_updates = []
+    for key, tensor in state_dict.items():
+        if key.endswith(".lora_B.bias"):
+            auxiliary_updates.append(
+                AdditiveBiasUpdate(
+                    module_name=key.removesuffix(".lora_B.bias"),
+                    tensor=tensor,
+                )
+            )
+        else:
+            lora_tensors[key] = tensor
+    return ConvertedLoRAState(
+        lora_tensors=lora_tensors,
+        auxiliary_updates=tuple(auxiliary_updates),
+    )
+
+return DiffusionLoRALoadPlan(
+    peft_config={
+        "lora_alpha": None,
+        "target_modules": list(_WAN_LORA_TARGETS),
+    },
+    state_dict_converter=convert,
+)
+```
+
+Its apply plan declares both transformer components, supported target modules,
+and the logical `to_q`/`to_k`/`to_v` to packed `to_qkv` mapping. MiniMax-H3 uses
+the same interfaces for metadata alpha, key mapping, and FFN row reordering;
+Qwen-Image uses them for publication-format conversion and packed QKV binding.
 
 ## Offline inference
 

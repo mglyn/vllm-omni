@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for multistage generation input construction."""
 
 from __future__ import annotations
@@ -92,6 +93,25 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_build_multistage_generation_inputs_rejects_invalid_lora(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+    from vllm_omni.errors import OmniClientError
+
+    engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion", is_comprehension=False)],
+        default_sampling_params_list=[OmniDiffusionSamplingParams()],
+    )
+    with pytest.raises(OmniClientError, match="lora object"):
+        OmniOpenAIServingChat._build_multistage_generation_inputs(
+            serving_chat,
+            engine=engine,
+            prompt="draw a robot",
+            extra_body={"lora": {"int_id": 7}},
+            reference_images=[],
+            gen_params=OmniDiffusionSamplingParams(),
+        )
 
 
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):

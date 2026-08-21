@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -15,15 +15,12 @@ from vllm_omni.diffusion.lora.plan import (
     DiffusionAdapterUpdate,
     DiffusionLoRALoadPlan,
 )
+from vllm_omni.diffusion.lora.utils import fold_diffusers_lora_alpha
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class _CustomLoadPlanPipeline(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.custom_dit = torch.nn.Module()
-
+class _CustomLoadPlanComponent(torch.nn.Module):
     def get_lora_load_plan(
         self,
         adapter_path: str,
@@ -51,12 +48,19 @@ class _CustomLoadPlanPipeline(torch.nn.Module):
         )
 
 
+class _CustomLoadPlanPipeline(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.container = torch.nn.Module()
+        self.container.custom_dit = _CustomLoadPlanComponent()
+
+
 def test_model_owned_load_plan_describes_custom_checkpoint() -> None:
     loader = DiffusionLoRAAdapterLoader(
         pipeline=_CustomLoadPlanPipeline(),
         dtype=torch.bfloat16,
         expected_lora_modules={"proj"},
-        component_names=("custom_dit",),
+        component_names=("container.custom_dit",),
     )
     tensors = {
         "vendor.proj.down": torch.ones(2, 4),
@@ -82,7 +86,7 @@ def test_model_converter_returns_typed_auxiliary_updates() -> None:
         pipeline=_CustomLoadPlanPipeline(),
         dtype=torch.bfloat16,
         expected_lora_modules={"proj"},
-        component_names=("custom_dit",),
+        component_names=("container.custom_dit",),
     )
     bias = torch.ones(4)
     tensors = {
@@ -113,3 +117,21 @@ def test_loader_rejects_unimplemented_auxiliary_update() -> None:
 
     with pytest.raises(ValueError, match="unsupported auxiliary update _UnsupportedUpdate"):
         DiffusionLoRAAdapterLoader._validate_auxiliary_updates("custom.safetensors", (update,))
+
+
+@pytest.mark.parametrize(
+    ("alpha", "lora_a", "match"),
+    [
+        (torch.tensor([1.0, 2.0]), torch.ones(1, 2), "one scalar"),
+        (torch.tensor(float("nan")), torch.ones(1, 2), "finite"),
+        (torch.tensor(1.0), torch.empty(0, 2), "positive rank"),
+    ],
+)
+def test_diffusers_alpha_validation(alpha: torch.Tensor, lora_a: torch.Tensor, match: str) -> None:
+    state = {
+        "proj.alpha": alpha,
+        "proj.lora_A.weight": lora_a,
+        "proj.lora_B.weight": torch.empty(2, lora_a.shape[0]),
+    }
+    with pytest.raises(ValueError, match=match):
+        fold_diffusers_lora_alpha(state)

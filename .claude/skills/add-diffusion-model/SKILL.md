@@ -105,7 +105,7 @@ Do not add checkpoint conversion or fusion lifecycle code to the common
 backend. If the model publishes non-PEFT keys, custom alpha normalization,
 typed updates, or special component/packed-module routing, implement
 `get_lora_load_plan()` and `get_lora_apply_plan()` on the pipeline or model.
-Follow the [Diffusion LoRA design](../../../docs/design/feature/diffusion_lora.md)
+Follow the [Diffusion LoRA guide](../../../docs/user_guide/diffusion/lora.md)
 and the MiniMax-H3, Qwen-Image, or Wan model-owned plans. The shared manager
 continues to own loading, caching, composition, dynamic execution, and
 prefusion.

@@ -9,6 +9,7 @@ directory). They cover a basic functional smoke plus the layerwise-CPU-offload p
 via ``SupportsComponentDiscovery`` / ``_layerwise_offload_blocks_attrs``.
 """
 
+import json
 import os
 
 import numpy as np
@@ -127,7 +128,7 @@ def _generate(handler: OmniRunnerHandler, lora_request: LoRARequestInput, lora_s
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize(
     "omni_runner",
-    [(MODEL, None, {"dynamic_lora": [{"path": LORA, "name": "darkbrush"}]})],
+    [(MODEL, None, {"dynamic_lora": [json.dumps({"path": LORA, "name": "darkbrush"})]})],
     indirect=True,
 )
 def test_krea2_lora(omni_runner_handler: OmniRunnerHandler) -> None:
