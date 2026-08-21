@@ -84,22 +84,21 @@ vllm serve MiniMaxAI/MiniMax-H3 \
   --omni \
   --trust-remote-code \
   --task-type fl2va \
-  --dynamic-lora "$TURBO_LORA=1.0" \
+  --dynamic-lora "{\"path\":\"$TURBO_LORA\",\"name\":\"turbo\"}" \
   --default-sampling-params \
     '{"0":{"num_inference_steps":5,"extra_args":{"flow_shift":6.0,"audio_flow_shift":3.0}}}'
 ```
 
-`--dynamic-lora` installs and enables the adapter before compilation without
-mutating the dense checkpoint. It supports request-scoped selection and
+`--dynamic-lora` registers and loads the inactive adapter before compilation
+without mutating the dense checkpoint. It supports request-scoped selection,
 reweighting, weighted composition, and quantized base weights. A request-level
 `num_inference_steps` still overrides the deployment default; the LoRA backend
 never changes the pipeline's sampling plan. MiniMax-H3 counts sigma grid
 points, including terminal zero, so `5` produces the four Transformer
 evaluations used by the published Turbo recipe.
 
-Omitting `lora` uses the startup dynamic composition. Requests may disable it
-with `lora=[]`, or explicitly select and reweight Turbo. For the synchronous
-video endpoint, pass the selection as multipart JSON:
+Omitting `lora` runs without a dynamic adapter. For the synchronous video
+endpoint, explicitly select and reweight Turbo with multipart JSON:
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8000/v1/videos/sync" \
@@ -108,12 +107,12 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/videos/sync" \
   -F 'num_inference_steps=5' \
   -F 'flow_shift=6' \
   -F 'extra_params={"audio_flow_shift":3.0}' \
-  -F "lora={\"name\":\"turbo\",\"path\":\"$TURBO_LORA\",\"scale\":1.0}"
+  -F 'lora={"name":"turbo","scale":1.0}'
 ```
 
 With compile or offload enabled, preload the adapter before the graph is fixed.
-A request may then select, disable (`lora=[]`), or reweight it without changing
-its sampling step count.
+A request may then select or reweight it without changing its sampling step
+count; `lora=[]` explicitly selects no dynamic adapter.
 
 The H3 integration formally supports the Diffusers-format FL2VA adapters in
 `lightx2v/Minimax-h3-Turbo`. Download and pass a specific safetensors file: the

@@ -295,6 +295,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+            # LoRA runtime tensors are model weights for sleep/wake purposes.
+            # Allocate them in the same pool as the dense checkpoint: the
+            # allocator deliberately rejects entering a second weights pool
+            # after the first one already owns live allocations.
+            self.init_lora_manager()
         time_after_load = time.perf_counter()
 
         logger.info(
@@ -320,9 +325,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
-
-        with get_memory_context():
-            self.init_lora_manager()
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(
