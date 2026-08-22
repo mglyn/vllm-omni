@@ -479,6 +479,13 @@ class DiffusionWorker:
         else:
             raise ValueError(f"Unknown LoRA backend: {lora_backend}. Available choices: {LoRABackend.__members__}")
 
+    def _release_lora_runtime_references(self) -> None:
+        """Drop references that can keep the current pipeline alive."""
+        self.lora_manager = None
+        self.diffusion_lora_runtime = None
+        if self.model_runner is not None:
+            self.model_runner.diffusion_lora_runtime = None
+
     def _activate_lora_state(
         self,
         lora_request: LoRARequest | None,
@@ -900,6 +907,10 @@ class CustomPipelineWorkerExtension:
         Args:
             custom_pipeline_args: Dictionary of arguments for custom pipeline initialization
         """
+
+        # LoRA managers and executors retain wrapped modules. Release them
+        # before deleting the pipeline so the old checkpoint can be reclaimed.
+        self._release_lora_runtime_references()
 
         # Clean up old pipeline
         if self.model_runner.pipeline is not None:
