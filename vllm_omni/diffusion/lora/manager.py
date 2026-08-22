@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 import time
@@ -289,29 +289,41 @@ class DiffusionLoRAManager:
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
         logger.debug("Resolved LoRA path: %s", lora_path)
 
-        peft_helper = PEFTHelper.from_local_dir(
-            lora_path,
-            max_position_embeddings=None,  # no need in diffusion
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-        )
+        model_loader = getattr(self.pipeline, "_load_diffusion_lora_adapter", None)
+        loaded = None
+        if callable(model_loader):
+            loaded = model_loader(
+                lora_request=lora_request,
+                lora_path=lora_path,
+                dtype=self.dtype,
+            )
+
+        if loaded is None:
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                max_position_embeddings=None,  # no need in diffusion
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+            )
+
+            lora_model = LoRAModel.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules=self._expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",  # consistent w/ vllm's behavior
+                dtype=self.dtype,
+                model_vocab_size=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=None,
+            )
+        else:
+            lora_model, peft_helper = loaded
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
             peft_helper.r,
             peft_helper.lora_alpha,
             peft_helper.target_modules,
-        )
-
-        lora_model = LoRAModel.from_local_checkpoint(
-            lora_path,
-            expected_lora_modules=self._expected_lora_modules,
-            peft_helper=peft_helper,
-            lora_model_id=lora_request.lora_int_id,
-            device="cpu",  # consistent w/ vllm's behavior
-            dtype=self.dtype,
-            model_vocab_size=None,
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            weights_mapper=None,
         )
 
         logger.info(
@@ -603,10 +615,15 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(0)
                     continue
 
-                total = sum(output_slices)
+                # LoRAModel stores the unsharded checkpoint tensors. Column-
+                # parallel wrappers localize each full output slice inside
+                # set_lora(), so split B by global rather than rank-local rows.
+                tp_size = int(getattr(lora_layer, "tp_size", 1))
+                global_output_slices = [int(size) * tp_size for size in output_slices]
+                total = sum(global_output_slices)
                 if lora_weights.lora_b.shape[0] != total:
                     logger.warning(
-                        "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
+                        "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != expected global output rows=%d",
                         full_module_name,
                         lora_weights.lora_b.shape[0],
                         total,
@@ -614,7 +631,7 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(0)
                     continue
 
-                b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
+                b_splits = list(torch.split(lora_weights.lora_b, global_output_slices, dim=0))
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)

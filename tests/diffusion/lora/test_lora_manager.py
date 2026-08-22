@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyLoRALayer:
-    def __init__(self, n_slices: int, output_slices: tuple[int, ...]):
+    def __init__(self, n_slices: int, output_slices: tuple[int, ...], tp_size: int = 1):
         self.n_slices = n_slices
         self.output_slices = output_slices
+        self.tp_size = tp_size
         self.set_calls: list[
             tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
@@ -232,6 +233,47 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
     b0, b1, b2 = lora_b_list
     assert b0.shape[0] == 2 and b1.shape[0] == 1 and b2.shape[0] == 1
     assert torch.allclose(torch.cat([b0, b1, b2], dim=0), B * 0.5)
+
+
+def test_lora_manager_splits_fused_lora_by_global_tp_output_slices():
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    packed_layer = _DummyLoRALayer(n_slices=2, output_slices=(2, 2), tp_size=2)
+    manager._lora_modules = {"transformer.blocks.0.mlp.fc1": packed_layer}
+
+    rank = 2
+    lora_a = torch.ones((rank, 4))
+    lora_b = torch.arange(16, dtype=torch.bfloat16).view(8, rank)
+    lora = LoRALayerWeights(
+        module_name="transformer.blocks.0.mlp.fc1",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=lora_a,
+        lora_b=lora_b,
+    )
+    manager._registered_adapters = {
+        1: type(
+            "LM",
+            (),
+            {
+                "id": 1,
+                "loras": {"transformer.blocks.0.mlp.fc1": lora},
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+    }
+
+    manager._activate_adapter(1, scale=0.5)
+
+    lora_a_list, lora_b_list = packed_layer.set_calls[0]
+    assert isinstance(lora_a_list, list)
+    assert isinstance(lora_b_list, list)
+    assert [piece.shape[0] for piece in lora_b_list] == [4, 4]
+    torch.testing.assert_close(torch.cat(lora_b_list), lora_b * 0.5)
 
 
 def test_lora_manager_activates_packed_lora_from_sublayers():
