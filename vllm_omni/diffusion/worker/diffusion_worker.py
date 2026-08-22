@@ -679,12 +679,12 @@ class DiffusionWorker:
         self._activate_lora_state(lora_request, lora_scale, diffusion_loras)
 
     def remove_lora(self, adapter_id: int) -> bool:
-        return self.lora_manager.remove_adapter(adapter_id)
+        return self._require_legacy_lora_manager("remove_lora").remove_adapter(adapter_id)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         # NOTE (Alex): We have not implemented the API routing
         # for the frontend server yet.
-        return self.lora_manager.add_adapter(lora_request)
+        return self._require_legacy_lora_manager("add_lora").add_adapter(lora_request)
 
     def submit_interaction(
         self,
@@ -696,10 +696,19 @@ class DiffusionWorker:
         self.model_runner.submit_interaction(request_id, interaction)
 
     def list_loras(self) -> list[int]:
-        return self.lora_manager.list_adapters()
+        return self._require_legacy_lora_manager("list_loras").list_adapters()
 
     def pin_lora(self, adapter_id: int) -> bool:
-        return self.lora_manager.pin_adapter(adapter_id)
+        return self._require_legacy_lora_manager("pin_lora").pin_adapter(adapter_id)
+
+    def _require_legacy_lora_manager(self, operation: str) -> DiffusionLoRAManager:
+        if getattr(self, "diffusion_lora_runtime", None) is not None:
+            raise NotImplementedError(
+                f"{operation} is not supported by Diffusion LoRA Runtime; adapters are immutable after startup"
+            )
+        if self.lora_manager is None:
+            raise RuntimeError("Legacy diffusion LoRA manager is not initialized")
+        return self.lora_manager
 
     def sleep(self, level: int = 1) -> int:
         """

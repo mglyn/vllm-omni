@@ -5,13 +5,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.request_scheduler import (
     build_request_batch_sampling_params_key,
 )
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
@@ -76,3 +79,36 @@ def test_runtime_config_rejects_legacy_lora_path():
             lora_path="legacy",
             parallel_config=SimpleNamespace(world_size=1),
         )
+
+
+def test_engine_rejects_unavailable_lora_before_admission(mocker):
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(enable_diffusion_lora=True)
+    engine._registered_diffusion_lora_names = frozenset({"turbo"})
+    engine.pre_process_func = mocker.Mock()
+    engine._diffusion_kv_profile_limits = None
+
+    with pytest.raises(OmniClientError, match="Unknown diffusion LoRA"):
+        engine._prepare_request_for_admission(_request("unknown", 1.0))
+    engine.pre_process_func.assert_not_called()
+
+    engine.od_config.enable_diffusion_lora = False
+    with pytest.raises(OmniClientError, match="did not enable"):
+        engine._prepare_request_for_admission(_request("turbo", 1.0))
+    engine.pre_process_func.assert_not_called()
+
+
+def test_new_runtime_rejects_legacy_lora_management(mocker):
+    worker = object.__new__(DiffusionWorker)
+    worker.diffusion_lora_runtime = object()
+    worker.lora_manager = None
+
+    calls = (
+        ("add_lora", (mocker.Mock(),)),
+        ("remove_lora", (1,)),
+        ("list_loras", ()),
+        ("pin_lora", (1,)),
+    )
+    for method_name, args in calls:
+        with pytest.raises(NotImplementedError, match="immutable after startup"):
+            getattr(worker, method_name)(*args)
