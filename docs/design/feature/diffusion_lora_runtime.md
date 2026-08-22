@@ -7,7 +7,8 @@ request-level LoRA selection. It is introduced in parallel with the legacy
 diffusion LoRA facilities. Existing models, examples, and request fields keep
 their legacy behavior until they are migrated explicitly.
 
-The first integration is MiniMax-H3 FL2VA Turbo. This initial scope supports:
+The first integration is MiniMax-H3 FL2VA, led by its Turbo deployment. This
+initial scope supports:
 
 - dynamic low-rank updates;
 - immutable startup registration;
@@ -75,6 +76,24 @@ admission. An empty or omitted composition selects the base model.
 The registry is not a default composition: registering an adapter makes it
 available but does not activate it automatically.
 
+Checkpoint format and adapter identity are independent. A model selects a
+decoder from checkpoint metadata and validates the tensors; it never selects a
+decoder from the user-provided deployment name. Multiple registered adapters
+may therefore share one format decoder while retaining distinct names, weight
+banks, and request scales.
+
+For example, a service can register two model-compatible adapters and compose
+them by name at request time:
+
+```bash
+--diffusion-lora '{"name":"fast","path":"/models/fast.safetensors"}' \
+--diffusion-lora '{"name":"style","path":"/models/style.safetensors"}'
+```
+
+```json
+{"loras":[{"name":"fast","scale":1.0},{"name":"style","scale":0.7}]}
+```
+
 ## Composition and execution
 
 For a base linear transform `W` and selected low-rank updates `(A_i, B_i)`, the
@@ -124,10 +143,12 @@ The first implementation has the following feature boundaries:
 
 ## MiniMax-H3 integration
 
-MiniMax-H3 owns the LightX2V Turbo v1.0 conversion. Its loader validates the
-rank-128, alpha-128 contract, maps Diffusers targets to native H3 modules,
-binds Q/K/V updates to packed QKV projections, and swaps the Diffusers FFN
-`lora_B` row order from `[value; gate]` to native `[gate; up]`.
+MiniMax-H3 owns both the LightX2V Turbo v1.0 conversion and normalization of
+the native H3 FL2VA fused-QKV layout. The Turbo path validates its rank-128,
+alpha-128 contract and swaps the Diffusers FFN `lora_B` row order from
+`[value; gate]` to native `[gate; up]`; the native path reads its declared rank
+and splits fused QKV updates into logical Q/K/V bindings. This format support
+does not endorse or register a specific third-party adapter.
 
 Sampling steps, flow shifts, task selection, and other recipe behavior remain
 pipeline/request concerns. Installing a Turbo adapter does not silently change
