@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Diffusion Worker for vLLM-Omni.
@@ -183,10 +183,12 @@ class DiffusionWorker:
         self.requested_memory: int | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
+        self.diffusion_lora_runtime: Any | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._step_diffusion_lora_state: dict[str, tuple[Any, ...]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -447,6 +449,11 @@ class DiffusionWorker:
         if self.model_runner.pipeline is None:
             return
 
+        self.diffusion_lora_runtime = self.model_runner.diffusion_lora_runtime
+        if getattr(self, "diffusion_lora_runtime", None) is not None:
+            self.lora_manager = None
+            return
+
         lora_path = self.od_config.lora_path
         if isinstance(lora_path, list) and len(lora_path) == 1:
             lora_path = lora_path[0]
@@ -471,6 +478,28 @@ class DiffusionWorker:
                 logger.warning("Pipeline does not support loading distilled LoRA weights for now.")
         else:
             raise ValueError(f"Unknown LoRA backend: {lora_backend}. Available choices: {LoRABackend.__members__}")
+
+    def _activate_lora_state(
+        self,
+        lora_request: LoRARequest | None,
+        lora_scale: float,
+        diffusion_loras: tuple[Any, ...],
+    ) -> None:
+        if getattr(self, "diffusion_lora_runtime", None) is not None:
+            if lora_request is not None:
+                raise ValueError("Legacy request LoRA cannot be combined with Diffusion LoRA Runtime")
+            self.diffusion_lora_runtime.activate(diffusion_loras)
+            return
+        if diffusion_loras:
+            raise ValueError("Request selected diffusion LoRAs, but the service did not enable Diffusion LoRA Runtime")
+        if self.lora_manager is None:
+            return
+        try:
+            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+        except Exception as exc:
+            if lora_request is not None:
+                raise
+            logger.warning("LoRA activation skipped: %s", exc)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.
@@ -547,13 +576,12 @@ class DiffusionWorker:
             req = new_req.req
             diffusion_kv_metadata = new_req.diffusion_kv_metadata
 
-        if self.lora_manager is not None:
-            try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
-            except Exception as exc:
-                if req.sampling_params.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+        sampling = req.sampling_params
+        self._activate_lora_state(
+            sampling.lora_request,
+            sampling.lora_scale,
+            getattr(sampling, "diffusion_loras", ()),
+        )
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
@@ -579,14 +607,13 @@ class DiffusionWorker:
         """Batch forward: LoRA activate once, delegate to model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         # LoRA: same adapter/scale within batch guaranteed by RequestBatchSamplingParamsKey.
-        if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
+        if scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
-            try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
-            except Exception as exc:
-                if sp.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+            self._activate_lora_state(
+                sp.lora_request,
+                sp.lora_scale,
+                getattr(sp, "diffusion_loras", ()),
+            )
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
         with ctx:
@@ -618,6 +645,7 @@ class DiffusionWorker:
         """
         for request_id in scheduler_output.finished_req_ids:
             self._step_lora_state.pop(request_id, None)
+            getattr(self, "_step_diffusion_lora_state", {}).pop(request_id, None)
 
         for new_req in scheduler_output.scheduled_new_reqs:
             sampling = new_req.req.sampling_params
@@ -625,24 +653,23 @@ class DiffusionWorker:
                 sampling.lora_request,
                 sampling.lora_scale,
             )
+            if getattr(self, "diffusion_lora_runtime", None) is not None:
+                self._step_diffusion_lora_state[new_req.request_id] = getattr(sampling, "diffusion_loras", ())
 
-        if self.lora_manager is None:
+        if self.lora_manager is None and getattr(self, "diffusion_lora_runtime", None) is None:
             return
 
         lora_request: LoRARequest | None = None
         lora_scale = 1.0
+        diffusion_loras: tuple[Any, ...] = ()
         for request_id in scheduler_output.scheduled_request_ids:
             entry = self._step_lora_state.get(request_id)
             if entry is not None:
                 lora_request, lora_scale = entry
+                diffusion_loras = getattr(self, "_step_diffusion_lora_state", {}).get(request_id, ())
                 break
 
-        try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
-        except Exception as exc:
-            if lora_request is not None:
-                raise
-            logger.warning("LoRA activation skipped: %s", exc)
+        self._activate_lora_state(lora_request, lora_scale, diffusion_loras)
 
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
