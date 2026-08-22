@@ -16,6 +16,7 @@ from vllm_omni.lora.request import LoRARequest
 
 _TURBO_RANK = 128
 _TURBO_ALPHA = 128
+_TURBO_FILENAME = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
 _LORA_A_SUFFIX = ".lora_A.default.weight"
 _LORA_B_SUFFIX = ".lora_B.default.weight"
 _TURBO_TARGETS = frozenset({"to_q", "to_k", "to_v", "out_proj", "fc1", "fc2"})
@@ -44,15 +45,8 @@ def _select_turbo_file(artifact_path: str | Path) -> Path | None:
     if not path.is_dir():
         return None
 
-    candidates = sorted(path.glob("*v1.0*.safetensors"))
-    if not candidates:
-        return None
-    if len(candidates) != 1:
-        raise ValueError(
-            "MiniMax-H3 Turbo v1.0 must resolve to exactly one safetensors "
-            f"file, found {[candidate.name for candidate in candidates]}"
-        )
-    return candidates[0]
+    candidate = path / _TURBO_FILENAME
+    return candidate if candidate.is_file() else None
 
 
 def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
@@ -115,6 +109,8 @@ def load_minimax_h3_turbo_lora(
         metadata = checkpoint.metadata() or {}
         if metadata.get("key_format") != "minimax-h3-diffusers":
             return None
+        if lora_file.name != _TURBO_FILENAME:
+            raise ValueError(f"MiniMax-H3 Turbo supports only {_TURBO_FILENAME!r}, got {lora_file.name!r}")
         raw_alpha = metadata.get("alpha")
         try:
             alpha = float(raw_alpha) if raw_alpha is not None else math.nan

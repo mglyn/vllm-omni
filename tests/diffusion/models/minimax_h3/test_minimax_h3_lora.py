@@ -87,7 +87,8 @@ def test_legacy_manager_uses_the_h3_model_loader_without_changing_its_interface(
 
 
 def test_h3_turbo_rejects_wrong_alpha_and_ref2va(tmp_path):
-    wrong_alpha = tmp_path / "turbo_v1.0.safetensors"
+    wrong_alpha = tmp_path / "wrong_alpha" / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+    wrong_alpha.parent.mkdir()
     _write_tiny_turbo(wrong_alpha, alpha="8")
     with pytest.raises(ValueError, match="requires alpha=128"):
         load_minimax_h3_turbo_lora(
@@ -97,7 +98,8 @@ def test_h3_turbo_rejects_wrong_alpha_and_ref2va(tmp_path):
             dtype=torch.float32,
         )
 
-    valid = tmp_path / "turbo_valid_v1.0.safetensors"
+    valid = tmp_path / "valid" / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+    valid.parent.mkdir()
     _write_tiny_turbo(valid)
     with pytest.raises(ValueError, match="supports FL2VA/T2VA only"):
         load_minimax_h3_turbo_lora(
@@ -106,6 +108,33 @@ def test_h3_turbo_rejects_wrong_alpha_and_ref2va(tmp_path):
             lora_path=valid,
             dtype=torch.float32,
         )
+
+
+def test_h3_turbo_accepts_only_the_declared_v1_artifact(tmp_path):
+    unsupported = tmp_path / "minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors"
+    _write_tiny_turbo(unsupported)
+
+    with pytest.raises(ValueError, match="supports only"):
+        load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(unsupported),
+            lora_path=unsupported,
+            dtype=torch.float32,
+        )
+
+    supported = tmp_path / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_turbo(supported)
+    # Directory resolution selects the declared artifact even when another
+    # v1.0 checkpoint is present beside it.
+    assert (
+        load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(tmp_path),
+            lora_path=tmp_path,
+            dtype=torch.float32,
+        )
+        is not None
+    )
 
 
 def test_non_h3_checkpoint_falls_back_to_the_generic_peft_loader(tmp_path):

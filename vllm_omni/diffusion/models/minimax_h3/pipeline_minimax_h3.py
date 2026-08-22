@@ -803,6 +803,8 @@ class MiniMaxH3Pipeline(
         self,
         requested: str | None,
         multi_modal_data: dict[str, Any],
+        *,
+        has_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -820,6 +822,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"checkpoint partition {self.partition!r} supports {sorted(self.supported_tasks)}, got task={task!r}"
             )
+        if task == "ref2va" and has_lora:
+            raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
         return task
 
     def _resolve_shape(
@@ -1677,7 +1681,11 @@ class MiniMaxH3Pipeline(
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
-        task = self._resolve_task(extra.get("task"), multi_modal_data)
+        task = self._resolve_task(
+            extra.get("task"),
+            multi_modal_data,
+            has_lora=sampling.lora_request is not None,
+        )
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
