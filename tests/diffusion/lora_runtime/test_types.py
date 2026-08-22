@@ -3,6 +3,7 @@
 
 import pytest
 
+from vllm_omni.diffusion.lora_runtime.loader import resolve_diffusion_lora_artifact
 from vllm_omni.diffusion.lora_runtime.types import (
     DiffusionLoRASelection,
     diffusion_lora_composition_key,
@@ -52,3 +53,16 @@ def test_composition_combines_by_name_and_rejects_paths():
 
     with pytest.raises(ValueError, match="unknown fields"):
         normalize_diffusion_lora_composition([{"name": "turbo", "path": "/tmp/turbo"}])
+
+
+def test_local_artifact_keeps_hf_snapshot_symlink_name(tmp_path):
+    blob = tmp_path / "extensionless-blob"
+    blob.touch()
+    published = tmp_path / "adapter.safetensors"
+    published.symlink_to(blob)
+
+    resolved = resolve_diffusion_lora_artifact(
+        parse_diffusion_lora_deployments([{"name": "turbo", "path": str(published)}])[0]
+    )
+    assert resolved == published.absolute()
+    assert resolved.suffix == ".safetensors"
