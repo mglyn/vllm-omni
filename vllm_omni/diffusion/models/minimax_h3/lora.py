@@ -20,6 +20,23 @@ _TURBO_FILENAME = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
 _LORA_A_SUFFIX = ".lora_A.default.weight"
 _LORA_B_SUFFIX = ".lora_B.default.weight"
 _TURBO_TARGETS = frozenset({"to_q", "to_k", "to_v", "out_proj", "fc1", "fc2"})
+_TURBO_RAW_TARGET_SUFFIXES = (
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "ff.net.0.proj",
+    "ff.net.2",
+)
+_TURBO_EXPECTED_RAW_TARGETS = frozenset(
+    f"{prefix}.{block_index}.{suffix}"
+    for prefix, block_count in (
+        ("transformer_blocks", 50),
+        ("token_refiner.refiner_blocks", 2),
+    )
+    for block_index in range(block_count)
+    for suffix in _TURBO_RAW_TARGET_SUFFIXES
+)
 _TURBO_TARGET_PATTERN = (
     r"^transformer\.(?:token_refiner\.blocks|blocks)\.\d+\."
     r"(?:attn\.(?:to_q|to_k|to_v|out_proj)|mlp\.(?:fc1|fc2))$"
@@ -52,6 +69,7 @@ def _select_turbo_file(artifact_path: str | Path) -> Path | None:
 def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
     tensors: dict[str, torch.Tensor] = {}
     pairs: dict[str, set[str]] = {}
+    raw_targets: set[str] = set()
     for name in checkpoint.keys():
         if name.endswith(_LORA_A_SUFFIX):
             raw_target = name[: -len(_LORA_A_SUFFIX)]
@@ -61,6 +79,7 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
             side = "b"
         else:
             raise ValueError(f"Unconsumed MiniMax-H3 Turbo tensor: {name!r}")
+        raw_targets.add(raw_target)
 
         mapped_name = _TURBO_WEIGHTS_MAPPER.apply_list([name])[0]
         mapped_target = mapped_name.rsplit(".lora_", 1)[0]
@@ -88,8 +107,13 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
     incomplete = sorted(target for target, sides in pairs.items() if sides != {"a", "b"})
     if incomplete:
         raise ValueError(f"Incomplete MiniMax-H3 Turbo LoRA pairs: {incomplete}")
-    if not tensors:
-        raise ValueError("MiniMax-H3 Turbo checkpoint contains no LoRA tensors")
+    missing = sorted(_TURBO_EXPECTED_RAW_TARGETS - raw_targets)
+    unexpected = sorted(raw_targets - _TURBO_EXPECTED_RAW_TARGETS)
+    if missing or unexpected:
+        raise ValueError(
+            "MiniMax-H3 Turbo target set does not match the supported v1.0 artifact: "
+            f"missing={len(missing)} {missing[:5]}, unexpected={len(unexpected)} {unexpected[:5]}"
+        )
     return tensors
 
 

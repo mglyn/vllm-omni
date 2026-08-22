@@ -65,19 +65,6 @@ On AMD ROCm, install without the `[fa4]` extra (FA4 is CUDA-only) and use
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
 
-### Turbo LoRA artifact
-
-MiniMax-H3 Turbo LoRA support is currently limited to the native Diffusers
-4-step FL2VA/T2VA v1.0 artifact below:
-
-```text
-lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
-```
-
-Download and pass that exact local file as the LoRA path. The similarly named
-8-step, ComfyUI, Ref2VA, and v1.1 artifacts are not interchangeable and are
-not supported by this integration.
-
 ## CPU MP4 response encoding
 
 For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
@@ -756,6 +743,10 @@ Omitting `quality` preserves the startup default: it uses the reference path
 normally, or the server-configured profile when the server was started with
 `--cache-backend cache_dit`.
 
+Turbo is independent of this quality switch: `quality` selects a Cache-DiT
+policy, while Turbo changes the active LoRA weights and sampling schedule. See
+[LoRA](#lora) below.
+
 The following result was measured on 4× NVIDIA H200 with SP4, text-encoder
 TP4, 1344×768, 124 frames, 24 FPS, and 50 inference steps. One full
 `lossless` warmup was excluded, followed by three fixed prompt/seed pairs in
@@ -771,6 +762,40 @@ balanced switch order.
 > resulting latency/quality trade-off may vary by hardware, topology, and
 > workload. The values above apply to this deployment and are not universal
 > guarantees. `lossless` remains the exact reference path.
+
+## LoRA
+
+### Turbo LoRA
+
+Only the native Diffusers 4-step FL2VA/T2VA v1.0 artifact is supported:
+
+```text
+lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+```
+
+Download only that file:
+
+```bash
+export TURBO_DIR=/path/to/minimax-h3-turbo
+export TURBO_FILE=minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
+export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
+```
+
+Add `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"` to
+one of the FL2VA server commands above. `--lora-path` preloads the adapter;
+each request still activates it and uses the published sampling settings:
+
+```bash
+-F 'num_inference_steps=4' \
+-F 'flow_shift=6' \
+-F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
+-F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
+```
+
+For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
+ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
+dynamic-only and does not support prefusion, DLO, or LoRA composition.
 
 ## Key parameters
 
