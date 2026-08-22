@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """LTX-2.5-specific distributed execution for the diffusion VAE decoder."""
 
@@ -21,12 +21,41 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 
-from .ltx2_diffusion_decoder import (
-    LTX2VideoDiffusionDecoderModel,
-    LTX2VideoDiffusionTilePlan,
-)
+from .ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _tile_intervals(length: int, tile_size: int, stride: int, min_size: int) -> list[tuple[int, int]]:
+    """Build overlapping intervals, merging a too-small trailing remnant."""
+    if length <= tile_size:
+        return [(0, length)]
+    starts = list(range(0, length, stride))
+    while len(starts) > 1 and length - starts[-1] < min_size:
+        starts.pop()
+    return [(start, min(start + tile_size, length)) for start in starts[:-1]] + [(starts[-1], length)]
+
+
+@dataclass(frozen=True)
+class LTX2VideoDiffusionTilePlan:
+    """Geometry shared by all ranks for one distributed DiffVAE decode."""
+
+    temporal_tiles: tuple[tuple[int, int], ...]
+    height_tiles: tuple[tuple[int, int], ...]
+    width_tiles: tuple[tuple[int, int], ...]
+    num_frames: int
+    height: int
+    width: int
+    scale_t: int
+    scale_h: int
+    scale_w: int
+    stride_t: int
+    stride_h: int
+    stride_w: int
+    blend_frames: int
+    blend_height: int
+    blend_width: int
+    single_step_x0: bool
 
 
 @dataclass
@@ -52,6 +81,164 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         model = super().from_pretrained(*args, **kwargs)
         model.init_distributed()
         return model
+
+    def _build_tiled_decode_plan(
+        self,
+        features: torch.Tensor,
+        num_inference_steps: int,
+    ) -> LTX2VideoDiffusionTilePlan:
+        """Build the rank-independent tile schedule around Diffusers' decoder."""
+        decoder = self.decoder
+        patch_size = decoder.patch_size
+        upsample_stride = decoder.upsamples[-1].stride
+        scale_t, scale_h, scale_w = (
+            upsample_stride[0],
+            upsample_stride[1] * patch_size,
+            upsample_stride[2] * patch_size,
+        )
+        tile_t = self.tile_sample_min_num_frames // scale_t
+        tile_h = self.tile_sample_min_height // scale_h
+        tile_w = self.tile_sample_min_width // scale_w
+        stride_t = self.tile_sample_stride_num_frames // scale_t
+        stride_h = self.tile_sample_stride_height // scale_h
+        stride_w = self.tile_sample_stride_width // scale_w
+        min_sizes = [
+            max(kernel_4, -(-kernel_5 // stride))
+            for kernel_4, kernel_5, stride in zip(
+                self.config.decoder_stage_kernels[-1],
+                self.config.decoder_stage5_kernel,
+                upsample_stride,
+            )
+        ]
+
+        ghost_frames = decoder.trailing_pad_latent_frames * math.prod(
+            upsample.stride[0] for upsample in decoder.upsamples[:-1]
+        )
+        num_frames = features.shape[1] - ghost_frames
+        height, width = features.shape[2:4]
+        return LTX2VideoDiffusionTilePlan(
+            temporal_tiles=tuple(_tile_intervals(num_frames, tile_t, stride_t, min_sizes[0])),
+            height_tiles=tuple(_tile_intervals(height, tile_h, stride_h, min_sizes[1])),
+            width_tiles=tuple(_tile_intervals(width, tile_w, stride_w, min_sizes[2])),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            scale_t=scale_t,
+            scale_h=scale_h,
+            scale_w=scale_w,
+            stride_t=stride_t,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            blend_frames=(tile_t - stride_t) * scale_t,
+            blend_height=(tile_h - stride_h) * scale_h,
+            blend_width=(tile_w - stride_w) * scale_w,
+            single_step_x0=num_inference_steps == 1 and decoder.model_output_type == "x0",
+        )
+
+    @staticmethod
+    def _iter_tiled_decode_coords(plan: LTX2VideoDiffusionTilePlan):
+        for t_idx in range(len(plan.temporal_tiles)):
+            for h_idx in range(len(plan.height_tiles)):
+                for w_idx in range(len(plan.width_tiles)):
+                    yield t_idx, h_idx, w_idx
+
+    @staticmethod
+    def _get_tiled_feature_slice(
+        features: torch.Tensor,
+        coord: tuple[int, int, int],
+        plan: LTX2VideoDiffusionTilePlan,
+    ) -> tuple[torch.Tensor, bool, bool]:
+        t_idx, h_idx, w_idx = coord
+        t0, t1 = plan.temporal_tiles[t_idx]
+        h0, h1 = plan.height_tiles[h_idx]
+        w0, w1 = plan.width_tiles[w_idx]
+        is_origin = t0 == 0
+        is_trailing = t1 == plan.num_frames
+        feature_t1 = features.shape[1] if is_trailing else t1
+        return features[:, t0:feature_t1, h0:h1, w0:w1], is_origin, is_trailing
+
+    def _tiled_pixel_shape_from_features(
+        self,
+        feature_tile: torch.Tensor,
+        *,
+        drop_leading_frame: bool,
+        crop_trailing_ghost: bool,
+    ) -> tuple[int, int, int, int, int]:
+        """Predict one output tile's shape without materializing stage 4."""
+        decoder = self.decoder
+        stride_t, stride_h, stride_w = decoder.upsamples[-1].stride
+        num_frames = feature_tile.shape[1] * stride_t
+        if stride_t == 2 and drop_leading_frame:
+            num_frames -= 1
+        if crop_trailing_ghost and decoder.trailing_pad_latent_frames > 0:
+            content_frames = max(
+                num_frames - decoder.trailing_pad_latent_frames * decoder.temporal_compression_ratio,
+                1,
+            )
+            num_frames = min(num_frames, max(content_frames, decoder.stage5_kernel[0]))
+        return (
+            feature_tile.shape[0],
+            decoder.out_channels,
+            num_frames,
+            feature_tile.shape[2] * stride_h * decoder.patch_size,
+            feature_tile.shape[3] * stride_w * decoder.patch_size,
+        )
+
+    @staticmethod
+    def _slice_tiled_noise(
+        x_t_full: torch.Tensor,
+        coord: tuple[int, int, int],
+        tile_pixel_shape: tuple[int, int, int, int, int],
+        plan: LTX2VideoDiffusionTilePlan,
+    ) -> torch.Tensor:
+        t_idx, h_idx, w_idx = coord
+        t0, _ = plan.temporal_tiles[t_idx]
+        h0, _ = plan.height_tiles[h_idx]
+        w0, _ = plan.width_tiles[w_idx]
+        pixel_t0 = t0 * plan.scale_t - (1 if t0 != 0 and plan.scale_t == 2 else 0)
+        return x_t_full[
+            :,
+            :,
+            pixel_t0 : pixel_t0 + tile_pixel_shape[2],
+            h0 * plan.scale_h : h0 * plan.scale_h + tile_pixel_shape[3],
+            w0 * plan.scale_w : w0 * plan.scale_w + tile_pixel_shape[4],
+        ]
+
+    def _merge_tiled_decode(
+        self,
+        tiles: dict[tuple[int, int, int], torch.Tensor],
+        plan: LTX2VideoDiffusionTilePlan,
+    ) -> torch.Tensor:
+        """Blend distributed RGB tiles in Diffusers' serial order."""
+        frame_groups = []
+        for t_idx in range(len(plan.temporal_tiles)):
+            rows = [
+                [tiles[(t_idx, h_idx, w_idx)] for w_idx in range(len(plan.width_tiles))]
+                for h_idx in range(len(plan.height_tiles))
+            ]
+            result_rows = []
+            for h_idx, row in enumerate(rows):
+                result_row = []
+                for w_idx, tile in enumerate(row):
+                    if h_idx > 0:
+                        tile = self.blend_v(rows[h_idx - 1][w_idx], tile, plan.blend_height)
+                    if w_idx > 0:
+                        tile = self.blend_h(row[w_idx - 1], tile, plan.blend_width)
+                    keep_height = plan.stride_h * plan.scale_h if h_idx < len(rows) - 1 else tile.shape[3]
+                    keep_width = plan.stride_w * plan.scale_w if w_idx < len(row) - 1 else tile.shape[4]
+                    result_row.append(tile[:, :, :, :keep_height, :keep_width])
+                result_rows.append(torch.cat(result_row, dim=4))
+            frame_groups.append(torch.cat(result_rows, dim=3))
+
+        result = []
+        for t_idx, group in enumerate(frame_groups):
+            if t_idx > 0:
+                group = self.blend_t(frame_groups[t_idx - 1], group, plan.blend_frames)
+            if t_idx < len(frame_groups) - 1:
+                keep_frames = plan.stride_t * plan.scale_t - (1 if t_idx == 0 and plan.scale_t == 2 else 0)
+                group = group[:, :, :keep_frames]
+            result.append(group)
+        return torch.cat(result, dim=2)
 
     def _default_generator(self, device: torch.device) -> torch.Generator:
         if device.type == "cpu":
