@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -11,6 +13,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3.lora import (
     load_minimax_h3_turbo_lora,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -188,3 +191,43 @@ def test_non_h3_checkpoint_falls_back_to_the_generic_peft_loader(tmp_path):
         )
         is None
     )
+
+
+def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "combined"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+    pipeline._turbo_lora_adapter_ids = set()
+    request = _request("generic-peft")
+
+    def load():
+        return pipeline._load_diffusion_lora_adapter(
+            lora_request=request,
+            lora_path=request.lora_path,
+            dtype=torch.float32,
+        )
+
+    def resolve(scale):
+        sampling = SimpleNamespace(lora_request=request, lora_scale=scale)
+        return pipeline._resolve_task(
+            "ref2va",
+            {},
+            has_turbo_lora=pipeline._has_active_turbo_lora(sampling),
+        )
+
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
+    assert load() is None
+    assert resolve(1.0) == "ref2va"
+
+    recognized = (object(), object())
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: recognized)
+    assert load() is recognized
+    assert resolve(0.0) == "ref2va"
+    with pytest.raises(OmniClientError, match="supports T2VA/FL2VA requests only"):
+        resolve(1.0)

@@ -206,9 +206,9 @@ def test_combined_task_inference_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
-    assert pipeline._resolve_task("fl2va", {"image": object()}, has_lora=True) == "fl2va"
+    assert pipeline._resolve_task("fl2va", {"image": object()}, has_turbo_lora=True) == "fl2va"
     with pytest.raises(OmniClientError, match="supports T2VA/FL2VA requests only"):
-        pipeline._resolve_task("ref2va", {}, has_lora=True)
+        pipeline._resolve_task("ref2va", {}, has_turbo_lora=True)
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task(None, {"image": object()}) == "ref2va"

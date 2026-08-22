@@ -574,11 +574,22 @@ class MiniMaxH3Pipeline(
         lora_path: str | Path,
         dtype: torch.dtype,
     ) -> tuple[LoRAModel, PEFTHelper] | None:
-        return load_minimax_h3_turbo_lora(
+        loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
+        )
+        if loaded is not None:
+            self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
+        return loaded
+
+    def _has_active_turbo_lora(self, sampling: Any) -> bool:
+        lora_request = sampling.lora_request
+        return (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._turbo_lora_adapter_ids
         )
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
@@ -611,6 +622,7 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
+        self._turbo_lora_adapter_ids: set[int] = set()
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -804,7 +816,7 @@ class MiniMaxH3Pipeline(
         requested: str | None,
         multi_modal_data: dict[str, Any],
         *,
-        has_lora: bool = False,
+        has_turbo_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -822,7 +834,7 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"checkpoint partition {self.partition!r} supports {sorted(self.supported_tasks)}, got task={task!r}"
             )
-        if task == "ref2va" and has_lora:
+        if task == "ref2va" and has_turbo_lora:
             raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
         return task
 
@@ -1684,7 +1696,7 @@ class MiniMaxH3Pipeline(
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
-            has_lora=sampling.lora_request is not None,
+            has_turbo_lora=self._has_active_turbo_lora(sampling),
         )
 
         raw_image = multi_modal_data.get("image")
