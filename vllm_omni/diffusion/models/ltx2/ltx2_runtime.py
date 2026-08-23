@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared recipe-driven runtime for LTX pipeline variants."""
 
@@ -815,11 +815,12 @@ class LTXRuntime(
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
+        latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
         latents = latent_ops.denormalize_latents(
             latents,
-            self.vae.latents_mean,
-            self.vae.latents_std,
-            self.vae.config.scaling_factor,
+            latents_mean,
+            latents_std,
+            scaling_factor,
         )
 
         audio_latents = latent_ops.unpad_audio_latents(audio_latents, forward_ctx.original_audio_num_frames)

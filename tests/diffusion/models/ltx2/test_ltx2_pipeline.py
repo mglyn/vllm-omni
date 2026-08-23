@@ -173,7 +173,7 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
         ("Lightricks/test-Diffusers", "Lightricks/test", "artifact-revision"),
     ],
 )
-def test_ltx_artifact_uses_source_revision_and_offline_mode(
+def test_ltx_artifact_uses_source_revision_and_hub_fallback(
     monkeypatch,
     model,
     repo_id,
@@ -193,7 +193,6 @@ def test_ltx_artifact_uses_source_revision_and_offline_mode(
             model,
             repo_id,
             filename,
-            local_files_only=True,
             model_revision="model-revision",
             artifact_revision="artifact-revision",
         )
@@ -203,7 +202,6 @@ def test_ltx_artifact_uses_source_revision_and_offline_mode(
         {
             "repo_id": repo_id,
             "filename": filename,
-            "local_files_only": True,
             "revision": expected_revision,
         }
     ]
@@ -219,10 +217,37 @@ def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
         str(tmp_path),
         "Lightricks/test",
         filename,
-        local_files_only=True,
         model_revision="unused-model-revision",
         artifact_revision="unused-artifact-revision",
     ) == str(expected)
+
+
+def test_ltx_artifact_local_model_missing_sidecar_falls_back_to_hub(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return "/cache/ltx-sidecar.safetensors"
+
+    monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
+
+    assert (
+        resolve_ltx_artifact(
+            str(tmp_path),
+            "Lightricks/test",
+            "ltx-sidecar.safetensors",
+            model_revision="local-model-revision",
+            artifact_revision="artifact-revision",
+        )
+        == "/cache/ltx-sidecar.safetensors"
+    )
+    assert calls == [
+        {
+            "repo_id": "Lightricks/test",
+            "filename": "ltx-sidecar.safetensors",
+            "revision": "artifact-revision",
+        }
+    ]
 
 
 @pytest.mark.parametrize(

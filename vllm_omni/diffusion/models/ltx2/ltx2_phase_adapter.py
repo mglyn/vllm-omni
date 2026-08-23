@@ -10,7 +10,6 @@ adapter-capable while retaining their quantization and tensor-parallel paths.
 
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -421,7 +420,6 @@ def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
         pipeline.od_config.model,
         profile.artifact_repo_id,
         profile.distilled_lora_filename,
-        local_files_only=os.path.exists(pipeline.od_config.model),
         model_revision=getattr(pipeline.od_config, "revision", None),
         artifact_revision=profile.artifact_revision,
     )

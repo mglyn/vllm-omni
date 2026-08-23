@@ -261,11 +261,15 @@ def resolve_ltx_artifact(
     repo_id: str,
     filename: str,
     *,
-    local_files_only: bool,
     model_revision: str | None,
     artifact_revision: str | None,
 ) -> str:
-    """Resolve an official LTX sidecar without crossing repository revisions."""
+    """Resolve an official LTX sidecar without crossing repository revisions.
+
+    A local model path selects where the primary components are loaded from;
+    it does not imply that independently hosted sidecars must be offline. Hub
+    offline behavior remains controlled by huggingface_hub itself.
+    """
     candidate = Path(model) / filename
     if candidate.is_file():
         return str(candidate)
@@ -278,7 +282,6 @@ def resolve_ltx_artifact(
         return hf_hub_download(
             repo_id=repo_id,
             filename=filename,
-            local_files_only=local_files_only,
             revision=revision,
         )
     except Exception as exc:
@@ -596,7 +599,6 @@ def _load_ltx25_native_diffusion_decoder(
         model,
         LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
         LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
-        local_files_only=local_files_only,
         model_revision=revision,
         artifact_revision=LTX25_NATIVE_ARTIFACT_REVISION,
     )
@@ -756,7 +758,6 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
                     model,
                     profile.artifact_repo_id,
                     profile.latent_upsampler_filename,
-                    local_files_only=local_files_only,
                     model_revision=revision,
                     artifact_revision=profile.artifact_revision,
                 )
@@ -768,7 +769,6 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
                 model,
                 profile.artifact_repo_id,
                 profile.latent_upsampler_filename,
-                local_files_only=local_files_only,
                 model_revision=revision,
                 artifact_revision=profile.artifact_revision,
             )

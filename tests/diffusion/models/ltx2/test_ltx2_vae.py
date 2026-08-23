@@ -262,6 +262,45 @@ class TestLTXDiffusionDecoder:
         torch.testing.assert_close(output.output[0], latents + 1)
         torch.testing.assert_close(output.output[1], torch.full((1, 1), 3.0))
 
+    def test_diffusion_decode_denormalizes_with_decoder_statistics(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+        pipe.vae = SimpleNamespace(
+            latents_mean=torch.full((2,), 100.0),
+            latents_std=torch.full((2,), 10.0),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        pipe.diffusion_decoder = SimpleNamespace(
+            latents_mean=torch.tensor([10.0, 20.0]),
+            latents_std=torch.tensor([2.0, 4.0]),
+            config=SimpleNamespace(scaling_factor=2.0),
+        )
+        pipe.audio_vae = SimpleNamespace(
+            latents_mean=torch.tensor(0.0),
+            latents_std=torch.tensor(1.0),
+        )
+        forward_ctx = SimpleNamespace(
+            latent_num_frames=1,
+            latent_height=1,
+            latent_width=1,
+            original_audio_num_frames=1,
+            latent_mel_bins=2,
+        )
+
+        video, audio = pipe._unpack_and_denormalize_stage(
+            forward_ctx,
+            torch.tensor([[[1.0, 2.0]]]),
+            torch.zeros(1, 1, 2),
+        )
+
+        torch.testing.assert_close(video.flatten(), torch.tensor([11.0, 24.0]))
+        torch.testing.assert_close(audio, torch.zeros(1, 1, 1, 2))
+
     def test_non_output_rank_does_not_enter_diffusion_decoder(self, monkeypatch):
         import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline

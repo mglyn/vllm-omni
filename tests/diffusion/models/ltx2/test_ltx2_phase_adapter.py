@@ -153,7 +153,6 @@ def test_ltx_phase_adapter_selects_execution_from_quantization(
 
     def resolve_artifact(*_args, **kwargs):
         assert kwargs == {
-            "local_files_only": False,
             "model_revision": None,
             "artifact_revision": None,
         }

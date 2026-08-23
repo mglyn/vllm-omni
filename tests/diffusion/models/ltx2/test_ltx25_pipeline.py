@@ -367,7 +367,6 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
         "Lightricks/LTX-2.5",
         "vae/ltx-2.5-video-vae-bf16.safetensors",
         {
-            "local_files_only": False,
             "model_revision": revision,
             "artifact_revision": ltx2_components.LTX25_NATIVE_ARTIFACT_REVISION,
         },
