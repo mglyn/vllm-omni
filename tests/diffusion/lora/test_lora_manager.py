@@ -235,47 +235,6 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
     assert torch.allclose(torch.cat([b0, b1, b2], dim=0), B * 0.5)
 
 
-def test_lora_manager_splits_fused_lora_by_global_tp_output_slices():
-    manager = DiffusionLoRAManager(
-        pipeline=torch.nn.Module(),
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-        max_cached_adapters=1,
-    )
-    packed_layer = _DummyLoRALayer(n_slices=2, output_slices=(2, 2), tp_size=2)
-    manager._lora_modules = {"transformer.blocks.0.mlp.fc1": packed_layer}
-
-    rank = 2
-    lora_a = torch.ones((rank, 4))
-    lora_b = torch.arange(16, dtype=torch.bfloat16).view(8, rank)
-    lora = LoRALayerWeights(
-        module_name="transformer.blocks.0.mlp.fc1",
-        rank=rank,
-        lora_alpha=rank,
-        lora_a=lora_a,
-        lora_b=lora_b,
-    )
-    manager._registered_adapters = {
-        1: type(
-            "LM",
-            (),
-            {
-                "id": 1,
-                "loras": {"transformer.blocks.0.mlp.fc1": lora},
-                "get_lora": lambda self, key: self.loras.get(key),
-            },
-        )()
-    }
-
-    manager._activate_adapter(1, scale=0.5)
-
-    lora_a_list, lora_b_list = packed_layer.set_calls[0]
-    assert isinstance(lora_a_list, list)
-    assert isinstance(lora_b_list, list)
-    assert [piece.shape[0] for piece in lora_b_list] == [4, 4]
-    torch.testing.assert_close(torch.cat(lora_b_list), lora_b * 0.5)
-
-
 def test_lora_manager_activates_packed_lora_from_sublayers():
     pipeline = torch.nn.Module()
     bound_names = None
@@ -330,6 +289,69 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     assert torch.allclose(lora_b_list[1], torch.ones((1, rank)) * 4 * 2.0)
     assert torch.allclose(lora_b_list[2], torch.ones((1, rank)) * 4 * 2.0)
     assert bound_names == frozenset(loras)
+
+
+def test_lora_manager_rolls_back_all_layers_when_activation_fails():
+    class _FailingLoRALayer(_DummyLoRALayer):
+        fail = False
+
+        def set_lora(self, index: int, lora_a, lora_b):
+            if self.fail:
+                raise RuntimeError("bind failed")
+            super().set_lora(index, lora_a, lora_b)
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=2,
+    )
+    first = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    second = _FailingLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {
+        "transformer.first": first,
+        "transformer.second": second,
+    }
+
+    def adapter(adapter_id: int):
+        loras = {
+            name: LoRALayerWeights(
+                module_name=name,
+                rank=2,
+                lora_alpha=2,
+                lora_a=torch.full((2, 2), float(adapter_id)),
+                lora_b=torch.full((2, 2), float(adapter_id)),
+            )
+            for name in manager._lora_modules
+        }
+        return type(
+            "LM",
+            (),
+            {
+                "id": adapter_id,
+                "loras": loras,
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+
+    manager._registered_adapters = {1: adapter(1), 2: adapter(2)}
+    manager._activate_adapter(1, scale=1.0)
+    first_calls_after_success = len(first.set_calls)
+
+    second.fail = True
+    with pytest.raises(RuntimeError, match="bind failed"):
+        manager._activate_adapter(2, scale=1.0)
+
+    assert manager._active_adapter_id is None
+    assert first.reset_calls == 1
+    assert second.reset_calls == 1
+
+    # The failed activation must not leave the old adapter eligible for the
+    # fast path: reactivating it binds every layer again.
+    second.fail = False
+    manager._activate_adapter(1, scale=1.0)
+    assert manager._active_adapter_id == 1
+    assert len(first.set_calls) == first_calls_after_success + 2
 
 
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:

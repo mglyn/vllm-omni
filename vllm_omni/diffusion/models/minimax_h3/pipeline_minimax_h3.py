@@ -580,11 +580,20 @@ class MiniMaxH3Pipeline(
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
+        od_config = getattr(self, "od_config", None)
+        offload_modes = []
+        if getattr(od_config, "enable_cpu_offload", False):
+            offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
+        if getattr(od_config, "enable_layerwise_offload", False):
+            offload_modes.append("layerwise offload (--enable-layerwise-offload)")
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            offload_modes.append("distributed layerwise offload (--enable-distributed-layerwise-offload)")
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
         )
         if loaded is not None:
             self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
@@ -616,14 +625,22 @@ class MiniMaxH3Pipeline(
     def _validate_turbo_sampling(self, sampling: Any) -> None:
         extra = sampling.extra_args or {}
         sigma_points = sampling.num_inference_steps
-        if sigma_points is None or int(sigma_points) != MINIMAX_H3_TURBO_SIGMA_POINTS:
+        if sigma_points != MINIMAX_H3_TURBO_SIGMA_POINTS:
             raise OmniClientError(
                 "MiniMax-H3 Turbo requires num_inference_steps=5 (five sigma points produce four denoiser evaluations)"
             )
-        video_shift = float(extra.get("flow_shift", self.default_video_shift))
+        try:
+            video_shift = float(extra.get("flow_shift", self.default_video_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}") from exc
         if not math.isclose(video_shift, MINIMAX_H3_TURBO_VIDEO_SHIFT):
             raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}")
-        audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        try:
+            audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(
+                f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}"
+            ) from exc
         if not math.isclose(audio_shift, MINIMAX_H3_TURBO_AUDIO_SHIFT):
             raise OmniClientError(f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}")
 

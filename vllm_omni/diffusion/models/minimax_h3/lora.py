@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from vllm.lora.lora_model import LoRAModel
+from vllm.lora.lora_weights import PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -16,6 +17,9 @@ from vllm_omni.lora.request import LoRARequest
 
 _TURBO_RANK = 128
 _TURBO_ALPHA = 128
+_TURBO_HIDDEN_SIZE = 5376
+_TURBO_ATTENTION_INNER_SIZE = 7168
+_TURBO_FFN_HIDDEN_SIZE = 14336
 _TURBO_FILENAME = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
 _LORA_A_SUFFIX = ".lora_A.default.weight"
 _LORA_B_SUFFIX = ".lora_B.default.weight"
@@ -28,6 +32,14 @@ _TURBO_RAW_TARGET_SUFFIXES = (
     "ff.net.0.proj",
     "ff.net.2",
 )
+_TURBO_TARGET_DIMS = {
+    "attn.to_q": (_TURBO_HIDDEN_SIZE, _TURBO_ATTENTION_INNER_SIZE),
+    "attn.to_k": (_TURBO_HIDDEN_SIZE, _TURBO_ATTENTION_INNER_SIZE),
+    "attn.to_v": (_TURBO_HIDDEN_SIZE, _TURBO_ATTENTION_INNER_SIZE),
+    "attn.to_out.0": (_TURBO_ATTENTION_INNER_SIZE, _TURBO_HIDDEN_SIZE),
+    "ff.net.0.proj": (_TURBO_HIDDEN_SIZE, 2 * _TURBO_FFN_HIDDEN_SIZE),
+    "ff.net.2": (_TURBO_FFN_HIDDEN_SIZE, _TURBO_HIDDEN_SIZE),
+}
 _TURBO_EXPECTED_RAW_TARGETS = frozenset(
     f"{prefix}.{block_index}.{suffix}"
     for prefix, block_count in (
@@ -93,13 +105,17 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
         tensor = checkpoint.get_tensor(name)
         if tensor.ndim != 2:
             raise ValueError(f"MiniMax-H3 Turbo LoRA tensors must be matrices, got {name}={tuple(tensor.shape)}")
-        if side == "a" and tensor.shape[0] != _TURBO_RANK:
-            raise ValueError(f"MiniMax-H3 Turbo requires rank {_TURBO_RANK}, got {name}={tuple(tensor.shape)}")
-        if side == "b" and tensor.shape[1] != _TURBO_RANK:
-            raise ValueError(f"MiniMax-H3 Turbo requires rank {_TURBO_RANK}, got {name}={tuple(tensor.shape)}")
+        suffix = next((suffix for suffix in _TURBO_RAW_TARGET_SUFFIXES if raw_target.endswith(suffix)), None)
+        if suffix is None:
+            raise ValueError(f"MiniMax-H3 Turbo LoRA contains unsupported target: {raw_target}")
+        input_dim, output_dim = _TURBO_TARGET_DIMS[suffix]
+        expected_shape = (_TURBO_RANK, input_dim) if side == "a" else (output_dim, _TURBO_RANK)
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"MiniMax-H3 Turbo tensor has invalid global shape: {name}={tuple(tensor.shape)}, "
+                f"expected={expected_shape}"
+            )
         if side == "b" and ".ff.net.0.proj." in name:
-            if tensor.shape[0] % 2:
-                raise ValueError(f"MiniMax-H3 Turbo fc1 lora_B rows must split evenly, got {tuple(tensor.shape)}")
             value, gate = tensor.chunk(2, dim=0)
             tensor = torch.cat((gate, value), dim=0).contiguous()
         tensors[name] = tensor
@@ -117,12 +133,30 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
     return tensors
 
 
+def _pack_h3_turbo_fc1(lora_model: LoRAModel) -> None:
+    """Represent H3's fused gate/up projection without generic layout guesses."""
+
+    for module_name, weights in tuple(lora_model.loras.items()):
+        if not module_name.endswith(".mlp.fc1"):
+            continue
+        gate_b, up_b = weights.lora_b.chunk(2, dim=0)
+        lora_model.loras[module_name] = PackedLoRALayerWeights(
+            module_name=module_name,
+            rank=weights.rank,
+            lora_alphas=[weights.lora_alpha, weights.lora_alpha],
+            lora_a=[weights.lora_a, weights.lora_a],
+            lora_b=[gate_b.contiguous(), up_b.contiguous()],
+            scaling=[weights.scaling, weights.scaling],
+        )
+
+
 def load_minimax_h3_turbo_lora(
     *,
     partition: str,
     lora_request: LoRARequest,
     lora_path: str | Path,
     dtype: torch.dtype,
+    unsupported_offload_mode: str | None = None,
 ) -> tuple[LoRAModel, PEFTHelper] | None:
     """Load the published LightX2V Turbo v1.0 through the legacy manager."""
 
@@ -148,6 +182,8 @@ def load_minimax_h3_turbo_lora(
             raise ValueError(f"MiniMax-H3 Turbo v1.0 requires alpha={_TURBO_ALPHA}, got {raw_alpha!r}")
         if partition == "ref2va":
             raise ValueError("MiniMax-H3 Turbo LoRA supports FL2VA/T2VA only")
+        if unsupported_offload_mode is not None:
+            raise ValueError(f"MiniMax-H3 Turbo dynamic LoRA does not support {unsupported_offload_mode}")
         tensors = _validate_and_convert_tensors(checkpoint)
 
     peft_helper = PEFTHelper.from_dict(
@@ -165,4 +201,5 @@ def load_minimax_h3_turbo_lora(
         dtype=dtype,
         weights_mapper=_TURBO_WEIGHTS_MAPPER,
     )
+    _pack_h3_turbo_fc1(lora_model)
     return lora_model, peft_helper

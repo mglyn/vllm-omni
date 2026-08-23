@@ -8,8 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors.torch import save_file
+from vllm.lora.lora_weights import PackedLoRALayerWeights
 
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.models.minimax_h3 import lora as lora_module
 from vllm_omni.diffusion.models.minimax_h3.lora import (
     load_minimax_h3_turbo_lora,
 )
@@ -17,6 +19,20 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+_TINY_TARGET_DIMS = {
+    "attn.to_q": (2, 3),
+    "attn.to_k": (2, 3),
+    "attn.to_v": (2, 3),
+    "attn.to_out.0": (3, 2),
+    "ff.net.0.proj": (2, 4),
+    "ff.net.2": (2, 2),
+}
+
+
+@pytest.fixture(autouse=True)
+def _use_tiny_h3_dimensions(monkeypatch):
+    monkeypatch.setattr(lora_module, "_TURBO_TARGET_DIMS", _TINY_TARGET_DIMS)
 
 
 def _request(path) -> LoRARequest:
@@ -33,9 +49,11 @@ def _write_tiny_turbo(
     alpha: str = "128",
     key_format: str = "minimax-h3-diffusers",
     omit_target: str | None = None,
+    shape_overrides: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     rank = 128
     tensors = {}
+    overrides = shape_overrides or {}
     target_suffixes = (
         "attn.to_q",
         "attn.to_k",
@@ -53,14 +71,23 @@ def _write_tiny_turbo(
                 target = f"{prefix}.{block_index}.{suffix}"
                 if target == omit_target:
                     continue
-                tensors[f"{target}.lora_A.default.weight"] = torch.ones(rank, 2)
+                input_dim, output_dim = _TINY_TARGET_DIMS[suffix]
+                a_name = f"{target}.lora_A.default.weight"
+                b_name = f"{target}.lora_B.default.weight"
+                tensors[a_name] = torch.ones(overrides.get(a_name, (rank, input_dim)))
                 if suffix == "ff.net.0.proj":
-                    tensors[f"{target}.lora_B.default.weight"] = torch.cat(
-                        (torch.ones(2, rank), torch.full((2, rank), 2.0)),
-                        dim=0,
-                    )
+                    if b_name in overrides:
+                        tensors[b_name] = torch.ones(overrides[b_name])
+                    else:
+                        tensors[b_name] = torch.cat(
+                            (
+                                torch.ones(output_dim // 2, rank),
+                                torch.full((output_dim // 2, rank), 2.0),
+                            ),
+                            dim=0,
+                        )
                 else:
-                    tensors[f"{target}.lora_B.default.weight"] = torch.ones(3, rank)
+                    tensors[b_name] = torch.ones(overrides.get(b_name, (output_dim, rank)))
     save_file(
         tensors,
         str(path),
@@ -87,9 +114,36 @@ def test_h3_turbo_loads_through_legacy_lora_model_and_swaps_ffn(tmp_path):
     assert "blocks.0.attn.to_q" in lora_model.loras
     assert "blocks.0.mlp.fc1" in lora_model.loras
     fc1 = lora_model.get_lora("blocks.0.mlp.fc1")
-    assert fc1 is not None
-    torch.testing.assert_close(fc1.lora_b[:2], torch.full((2, 128), 2.0))
-    torch.testing.assert_close(fc1.lora_b[2:], torch.ones(2, 128))
+    assert isinstance(fc1, PackedLoRALayerWeights)
+    assert len(fc1.lora_a) == 2
+    assert len(fc1.lora_b) == 2
+    torch.testing.assert_close(fc1.lora_a[0], torch.ones(128, 2))
+    torch.testing.assert_close(fc1.lora_a[1], torch.ones(128, 2))
+    torch.testing.assert_close(fc1.lora_b[0], torch.full((2, 128), 2.0))
+    torch.testing.assert_close(fc1.lora_b[1], torch.ones(2, 128))
+
+
+@pytest.mark.parametrize(
+    ("tensor_suffix", "bad_shape"),
+    [
+        ("attn.to_q.lora_A.default.weight", (128, 1)),
+        ("attn.to_q.lora_A.default.weight", (128, 3)),
+        ("attn.to_q.lora_B.default.weight", (2, 128)),
+        ("attn.to_q.lora_B.default.weight", (4, 128)),
+    ],
+)
+def test_h3_turbo_rejects_under_and_oversized_global_shapes(tmp_path, tensor_suffix, bad_shape):
+    path = tmp_path / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+    tensor_name = f"transformer_blocks.0.{tensor_suffix}"
+    _write_tiny_turbo(path, shape_overrides={tensor_name: bad_shape})
+
+    with pytest.raises(ValueError, match="invalid global shape"):
+        load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+        )
 
 
 def test_legacy_manager_uses_the_h3_model_loader_without_changing_its_interface(tmp_path):
@@ -135,6 +189,28 @@ def test_h3_turbo_rejects_wrong_alpha_and_ref2va(tmp_path):
             lora_request=_request(valid),
             lora_path=valid,
             dtype=torch.float32,
+        )
+
+
+@pytest.mark.parametrize(
+    "offload_mode",
+    [
+        "model-level CPU offload (--enable-cpu-offload)",
+        "layerwise offload (--enable-layerwise-offload)",
+        "distributed layerwise offload (--enable-distributed-layerwise-offload)",
+    ],
+)
+def test_h3_turbo_rejects_offload_modes(tmp_path, offload_mode):
+    path = tmp_path / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_turbo(path)
+
+    with pytest.raises(ValueError, match="does not support"):
+        load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+            unsupported_offload_mode=offload_mode,
         )
 
 
@@ -269,8 +345,11 @@ def test_h3_turbo_requires_all_loaded_targets_to_bind():
     [
         (None, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
         (4, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
+        ("5", {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
         (5, {"flow_shift": 7.0, "audio_flow_shift": 3.0}, "flow_shift=6"),
+        (5, {"flow_shift": "bad", "audio_flow_shift": 3.0}, "flow_shift=6"),
         (5, {"flow_shift": 6.0, "audio_flow_shift": 4.0}, "audio_flow_shift=3"),
+        (5, {"flow_shift": 6.0, "audio_flow_shift": []}, "audio_flow_shift=3"),
     ],
 )
 def test_h3_turbo_rejects_unsupported_sampling(num_inference_steps, extra_args, error):

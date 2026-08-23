@@ -534,13 +534,7 @@ class DiffusionLoRAManager:
         matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
         return is_active and matches_scale
 
-    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
-        if self._is_active_at_scale(adapter_id, scale):
-            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
-            return
-
-        logger.info("Activating adapter: id=%d", adapter_id)
-        lora_model = self._registered_adapters[adapter_id]
+    def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
         lora_names_by_id = (
             {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
@@ -629,15 +623,10 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(0)
                     continue
 
-                # LoRAModel stores the unsharded checkpoint tensors. Column-
-                # parallel wrappers localize each full output slice inside
-                # set_lora(), so split B by global rather than rank-local rows.
-                tp_size = int(getattr(lora_layer, "tp_size", 1))
-                global_output_slices = [int(size) * tp_size for size in output_slices]
-                total = sum(global_output_slices)
+                total = sum(output_slices)
                 if lora_weights.lora_b.shape[0] != total:
                     logger.warning(
-                        "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != expected global output rows=%d",
+                        "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
                         full_module_name,
                         lora_weights.lora_b.shape[0],
                         total,
@@ -645,7 +634,7 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(0)
                     continue
 
-                b_splits = list(torch.split(lora_weights.lora_b, global_output_slices, dim=0))
+                b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
@@ -669,16 +658,31 @@ class DiffusionLoRAManager:
             )
 
         if callable(binding_validator):
-            try:
-                binding_validator(
-                    lora_model=lora_model,
-                    bound_lora_names=frozenset(bound_lora_names),
-                )
-            except Exception:
-                for lora_layer in self._lora_modules.values():
-                    lora_layer.reset_lora(0)
-                self._active_adapter_id = None
-                raise
+            binding_validator(
+                lora_model=lora_model,
+                bound_lora_names=frozenset(bound_lora_names),
+            )
+
+    def _reset_lora_layers(self) -> None:
+        for lora_layer in self._lora_modules.values():
+            lora_layer.reset_lora(0)
+
+    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        if self._is_active_at_scale(adapter_id, scale):
+            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            return
+
+        logger.info("Activating adapter: id=%d", adapter_id)
+        lora_model = self._registered_adapters[adapter_id]
+        # Binding overwrites slot 0 incrementally. Invalidate the fast-path
+        # state before the first mutation and leave every wrapper inactive if
+        # any set_lora() call or model validator fails.
+        self._active_adapter_id = None
+        try:
+            self._bind_adapter_weights(lora_model, scale)
+        except Exception:
+            self._reset_lora_layers()
+            raise
 
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
@@ -688,8 +692,7 @@ class DiffusionLoRAManager:
             logger.debug("All adapters already inactive")
             return
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
-        for lora_layer in self._lora_modules.values():
-            lora_layer.reset_lora(0)
+        self._reset_lora_layers()
         self._active_adapter_id = None
         logger.debug("All adapters deactivated")
 
