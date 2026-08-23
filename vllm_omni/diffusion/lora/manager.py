@@ -541,6 +541,16 @@ class DiffusionLoRAManager:
 
         logger.info("Activating adapter: id=%d", adapter_id)
         lora_model = self._registered_adapters[adapter_id]
+        binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
+        lora_names_by_id = (
+            {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
+        )
+        bound_lora_names: set[str] = set()
+
+        def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
+            name = lora_names_by_id.get(id(weights))
+            if name is not None:
+                bound_lora_names.add(name)
 
         # activate weights in each LoRA layer
         for full_module_name, lora_layer in self._lora_modules.items():
@@ -582,6 +592,9 @@ class DiffusionLoRAManager:
                         lora_b_list.append(sub_lora.lora_b * scale)
 
                     lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                    for sub_lora in sub_loras:
+                        if sub_lora is not None:
+                            _record_bound(sub_lora)
                     logger.debug(
                         "Activated packed LoRA for %s via submodules=%s (scale=%.2f)",
                         full_module_name,
@@ -600,6 +613,7 @@ class DiffusionLoRAManager:
                     for b in lora_weights.lora_b
                 ]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                _record_bound(lora_weights)
                 logger.debug(
                     "Activated packed LoRA for %s (scale=%.2f)",
                     full_module_name,
@@ -635,6 +649,7 @@ class DiffusionLoRAManager:
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                _record_bound(lora_weights)
                 logger.debug(
                     "Activated fused LoRA for packed layer %s (scale=%.2f)",
                     full_module_name,
@@ -644,6 +659,7 @@ class DiffusionLoRAManager:
 
             scaled_lora_b = lora_weights.lora_b * scale
             lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+            _record_bound(lora_weights)
             logger.debug(
                 "Activated LoRA for %s: lora_a shape=%s, lora_b shape=%s, scale=%.2f",
                 full_module_name,
@@ -651,6 +667,18 @@ class DiffusionLoRAManager:
                 lora_weights.lora_b.shape,
                 scale,
             )
+
+        if callable(binding_validator):
+            try:
+                binding_validator(
+                    lora_model=lora_model,
+                    bound_lora_names=frozenset(bound_lora_names),
+                )
+            except Exception:
+                for lora_layer in self._lora_modules.values():
+                    lora_layer.reset_lora(0)
+                self._active_adapter_id = None
+                raise
 
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)

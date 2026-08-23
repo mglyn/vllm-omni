@@ -787,7 +787,7 @@ one of the FL2VA server commands above. `--lora-path` preloads the adapter;
 each request still activates it and uses the published sampling settings:
 
 ```bash
--F 'num_inference_steps=4' \
+-F 'num_inference_steps=5' \
 -F 'flow_shift=6' \
 -F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
 -F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
@@ -796,6 +796,8 @@ each request still activates it and uses the published sampling settings:
 For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
 ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
 dynamic-only and does not support prefusion, DLO, or LoRA composition.
+The five requested sigma points produce the four denoiser evaluations expected
+by the Turbo artifact.
 
 ## Key parameters
 

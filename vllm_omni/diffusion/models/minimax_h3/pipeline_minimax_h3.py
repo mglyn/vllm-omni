@@ -138,6 +138,9 @@ MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
 MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+MINIMAX_H3_TURBO_SIGMA_POINTS = 5
+MINIMAX_H3_TURBO_VIDEO_SHIFT = 6.0
+MINIMAX_H3_TURBO_AUDIO_SHIFT = 3.0
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
     "Ref2VA/model_index.json",
@@ -574,6 +577,9 @@ class MiniMaxH3Pipeline(
         lora_path: str | Path,
         dtype: torch.dtype,
     ) -> tuple[LoRAModel, PEFTHelper] | None:
+        # A cache eviction may be followed by a different adapter reusing the
+        # same client-supplied ID. Every real load replaces the classification.
+        self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -584,6 +590,21 @@ class MiniMaxH3Pipeline(
             self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
         return loaded
 
+    def _validate_diffusion_lora_binding(
+        self,
+        *,
+        lora_model: LoRAModel,
+        bound_lora_names: frozenset[str],
+    ) -> None:
+        if lora_model.id not in self._turbo_lora_adapter_ids:
+            return
+        missing = sorted(set(lora_model.loras) - bound_lora_names)
+        if missing:
+            raise ValueError(
+                "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
+            )
+
     def _has_active_turbo_lora(self, sampling: Any) -> bool:
         lora_request = sampling.lora_request
         return (
@@ -591,6 +612,20 @@ class MiniMaxH3Pipeline(
             and not math.isclose(0.0, float(sampling.lora_scale))
             and lora_request.lora_int_id in self._turbo_lora_adapter_ids
         )
+
+    def _validate_turbo_sampling(self, sampling: Any) -> None:
+        extra = sampling.extra_args or {}
+        sigma_points = sampling.num_inference_steps
+        if sigma_points is None or int(sigma_points) != MINIMAX_H3_TURBO_SIGMA_POINTS:
+            raise OmniClientError(
+                "MiniMax-H3 Turbo requires num_inference_steps=5 (five sigma points produce four denoiser evaluations)"
+            )
+        video_shift = float(extra.get("flow_shift", self.default_video_shift))
+        if not math.isclose(video_shift, MINIMAX_H3_TURBO_VIDEO_SHIFT):
+            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}")
+        audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        if not math.isclose(audio_shift, MINIMAX_H3_TURBO_AUDIO_SHIFT):
+            raise OmniClientError(f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}")
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -1693,11 +1728,14 @@ class MiniMaxH3Pipeline(
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
+        has_turbo_lora = self._has_active_turbo_lora(sampling)
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
-            has_turbo_lora=self._has_active_turbo_lora(sampling),
+            has_turbo_lora=has_turbo_lora,
         )
+        if has_turbo_lora:
+            self._validate_turbo_sampling(sampling)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")

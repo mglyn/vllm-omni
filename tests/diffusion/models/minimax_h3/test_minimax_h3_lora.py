@@ -192,6 +192,16 @@ def test_non_h3_checkpoint_falls_back_to_the_generic_peft_loader(tmp_path):
         is None
     )
 
+    declared = tmp_path / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_turbo(declared, key_format="other")
+    with pytest.raises(ValueError, match="requires safetensors metadata"):
+        load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(declared),
+            lora_path=declared,
+            dtype=torch.float32,
+        )
+
 
 def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -221,13 +231,72 @@ def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
             has_turbo_lora=pipeline._has_active_turbo_lora(sampling),
         )
 
-    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
-    assert load() is None
-    assert resolve(1.0) == "ref2va"
-
     recognized = (object(), object())
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: recognized)
     assert load() is recognized
     assert resolve(0.0) == "ref2va"
     with pytest.raises(OmniClientError, match="supports T2VA/FL2VA requests only"):
         resolve(1.0)
+
+    # Simulate manager eviction followed by a generic PEFT adapter reusing the
+    # same client-supplied ID. A real reload must replace the stale kind.
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
+    assert load() is None
+    assert resolve(1.0) == "ref2va"
+
+
+def test_h3_turbo_requires_all_loaded_targets_to_bind():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._turbo_lora_adapter_ids = {1}
+    lora_model = SimpleNamespace(id=1, loras={"to_q": object(), "to_k": object()})
+
+    pipeline._validate_diffusion_lora_binding(
+        lora_model=lora_model,
+        bound_lora_names=frozenset(lora_model.loras),
+    )
+    with pytest.raises(ValueError, match="bound=1/2"):
+        pipeline._validate_diffusion_lora_binding(
+            lora_model=lora_model,
+            bound_lora_names=frozenset({"to_q"}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("num_inference_steps", "extra_args", "error"),
+    [
+        (None, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
+        (4, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
+        (5, {"flow_shift": 7.0, "audio_flow_shift": 3.0}, "flow_shift=6"),
+        (5, {"flow_shift": 6.0, "audio_flow_shift": 4.0}, "audio_flow_shift=3"),
+    ],
+)
+def test_h3_turbo_rejects_unsupported_sampling(num_inference_steps, extra_args, error):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    sampling = SimpleNamespace(
+        num_inference_steps=num_inference_steps,
+        extra_args=extra_args,
+    )
+
+    with pytest.raises(OmniClientError, match=error):
+        pipeline._validate_turbo_sampling(sampling)
+
+
+def test_h3_turbo_accepts_five_sigma_points_for_four_nfe():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline._validate_turbo_sampling(
+        SimpleNamespace(
+            num_inference_steps=5,
+            extra_args={"flow_shift": 6.0, "audio_flow_shift": 3.0},
+        )
+    )

@@ -132,6 +132,10 @@ def load_minimax_h3_turbo_lora(
     with safe_open(lora_file, framework="pt", device="cpu") as checkpoint:
         metadata = checkpoint.metadata() or {}
         if metadata.get("key_format") != "minimax-h3-diffusers":
+            if lora_file.name == _TURBO_FILENAME:
+                raise ValueError(
+                    "MiniMax-H3 Turbo v1.0 requires safetensors metadata key_format='minimax-h3-diffusers'"
+                )
             return None
         if lora_file.name != _TURBO_FILENAME:
             raise ValueError(f"MiniMax-H3 Turbo supports only {_TURBO_FILENAME!r}, got {lora_file.name!r}")

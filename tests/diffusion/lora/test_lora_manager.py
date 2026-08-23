@@ -278,6 +278,14 @@ def test_lora_manager_splits_fused_lora_by_global_tp_output_slices():
 
 def test_lora_manager_activates_packed_lora_from_sublayers():
     pipeline = torch.nn.Module()
+    bound_names = None
+
+    def validate_binding(*, lora_model, bound_lora_names):
+        nonlocal bound_names
+        assert lora_model.id == 1
+        bound_names = bound_lora_names
+
+    pipeline._validate_diffusion_lora_binding = validate_binding
     pipeline.stacked_params_mapping = [
         (".to_qkv", ".to_q", "q"),
         (".to_qkv", ".to_k", "k"),
@@ -321,6 +329,7 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     assert torch.allclose(lora_b_list[0], torch.ones((2, rank)) * 3 * 2.0)
     assert torch.allclose(lora_b_list[1], torch.ones((1, rank)) * 4 * 2.0)
     assert torch.allclose(lora_b_list[2], torch.ones((1, rank)) * 4 * 2.0)
+    assert bound_names == frozenset(loras)
 
 
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:
