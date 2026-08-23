@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for LTX video VAE tiling and distributed decode behavior."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -37,6 +38,35 @@ def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
 
 
 class TestLTXDiffusionDecoder:
+    @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
+    def test_distributed_diffusion_decoder_rejects_non_tile_parallel_modes(self, mode):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.distributed_executor = SimpleNamespace(set_parallel_size=lambda *_args, **_kwargs: None)
+
+        with pytest.raises(ValueError, match="only supports vae_parallel_mode='tile'"):
+            model.set_parallel_size(2, mode=mode)
+
+    def test_distributed_diffusion_decoder_accepts_tile_parallel_mode(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        calls = []
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.distributed_executor = SimpleNamespace(
+            set_parallel_size=lambda parallel_size, mode: calls.append((parallel_size, mode))
+        )
+
+        model.set_parallel_size(4, mode="tile")
+
+        assert calls == [(4, "tile")]
+
     def test_short_clip_keeps_stage5_temporal_context_then_crops_output(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
             LTX2VideoDiffusionDecoder3d,
@@ -505,7 +535,7 @@ class TestLTX23VaeDistributedDecode:
             },
             output_dtype=torch.float32,
         )
-        seen = {}
+        seen: dict[str, Any] = {}
 
         def exec_tile(task):
             return torch.full(tile_output_shapes[task.tile_id], float(task.tile_id + 1))

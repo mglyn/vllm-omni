@@ -25,7 +25,7 @@ with the model license before downloading or using the weights.
 ## Choose a pipeline
 
 | Pipeline | Mode | Default size | Schedule |
-|---|---|---:|---:|
+| --- | --- | ---: | ---: |
 | `LTX2Pipeline` | Full/SFT one-stage | 960x544 | 30 steps |
 | `LTX2TwoStagePipeline` | Full/SFT two-stage | 1920x1088 | 30 + 3 steps |
 | `LTX2DistilledOneStagePipeline` | Distilled one-stage | 960x544 | 8 steps |
@@ -41,7 +41,9 @@ image selects I2V, while omitting it selects T2V.
 LTX-2.5 uses the canonical Native Diffusion VAE decoder by default. To opt in
 to the legacy convolutional VAE, set the startup-only stage-0 model extra
 `ltx2_use_conv_vae: true`. The choice applies to all requests and all four
-pipeline classes above.
+pipeline classes above. DiffVAE loads its NATTEN kernel from Hugging Face Hub
+during startup. `decode_timestep` and `decode_noise_scale` condition only the
+legacy ConvVAE and have no effect when DiffVAE is selected.
 
 For offline Python usage:
 
@@ -65,8 +67,9 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 Both decoders are untiled by default. Set `vae_use_tiling` for memory-saving
 serial tiling; DiffVAE tiles only above 80 frames or 768 pixels in either spatial
 dimension. For distributed decode, use matching `--usp N` and
-`--vae-patch-parallel-size N`; this enables tiling and reuses the existing DiT
-ranks. DiffVAE is decoder-only, so I2V still uses the convolutional VAE encoder.
+`--vae-patch-parallel-size N`; this enables tiling and reuses the existing
+diffusion worker ranks. DiffVAE is decoder-only, so I2V still uses the
+convolutional VAE encoder.
 
 ## Prerequisites
 
@@ -82,7 +85,7 @@ Install matching vLLM and vLLM-Omni versions, and ensure `ffmpeg` and
 ## Hardware
 
 | GPU | Status | Recommended scope |
-|---|---|---|
+| --- | --- | --- |
 | NVIDIA B300 | Verified | All four canonical pipelines |
 | NVIDIA B200 or H200 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
 | NVIDIA GB200 or GB300 | Capacity-based recommendation; not yet verified | All four canonical pipelines |

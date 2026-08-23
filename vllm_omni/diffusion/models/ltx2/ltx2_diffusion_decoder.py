@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright 2026 Lightricks and The HuggingFace Team. All rights reserved.
+#
+# Native conversion rules and decoder behavior copied and modified from
+# Diffusers commit d035dcd7cc7c88e0a154609b62887d50bba9fdc2 (Apache-2.0).
 
 """LTX-2.5 Native-weight adapter for Diffusers' diffusion VAE decoder."""
 
@@ -17,6 +21,7 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from safetensors import safe_open
 
 LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID = "Lightricks/LTX-2.5"
+LTX25_NATIVE_ARTIFACT_REVISION = "8a4ff96f581e72bedc1b44367581c49d544a05f1"
 LTX25_NATIVE_DIFFUSION_DECODER_FILENAME = "vae/ltx-2.5-video-vae-bf16.safetensors"
 
 _NATIVE_DECODER_PREFIXES = ("vae.decoder.", "decoder.")

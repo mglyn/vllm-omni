@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for the shared LTX pipeline runtime and public contracts."""
 
@@ -8,6 +8,7 @@ import os
 import tempfile
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -165,7 +166,19 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
     assert detect_ltx_model_version(str(tmp_path)) == "2"
 
 
-def test_ltx_artifact_falls_back_to_unpinned_hub_download(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("model", "repo_id", "expected_revision"),
+    [
+        ("Lightricks/test", "Lightricks/test", "model-revision"),
+        ("Lightricks/test-Diffusers", "Lightricks/test", "artifact-revision"),
+    ],
+)
+def test_ltx_artifact_uses_source_revision_and_offline_mode(
+    monkeypatch,
+    model,
+    repo_id,
+    expected_revision,
+):
     filename = "ltx-sidecar.safetensors"
     calls = []
 
@@ -176,9 +189,24 @@ def test_ltx_artifact_falls_back_to_unpinned_hub_download(tmp_path, monkeypatch)
     monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
 
     assert (
-        resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", filename) == "/cache/ltx-sidecar.safetensors"
+        resolve_ltx_artifact(
+            model,
+            repo_id,
+            filename,
+            local_files_only=True,
+            model_revision="model-revision",
+            artifact_revision="artifact-revision",
+        )
+        == "/cache/ltx-sidecar.safetensors"
     )
-    assert calls == [{"repo_id": "Lightricks/test", "filename": filename}]
+    assert calls == [
+        {
+            "repo_id": repo_id,
+            "filename": filename,
+            "local_files_only": True,
+            "revision": expected_revision,
+        }
+    ]
 
 
 def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
@@ -187,7 +215,14 @@ def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
     expected.write_bytes(b"sidecar")
     monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
 
-    assert resolve_ltx_artifact(str(tmp_path), "Lightricks/test", filename) == str(expected)
+    assert resolve_ltx_artifact(
+        str(tmp_path),
+        "Lightricks/test",
+        filename,
+        local_files_only=True,
+        model_revision="unused-model-revision",
+        artifact_revision="unused-artifact-revision",
+    ) == str(expected)
 
 
 @pytest.mark.parametrize(
@@ -900,7 +935,7 @@ def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
         max_sequence_length=16,
     )
     prompt_context = object()
-    phase_calls = []
+    phase_calls: list[Any] = []
 
     def resolve_request_inputs(req, **kwargs):
         return request_inputs
@@ -959,7 +994,7 @@ def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
     pipeline.vae_spatial_compression_ratio = 32
     pipeline.vae_temporal_compression_ratio = 8
     pipeline.latent_upsampler = FakeUpsampler()
-    activated_slots = []
+    activated_slots: list[Any] = []
     if pipeline_cls is LTX2TwoStagePipeline:
         pipeline._phase_adapter = SimpleNamespace(activate=activated_slots.append)
     object.__setattr__(pipeline, "_resolve_request_inputs", resolve_request_inputs)
@@ -1284,7 +1319,7 @@ def test_ltx_official_two_stage_recipes_only_vary_by_model_defaults(recipe, step
 
 
 def test_ltx_two_stage_entries_select_the_official_adapter_slots():
-    phase_switches = []
+    phase_switches: list[Any] = []
     ordinary_pipeline = object.__new__(LTX2TwoStagePipeline)
     ordinary_pipeline._phase_adapter = SimpleNamespace(activate=phase_switches.append)
     for phase in LTX2_TWO_STAGE_RECIPE.phases:

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Focused LTX-2.5 pipeline correctness tests."""
 
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -190,7 +191,7 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
 
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
-    calls = {"components": []}
+    calls: dict[str, Any] = {"components": []}
     natten_processor = object()
 
     class FakeDiffusionDecoder:
@@ -313,7 +314,7 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
 def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_artifact(monkeypatch):
     revision = "diffusers-revision"
     config = {"decoder_stage_channels": [8, 8, 8, 8, 8]}
-    calls = {}
+    calls: dict[str, Any] = {}
 
     class FakeDecoder:
         def init_distributed(self):
@@ -325,8 +326,8 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
         calls["config"] = (model, kwargs)
         return config
 
-    def fake_resolve(model, repo_id, filename):
-        calls["artifact"] = (model, repo_id, filename)
+    def fake_resolve(model, repo_id, filename, **kwargs):
+        calls["artifact"] = (model, repo_id, filename, kwargs)
         return "/models/native-diffvae.safetensors"
 
     def fake_load(cls, path, passed_config, dtype):
@@ -365,9 +366,29 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
         "Lightricks/LTX-2.5-Diffusers",
         "Lightricks/LTX-2.5",
         "vae/ltx-2.5-video-vae-bf16.safetensors",
+        {
+            "local_files_only": False,
+            "model_revision": revision,
+            "artifact_revision": ltx2_components.LTX25_NATIVE_ARTIFACT_REVISION,
+        },
     )
     assert calls["load"] == ("/models/native-diffvae.safetensors", config, torch.bfloat16)
     assert calls["init_distributed"] is True
+
+
+def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
+    class MissingNattenProcessor:
+        def __init__(self):
+            raise ImportError("kernels is unavailable")
+
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodNattenProcessor",
+        MissingNattenProcessor,
+    )
+
+    with pytest.raises(RuntimeError, match=r"kernels==0\.14\.1.*supported GPU.*allow Hub access"):
+        ltx2_components._create_ltx25_natten_processor()
 
 
 def test_ltx_checkpoint_explicit_version_precedes_structural_heuristics(tmp_path):
@@ -813,7 +834,7 @@ def test_ltx25_distilled_two_stage_executes_custom_phase_schedules():
         max_sequence_length=16,
     )
     prompt_context = object()
-    phase_calls = []
+    phase_calls: list[Any] = []
 
     def resolve_request_inputs(req, **kwargs):
         return request_inputs

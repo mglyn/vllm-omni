@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright 2026 Lightricks and The HuggingFace Team. All rights reserved.
+#
+# Distributed tiling is copied and modified from Diffusers' serial LTX-2.5
+# tiling at commit d035dcd7cc7c88e0a154609b62887d50bba9fdc2 (Apache-2.0).
 
 """LTX-2.5-specific distributed execution for the diffusion VAE decoder."""
 
@@ -81,6 +85,11 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         model = super().from_pretrained(*args, **kwargs)
         model.init_distributed()
         return model
+
+    def set_parallel_size(self, parallel_size: int, mode: str = "tile") -> None:
+        if mode != "tile":
+            raise ValueError(f"LTX-2.5 DiffVAE only supports vae_parallel_mode='tile', got {mode!r}.")
+        super().set_parallel_size(parallel_size, mode=mode)
 
     def _build_tiled_decode_plan(
         self,

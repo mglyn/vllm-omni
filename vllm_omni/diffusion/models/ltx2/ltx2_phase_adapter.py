@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Construction and execution of a fixed LTX refinement-phase adapter.
 
@@ -10,6 +10,7 @@ adapter-capable while retaining their quantization and tensor-parallel paths.
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -420,6 +421,9 @@ def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
         pipeline.od_config.model,
         profile.artifact_repo_id,
         profile.distilled_lora_filename,
+        local_files_only=os.path.exists(pipeline.od_config.model),
+        model_revision=getattr(pipeline.od_config, "revision", None),
+        artifact_revision=profile.artifact_revision,
     )
 
     if layer_fused and pipeline.od_config.dtype is not torch.bfloat16:
