@@ -253,12 +253,17 @@ class LTXRuntime(
             raise ValueError(f"{self.__class__.__name__} does not support `image` input.")
         request_sigmas = self._resolve_request_sigmas(req, sigmas)
         request_phase_sigmas = self._resolve_request_phase_sigmas(req, stage_1_sigmas, stage_2_sigmas)
+        min_video_latent_spatial_size = None
+        if getattr(self, "use_diffusion_decoder", False):
+            first_stage_kernel = self.diffusion_decoder.config.decoder_stage_kernels[0]
+            min_video_latent_spatial_size = (int(first_stage_kernel[-2]), int(first_stage_kernel[-1]))
         validate_pipeline_request(
             request_inputs,
             pipeline_recipe=self.pipeline_recipe,
             vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
             vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
             pipeline_name=self.__class__.__name__,
+            min_video_latent_spatial_size=min_video_latent_spatial_size,
             request_sigmas=request_sigmas,
             request_phase_sigmas=request_phase_sigmas,
         )

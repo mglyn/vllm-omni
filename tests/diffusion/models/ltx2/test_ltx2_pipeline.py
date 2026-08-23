@@ -1193,6 +1193,59 @@ def test_ltx_two_stage_recipe_rejects_sigmas():
         )
 
 
+def test_ltx_request_applies_diffvae_minimum_spatial_size_only_when_requested():
+    request = LTXRequestInputs(
+        prompt="prompt",
+        negative_prompt="",
+        height=128,
+        width=128,
+        num_frames=9,
+        frame_rate=24.0,
+        num_inference_steps=30,
+        guidance=LTX2_ONE_STAGE_RECIPE.request_guidance,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=16,
+    )
+
+    with pytest.raises(ValueError, match="DiffVAE requires video latent spatial dimensions of at least 7x7"):
+        validate_pipeline_request(
+            request,
+            pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+            vae_spatial_compression_ratio=32,
+            vae_temporal_compression_ratio=8,
+            pipeline_name="LTX2Pipeline",
+            min_video_latent_spatial_size=(7, 7),
+        )
+
+    # ConvVAE does not use NATTEN, so its existing 128x128 boundary remains valid.
+    validate_pipeline_request(
+        request,
+        pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+        vae_spatial_compression_ratio=32,
+        vae_temporal_compression_ratio=8,
+        pipeline_name="LTX2Pipeline",
+    )
+
+    validate_pipeline_request(
+        replace(request, height=256, width=256),
+        pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+        vae_spatial_compression_ratio=32,
+        vae_temporal_compression_ratio=8,
+        pipeline_name="LTX2Pipeline",
+        min_video_latent_spatial_size=(7, 7),
+    )
+
+
 @pytest.mark.parametrize(
     ("direct_kwargs", "sampling_kwargs", "error"),
     [

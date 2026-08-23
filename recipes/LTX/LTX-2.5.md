@@ -66,10 +66,9 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 
 Both decoders are untiled by default. Set `vae_use_tiling` for memory-saving
 serial tiling; DiffVAE tiles only above 80 frames or 768 pixels in either spatial
-dimension. For distributed decode, use matching `--usp N` and
-`--vae-patch-parallel-size N`; this enables tiling and reuses the existing
-diffusion worker ranks. DiffVAE is decoder-only, so I2V still uses the
-convolutional VAE encoder.
+dimension. DiffVAE also supports distributed VAE decode; see the
+[VAE Parallelism Guide](../../docs/user_guide/diffusion/parallelism/vae_parallelism.md).
+DiffVAE is decoder-only, so I2V still uses the convolutional VAE encoder.
 
 ## Prerequisites
 
