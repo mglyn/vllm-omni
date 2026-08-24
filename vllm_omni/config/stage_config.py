@@ -301,6 +301,7 @@ class StageDeployConfig:
     default_sampling_params: dict[str, Any] | None = None
     default_pooling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
 
     # === Generic stage engine fields ===
     # Parallelism, scheduler, and memory-capacity controls.
@@ -532,7 +533,13 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
 
 
 _DEEP_MERGE_KEYS = frozenset(
-    {"default_sampling_params", "default_pooling_params", "subtalker_sampling_params", "engine_extras", "engine_args"}
+    {
+        "default_sampling_params",
+        "default_pooling_params",
+        "subtalker_sampling_params",
+        "engine_extras",
+        "engine_args",
+    }
 )
 
 
@@ -952,6 +959,7 @@ def merge_pipeline_deploy(
                 scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
+                sampling_constraints=dict(ps.sampling_constraints),
                 yaml_engine_args=engine_args,
                 yaml_runtime=runtime,
                 yaml_extras=extras,
@@ -979,6 +987,7 @@ class StageConfig:
     scheduler_cls: str | None = None
     hf_config_name: str | None = None
     is_comprehension: bool = False
+    sampling_constraints: dict[str, Any] = field(default_factory=dict)
     yaml_engine_args: dict[str, Any] = field(default_factory=dict)
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
@@ -1039,6 +1048,7 @@ class StageConfig:
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
             "is_comprehension": self.is_comprehension,
+            "sampling_constraints": dict(self.sampling_constraints),
         }
 
         if self.custom_process_input_func:
