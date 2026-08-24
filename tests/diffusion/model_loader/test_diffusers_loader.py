@@ -126,7 +126,9 @@ def test_prepare_weights_honors_component_index_and_explicit_override(tmp_path, 
             return str(index_path)
         raise loader_mod.huggingface_hub.errors.EntryNotFoundError(filename)
 
-    hub_download = mocker.patch.object(loader_mod, "hf_hub_download", side_effect=download_index)
+    hub_api = mocker.Mock()
+    hub_api.hf_hub_download.side_effect = download_index
+    mocker.patch.object(loader_mod, "hf_api", return_value=hub_api)
     indexed_download = mocker.patch.object(loader_mod, "download_weights_from_hf_specific", return_value=str(snapshot))
     generic_download = mocker.patch.object(loader_mod, "download_weights_from_hf", return_value=str(snapshot))
 
@@ -144,8 +146,8 @@ def test_prepare_weights_honors_component_index_and_explicit_override(tmp_path, 
     assert folder == str(transformer)
     assert [str(transformer / filename) for filename in indexed_files] == files
     assert use_safetensors
-    assert hub_download.call_count == 2
-    hub_download.assert_any_call(
+    assert hub_api.hf_hub_download.call_count == 2
+    hub_api.hf_hub_download.assert_any_call(
         repo_id="org/model",
         filename="transformer/diffusion_pytorch_model.safetensors.index.json",
         cache_dir=cache_dir,
@@ -214,11 +216,9 @@ def test_prepare_weights_rejects_polluted_offline_cache_without_index(tmp_path, 
             (transformer / f"diffusion_pytorch_model-{shard:05d}-of-{shard_count:05d}.safetensors").touch()
 
     mocker.patch.object(loader_mod.huggingface_hub.constants, "HF_HUB_OFFLINE", True)
-    index_download = mocker.patch.object(
-        loader_mod,
-        "hf_hub_download",
-        side_effect=loader_mod.huggingface_hub.errors.EntryNotFoundError("index is not cached"),
-    )
+    hub_api = mocker.Mock()
+    hub_api.hf_hub_download.side_effect = loader_mod.huggingface_hub.errors.EntryNotFoundError("index is not cached")
+    mocker.patch.object(loader_mod, "hf_api", return_value=hub_api)
     mocker.patch.object(loader_mod, "download_weights_from_hf", return_value=str(snapshot))
 
     loader = _make_loader_with_weights([])
@@ -231,8 +231,8 @@ def test_prepare_weights_rejects_polluted_offline_cache_without_index(tmp_path, 
             allow_patterns_overrides=None,
         )
 
-    assert index_download.call_count == 2
-    assert all(call.kwargs["local_files_only"] for call in index_download.call_args_list)
+    assert hub_api.hf_hub_download.call_count == 2
+    assert all(call.kwargs["local_files_only"] for call in hub_api.hf_hub_download.call_args_list)
 
 
 def test_strict_check_only_validates_source_prefix_parameters():

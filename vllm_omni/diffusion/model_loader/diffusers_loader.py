@@ -13,7 +13,6 @@ from typing import cast
 
 import huggingface_hub
 import torch
-from huggingface_hub import hf_hub_download
 from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
@@ -25,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.transformers_utils.repo_utils import hf_api
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -191,7 +191,7 @@ class DiffusersPipelineLoader:
                 continue
 
             try:
-                index_path = hf_hub_download(
+                index_path = hf_api().hf_hub_download(
                     repo_id=str(model_name_or_path),
                     filename=repo_index_path,
                     cache_dir=self.load_config.download_dir,
