@@ -1417,6 +1417,49 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     assert next(video_vae.parameters()).dtype == torch.float32
 
 
+def test_video_vae_installs_exact_optimizations(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Module()
+
+    class FakeRemote(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeModel()
+
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+        },
+    )
+    monkeypatch.setattr(
+        vae_module,
+        "_load_remote_component",
+        lambda _path, _config: FakeRemote(),
+    )
+    install = Mock(return_value=True)
+    monkeypatch.setattr(vae_module, "install_h3_vae_optimizations", install)
+    monkeypatch.setattr(vae_module, "PinnedModuleStager", Mock())
+
+    video_vae = vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("cuda"),
+        load_device=torch.device("cpu"),
+    )
+
+    install.assert_called_once_with(
+        video_vae.model.decoder,
+        device=torch.device("cuda"),
+    )
+
+
 def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
