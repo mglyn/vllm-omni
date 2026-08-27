@@ -9,30 +9,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.platforms import current_omni_platform
 
-from .qk_norm_rope import try_qk_norm_rope_exact
-from .scaled_residual import try_scaled_residual_exact
-
-_H3_VAE_COMPUTE_CAPABILITY = 90
-
-
-def _supports_h3_vae_optimizations(device: torch.device) -> bool:
-    """Return whether the exact operators were validated for ``device``."""
-
-    if (
-        not HAS_TRITON
-        or device.type != "cuda"
-        or not current_omni_platform.is_cuda()
-        or not current_omni_platform.is_available()
-    ):
-        return False
-    device_index = 0 if device.index is None else int(device.index)
-    capability = current_omni_platform.get_device_capability(device_index)
-    return capability is not None and int(capability.to_int()) == _H3_VAE_COMPUTE_CAPABILITY
+from .dispatch import resolve_h3_vae_operators
 
 
 def _optimized_feed_forward(self: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -69,7 +49,7 @@ def _optimized_attention(
         3 * self.dim_head,
     )
     query, key, value = qkv.chunk(3, dim=-1)
-    optimized_qk = try_qk_norm_rope_exact(
+    optimized_qk = self._omni_qk_norm_rope(
         query,
         key,
         rotary_pos_emb,
@@ -96,7 +76,7 @@ def _optimized_transformer_block(
 
     normalized = self.norm1(hidden_states.float()).to(hidden_states.dtype)
     attention_output = self.attn(normalized, rotary_pos_emb, pack_info)
-    updated = try_scaled_residual_exact(
+    updated = self._omni_scaled_residual(
         hidden_states,
         attention_output,
         self.scale1,
@@ -105,7 +85,7 @@ def _optimized_transformer_block(
 
     normalized = self.norm2(hidden_states.float()).to(hidden_states.dtype)
     feed_forward_output = self.ff(normalized)
-    updated = try_scaled_residual_exact(
+    updated = self._omni_scaled_residual(
         hidden_states,
         feed_forward_output,
         self.scale2,
@@ -153,11 +133,12 @@ def install_h3_vae_optimizations(
     *,
     device: torch.device,
 ) -> bool:
-    """Install validated SM90 optimizations once, leaving other targets intact."""
+    """Install the operators selected for ``device`` once."""
 
     if getattr(decoder, "_omni_h3_vae_optimizations_installed", False):
         return True
-    if not _supports_h3_vae_optimizations(device):
+    operators = resolve_h3_vae_operators(device)
+    if operators is None:
         return False
 
     linears = _decoder_block_linears(decoder)
@@ -172,7 +153,9 @@ def install_h3_vae_optimizations(
     for block in decoder.transformer_blocks:
         block.ff._omni_silu_and_mul = SiluAndMul()
         block.ff.forward = MethodType(_optimized_feed_forward, block.ff)
+        block.attn._omni_qk_norm_rope = operators.qk_norm_rope
         block.attn.forward = MethodType(_optimized_attention, block.attn)
+        block._omni_scaled_residual = operators.scaled_residual
         block.forward = MethodType(_optimized_transformer_block, block)
 
     decoder._omni_h3_vae_optimizations_installed = True

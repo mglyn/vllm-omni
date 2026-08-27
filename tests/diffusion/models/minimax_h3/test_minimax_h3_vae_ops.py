@@ -5,13 +5,34 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.triton_utils import HAS_TRITON
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [pytest.mark.core_model, pytest.mark.gpu, pytest.mark.diffusion]
 
 
-def _sm90_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+def _selected_operators():
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae.dispatch import (
+        resolve_h3_vae_operators,
+    )
+
+    if not current_omni_platform.is_available():
+        pytest.skip("No accelerator is available")
+    device = current_omni_platform.get_torch_device()
+    operators = resolve_h3_vae_operators(device)
+    if operators is None:
+        pytest.skip("No H3 VAE operator implementation is registered for this target")
+    return device, operators
+
+
+def _operator_set(*, supports=lambda _device: True):
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae.dispatch import H3VAEOperatorSet
+
+    return H3VAEOperatorSet(
+        supports=supports,
+        qk_norm_rope=lambda *_args: None,
+        scaled_residual=lambda *_args: None,
+    )
 
 
 def _qk_reference(x, cos, sin):
@@ -25,13 +46,9 @@ def _qk_reference(x, cos, sin):
     )
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="CUDA SM90 required")
-@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize(("batch", "sequence"), [(1, 1), (1, 195), (2, 1797)])
 def test_h3_vae_qk_norm_rope_is_bit_exact(batch, sequence):
-    from vllm_omni.diffusion.models.minimax_h3.ops.vae.qk_norm_rope import (
-        try_qk_norm_rope_exact,
-    )
+    device, operators = _selected_operators()
 
     torch.manual_seed(17)
     qkv = torch.randn(
@@ -39,17 +56,17 @@ def test_h3_vae_qk_norm_rope_is_bit_exact(batch, sequence):
         sequence,
         32,
         192,
-        device="cuda",
+        device=device,
         dtype=torch.float16,
     )
     q, k, _ = qkv.chunk(3, dim=-1)
-    cos = torch.randn(batch, sequence, 1, 48, device="cuda", dtype=torch.float16)
+    cos = torch.randn(batch, sequence, 1, 48, device=device, dtype=torch.float16)
     sin = torch.randn_like(cos)
 
     expected_q = _qk_reference(q, cos, sin)
     expected_k = _qk_reference(k, cos, sin)
     with torch.inference_mode():
-        actual = try_qk_norm_rope_exact(q, k, (cos, sin), 1e-5)
+        actual = operators.qk_norm_rope(q, k, (cos, sin), 1e-5)
 
     assert actual is not None
     actual_q, actual_k = actual
@@ -57,21 +74,17 @@ def test_h3_vae_qk_norm_rope_is_bit_exact(batch, sequence):
     assert torch.equal(actual_k, expected_k)
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="CUDA SM90 required")
-@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_h3_vae_scaled_residual_is_bit_exact():
-    from vllm_omni.diffusion.models.minimax_h3.ops.vae.scaled_residual import (
-        try_scaled_residual_exact,
-    )
+    device, operators = _selected_operators()
 
     torch.manual_seed(29)
-    residual = torch.randn(195, 2048, device="cuda", dtype=torch.float32)
-    branch = torch.randn(195, 2048, device="cuda", dtype=torch.float16)
-    scale = torch.randn(2048, device="cuda", dtype=torch.float32)
+    residual = torch.randn(195, 2048, device=device, dtype=torch.float32)
+    branch = torch.randn(195, 2048, device=device, dtype=torch.float16)
+    scale = torch.randn(2048, device=device, dtype=torch.float32)
     expected = residual + branch * scale
 
     with torch.inference_mode():
-        actual = try_scaled_residual_exact(residual, branch, scale)
+        actual = operators.scaled_residual(residual, branch, scale)
 
     assert actual is not None
     assert torch.equal(actual, expected)
@@ -146,12 +159,13 @@ def _make_decoder():
 def test_h3_vae_install_precasts_only_block_linears(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
-    monkeypatch.setattr(vae_ops, "_supports_h3_vae_optimizations", lambda _device: True)
+    operators = _operator_set()
+    monkeypatch.setattr(vae_ops, "resolve_h3_vae_operators", lambda _device: operators)
     decoder = _make_decoder()
 
     assert vae_ops.install_h3_vae_optimizations(
         decoder,
-        device=torch.device("cuda:0"),
+        device=torch.device("meta"),
     )
 
     for block in decoder.transformer_blocks:
@@ -162,30 +176,32 @@ def test_h3_vae_install_precasts_only_block_linears(monkeypatch):
         assert block.forward.__func__.__name__ == "_optimized_transformer_block"
         assert block.attn.forward.__func__.__name__ == "_optimized_attention"
         assert block.ff.forward.__func__.__name__ == "_optimized_feed_forward"
+        assert block.attn._omni_qk_norm_rope is operators.qk_norm_rope
+        assert block._omni_scaled_residual is operators.scaled_residual
     assert decoder.proj_out.weight.dtype == torch.float32
 
     # Repeated installation is idempotent.
     assert vae_ops.install_h3_vae_optimizations(
         decoder,
-        device=torch.device("cuda:0"),
+        device=torch.device("meta"),
     )
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="CUDA SM90 required")
 def test_h3_vae_swiglu_uses_post_linear_fp16_output(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
-    monkeypatch.setattr(vae_ops, "_supports_h3_vae_optimizations", lambda _device: True)
-    decoder = _make_decoder().cuda()
+    device, operators = _selected_operators()
+    monkeypatch.setattr(vae_ops, "resolve_h3_vae_operators", lambda _device: operators)
+    decoder = _make_decoder().to(device)
     feed_forward = decoder.transformer_blocks[0].ff
     reference_forward = type(feed_forward).forward
     assert vae_ops.install_h3_vae_optimizations(
         decoder,
-        device=torch.device("cuda:0"),
+        device=device,
     )
 
-    hidden_states = torch.randn(4, 8, device="cuda", dtype=torch.float32)
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+    hidden_states = torch.randn(4, 8, device=device, dtype=torch.float32)
+    with torch.inference_mode(), torch.autocast(device.type, dtype=torch.float16):
         expected = reference_forward(feed_forward, hidden_states)
         actual = feed_forward(hidden_states)
 
@@ -196,12 +212,12 @@ def test_h3_vae_swiglu_uses_post_linear_fp16_output(monkeypatch):
 def test_h3_vae_install_leaves_unsupported_target_untouched(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
-    monkeypatch.setattr(vae_ops, "_supports_h3_vae_optimizations", lambda _device: False)
+    monkeypatch.setattr(vae_ops, "resolve_h3_vae_operators", lambda _device: None)
     decoder = _make_decoder()
 
     assert not vae_ops.install_h3_vae_optimizations(
         decoder,
-        device=torch.device("cuda:0"),
+        device=torch.device("meta"),
     )
     assert not hasattr(decoder, "_omni_h3_vae_optimizations_installed")
     for block in decoder.transformer_blocks:
@@ -211,36 +227,12 @@ def test_h3_vae_install_leaves_unsupported_target_untouched(monkeypatch):
         assert block.attn.forward.__func__.__name__ == "forward"
 
 
-def test_h3_vae_support_is_platform_and_capability_scoped(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
+def test_h3_vae_dispatch_is_extended_by_adding_an_operator_set(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae import dispatch
 
-    class FakePlatform:
-        def __init__(self, cuda, capability):
-            self.cuda = cuda
-            self.capability = capability
+    first = _operator_set(supports=lambda _device: False)
+    added = _operator_set(supports=lambda device: device.type == "meta")
+    monkeypatch.setattr(dispatch, "H3_VAE_OPERATOR_TABLE", (first, added))
 
-        def is_cuda(self):
-            return self.cuda
-
-        def is_available(self):
-            return True
-
-        def get_device_capability(self, _device_index):
-            capability = self.capability
-
-            class Capability:
-                def to_int(self):
-                    return capability
-
-            return Capability()
-
-    platform = FakePlatform(True, 90)
-    monkeypatch.setattr(vae_ops, "current_omni_platform", platform)
-    monkeypatch.setattr(vae_ops, "HAS_TRITON", True)
-
-    assert vae_ops._supports_h3_vae_optimizations(torch.device("cuda:0"))
-    platform.capability = 89
-    assert not vae_ops._supports_h3_vae_optimizations(torch.device("cuda:0"))
-    platform.cuda = False
-    assert not vae_ops._supports_h3_vae_optimizations(torch.device("cuda:0"))
-    assert not vae_ops._supports_h3_vae_optimizations(torch.device("cpu"))
+    assert dispatch.resolve_h3_vae_operators(torch.device("meta")) is added
+    assert dispatch.resolve_h3_vae_operators(torch.device("cpu")) is None
