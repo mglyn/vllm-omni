@@ -130,6 +130,9 @@ def _make_decoder():
             self.w2 = nn.Linear(16, 8)
             self.use_gated = True
             self.act_fn = nn.SiLU()
+            self._compile_forward_enabled = False
+            self._compile_forward_fatal = False
+            self._compiled_forward = None
 
         def forward(self, hidden_states):
             hidden_states = self.w1(hidden_states)
@@ -225,6 +228,60 @@ def test_h3_vae_install_leaves_unsupported_target_untouched(monkeypatch):
         assert block.ff.w1.weight.dtype == torch.float32
         assert block.forward.__func__.__name__ == "forward"
         assert block.attn.forward.__func__.__name__ == "forward"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "0"),
+        ("MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "1"),
+        ("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "true"),
+    ],
+)
+def test_h3_vae_install_preserves_nondefault_official_semantics(monkeypatch, name, value):
+    from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
+
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        vae_ops,
+        "resolve_h3_vae_operators",
+        lambda _device: _operator_set(),
+    )
+    decoder = _make_decoder()
+
+    assert not vae_ops.install_h3_vae_optimizations(
+        decoder,
+        device=torch.device("meta"),
+    )
+    assert not hasattr(decoder, "_omni_h3_vae_optimizations_installed")
+    assert decoder.transformer_blocks[0].attn.to_qkv.weight.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "break_contract",
+    [
+        lambda block: delattr(block.attn, "spatial_parallel"),
+        lambda block: setattr(block.attn, "perform_attention", None),
+        lambda block: setattr(block, "scale1", nn.Parameter(torch.zeros(7))),
+        lambda block: setattr(block.ff, "_compile_forward_enabled", True),
+    ],
+)
+def test_h3_vae_install_rejects_incompatible_remote_contract(monkeypatch, break_contract):
+    from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
+
+    monkeypatch.setattr(
+        vae_ops,
+        "resolve_h3_vae_operators",
+        lambda _device: _operator_set(),
+    )
+    decoder = _make_decoder()
+    break_contract(decoder.transformer_blocks[0])
+
+    assert not vae_ops.install_h3_vae_optimizations(
+        decoder,
+        device=torch.device("meta"),
+    )
+    assert decoder.transformer_blocks[0].attn.to_qkv.weight.dtype == torch.float32
 
 
 def test_h3_vae_dispatch_is_extended_by_adding_an_operator_set(monkeypatch):

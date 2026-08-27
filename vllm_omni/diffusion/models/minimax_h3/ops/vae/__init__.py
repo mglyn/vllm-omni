@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from types import MethodType
 from typing import Any
 
@@ -15,19 +16,31 @@ from vllm_omni.diffusion.layers.activation import SiluAndMul
 from .dispatch import resolve_h3_vae_operators
 
 
+def _env_flag(name: str, default: str) -> bool:
+    value = os.environ.get(name, default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _official_execution_semantics_supported() -> bool:
+    """Return whether replacing the official eager forwards is semantics-safe."""
+
+    return (
+        _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1")
+        and not _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "0")
+        and not _env_flag("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "0")
+    )
+
+
 def _optimized_feed_forward(self: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     if torch.compiler.is_compiling():
         return type(self).forward(self, hidden_states)
 
     hidden_states = self.w1(hidden_states)
-    if self.use_gated:
-        if hidden_states.is_cuda and hidden_states.dtype == torch.float16:
-            hidden_states = self._omni_silu_and_mul(hidden_states)
-        else:
-            gate, hidden_states = hidden_states.chunk(2, dim=-1)
-            hidden_states = self.act_fn(gate) * hidden_states
+    if hidden_states.is_cuda and hidden_states.dtype == torch.float16:
+        hidden_states = self._omni_silu_and_mul(hidden_states)
     else:
-        hidden_states = self.act_fn(hidden_states)
+        gate, hidden_states = hidden_states.chunk(2, dim=-1)
+        hidden_states = self.act_fn(gate) * hidden_states
     return self.w2(hidden_states)
 
 
@@ -102,14 +115,20 @@ def _decoder_block_linears(decoder: nn.Module) -> tuple[nn.Linear, ...] | None:
     for block in blocks:
         attention = getattr(block, "attn", None)
         feed_forward = getattr(block, "ff", None)
-        candidates = (
-            getattr(attention, "to_qkv", None),
-            getattr(attention, "to_out", None),
-            getattr(feed_forward, "w1", None),
-            getattr(feed_forward, "w2", None),
-        )
+        to_qkv = getattr(attention, "to_qkv", None)
+        to_out = getattr(attention, "to_out", None)
+        w1 = getattr(feed_forward, "w1", None)
+        w2 = getattr(feed_forward, "w2", None)
+        candidates = (to_qkv, to_out, w1, w2)
+        dim_head = getattr(attention, "dim_head", None)
+        scale1 = getattr(block, "scale1", None)
+        scale2 = getattr(block, "scale2", None)
         if (
             not all(isinstance(linear, nn.Linear) for linear in candidates)
+            or not isinstance(getattr(attention, "spatial_parallel", None), bool)
+            or not isinstance(dim_head, int)
+            or dim_head <= 0
+            or not callable(getattr(attention, "perform_attention", None))
             or not isinstance(getattr(attention, "norm_q", None), nn.RMSNorm)
             or not isinstance(getattr(attention, "norm_k", None), nn.RMSNorm)
             or attention.norm_q.weight is not None
@@ -120,8 +139,31 @@ def _decoder_block_linears(decoder: nn.Module) -> tuple[nn.Linear, ...] | None:
             or block.norm1.weight is None
             or block.norm2.weight is None
             or not getattr(block, "use_scale", False)
+            or not isinstance(scale1, torch.Tensor)
+            or not isinstance(scale2, torch.Tensor)
             or not getattr(feed_forward, "use_gated", False)
             or not isinstance(getattr(feed_forward, "act_fn", None), nn.SiLU)
+            or not hasattr(feed_forward, "_compile_forward_enabled")
+            or getattr(feed_forward, "_compile_forward_enabled")
+            or not hasattr(feed_forward, "_compile_forward_fatal")
+            or not hasattr(feed_forward, "_compiled_forward")
+        ):
+            return None
+
+        hidden_size = to_qkv.in_features
+        if (
+            to_qkv.out_features != 3 * to_out.in_features
+            or to_out.in_features % dim_head != 0
+            or to_out.out_features != hidden_size
+            or w1.in_features != hidden_size
+            or w1.out_features != 2 * w2.in_features
+            or w2.out_features != hidden_size
+            or attention.norm_q.normalized_shape != (dim_head,)
+            or attention.norm_k.normalized_shape != (dim_head,)
+            or block.norm1.normalized_shape != (hidden_size,)
+            or block.norm2.normalized_shape != (hidden_size,)
+            or scale1.shape != (hidden_size,)
+            or scale2.shape != (hidden_size,)
         ):
             return None
         linears.extend(candidates)
@@ -137,6 +179,8 @@ def install_h3_vae_optimizations(
 
     if getattr(decoder, "_omni_h3_vae_optimizations_installed", False):
         return True
+    if not _official_execution_semantics_supported():
+        return False
     operators = resolve_h3_vae_operators(device)
     if operators is None:
         return False
