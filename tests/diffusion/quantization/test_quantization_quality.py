@@ -538,8 +538,6 @@ def _quality_param(c: QualityTestConfig):
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")
         )
-    if c.id == "fp8_ltx2":
-        marks.append(pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/6245"))
     return pytest.param(c, id=c.id, marks=marks)
 
 
