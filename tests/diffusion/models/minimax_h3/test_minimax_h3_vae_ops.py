@@ -235,6 +235,26 @@ def test_h3_vae_install_precasts_only_block_linears(monkeypatch):
     )
 
 
+def test_h3_vae_install_accepts_remote_integer_parallel_flag(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
+
+    monkeypatch.setattr(
+        vae_ops,
+        "resolve_h3_vae_operators",
+        lambda _device: _operator_set(),
+    )
+    decoder = _make_decoder()
+    for block in decoder.transformer_blocks:
+        # The official checkpoint loads this JSON boolean-like field as int 0.
+        block.attn.spatial_parallel = 0
+
+    assert vae_ops.install_h3_vae_optimizations(
+        decoder,
+        device=torch.device("meta"),
+    )
+    assert getattr(decoder, "_omni_h3_vae_optimizations_installed", False)
+
+
 def test_h3_vae_swiglu_uses_post_linear_fp16_output(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
@@ -306,6 +326,7 @@ def test_h3_vae_install_preserves_nondefault_official_semantics(monkeypatch, nam
     "break_contract",
     [
         lambda block: delattr(block.attn, "spatial_parallel"),
+        lambda block: setattr(block.attn, "spatial_parallel", 2),
         lambda block: setattr(block.attn, "perform_attention", None),
         lambda block: setattr(block, "scale1", nn.Parameter(torch.zeros(7))),
         lambda block: setattr(block.ff, "_compile_forward_enabled", True),

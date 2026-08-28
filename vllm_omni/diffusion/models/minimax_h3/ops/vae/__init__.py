@@ -31,6 +31,12 @@ def _official_execution_semantics_supported() -> bool:
     )
 
 
+def _is_boolean_flag(value: Any) -> bool:
+    """Accept bools and the JSON-derived 0/1 flags used by remote VAE code."""
+
+    return isinstance(value, bool) or type(value) is int and value in (0, 1)
+
+
 def _optimized_feed_forward(self: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     if torch.compiler.is_compiling():
         return type(self).forward(self, hidden_states)
@@ -125,7 +131,7 @@ def _decoder_block_linears(decoder: nn.Module) -> tuple[nn.Linear, ...] | None:
         scale2 = getattr(block, "scale2", None)
         if (
             not all(isinstance(linear, nn.Linear) for linear in candidates)
-            or not isinstance(getattr(attention, "spatial_parallel", None), bool)
+            or not _is_boolean_flag(getattr(attention, "spatial_parallel", None))
             or not isinstance(dim_head, int)
             or dim_head <= 0
             or not callable(getattr(attention, "perform_attention", None))
