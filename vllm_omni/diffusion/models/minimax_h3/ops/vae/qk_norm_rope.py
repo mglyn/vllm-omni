@@ -143,8 +143,9 @@ def try_qk_norm_rope_exact(
     sin = sin.reshape(tokens, sin.shape[-1])
     q_output = torch.empty_like(q)
     k_output = torch.empty_like(k)
-    # This SM90 launch layout is part of the exactness contract: changing the
-    # warp-to-row mapping changes the FP32 RMS reduction order.
+    # This launch layout is part of the exactness contract on the validated
+    # SM90 and SM103 targets: changing the warp-to-row mapping changes the
+    # FP32 RMS reduction order.
     heads_per_program = 8
     grid = (tokens, triton.cdiv(heads, heads_per_program))
     launch_args = {

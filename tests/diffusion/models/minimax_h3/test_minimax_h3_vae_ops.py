@@ -359,3 +359,21 @@ def test_h3_vae_dispatch_is_extended_by_adding_an_operator_set(monkeypatch):
 
     assert dispatch.resolve_h3_vae_operators(torch.device("meta")) is added
     assert dispatch.resolve_h3_vae_operators(torch.device("cpu")) is None
+
+
+def test_h3_vae_dispatch_selects_only_validated_cuda_capabilities(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae import dispatch
+
+    platform = Mock()
+    platform.is_cuda.return_value = True
+    platform.is_available.return_value = True
+    monkeypatch.setattr(dispatch, "HAS_TRITON", True)
+    monkeypatch.setattr(dispatch, "current_omni_platform", platform)
+
+    for capability in (90, 103):
+        platform.get_device_capability.return_value.to_int.return_value = capability
+        assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is not None
+
+    for capability in (89, 100, 110):
+        platform.get_device_capability.return_value.to_int.return_value = capability
+        assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is None

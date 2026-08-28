@@ -39,7 +39,7 @@ class H3VAEOperatorSet:
     scaled_residual: ScaledResidualOp
 
 
-def _supports_cuda_sm90(device: torch.device) -> bool:
+def _supports_cuda_capability(device: torch.device, expected: int) -> bool:
     if (
         not HAS_TRITON
         or device.type != "cuda"
@@ -50,7 +50,15 @@ def _supports_cuda_sm90(device: torch.device) -> bool:
         return False
     device_index = 0 if device.index is None else int(device.index)
     capability = current_omni_platform.get_device_capability(device_index)
-    return capability is not None and int(capability.to_int()) == 90
+    return capability is not None and int(capability.to_int()) == expected
+
+
+def _supports_cuda_sm90(device: torch.device) -> bool:
+    return _supports_cuda_capability(device, 90)
+
+
+def _supports_cuda_sm103(device: torch.device) -> bool:
+    return _supports_cuda_capability(device, 103)
 
 
 # Keep hardware selection flat: adding a backend means adding one operator set,
@@ -58,6 +66,11 @@ def _supports_cuda_sm90(device: torch.device) -> bool:
 H3_VAE_OPERATOR_TABLE: tuple[H3VAEOperatorSet, ...] = (
     H3VAEOperatorSet(
         supports=_supports_cuda_sm90,
+        qk_norm_rope=try_qk_norm_rope_exact,
+        scaled_residual=try_scaled_residual_exact,
+    ),
+    H3VAEOperatorSet(
+        supports=_supports_cuda_sm103,
         qk_norm_rope=try_qk_norm_rope_exact,
         scaled_residual=try_scaled_residual_exact,
     ),
