@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Install bit-exact eager optimizations for the MiniMax H3 video VAE."""
+"""Install bit-exact eager optimizations for the MiniMax H3 video VAE.
+
+These operations stay model-owned because correctness and performance depend
+on H3's exact math, dtype, layout, execution contract, and per-platform
+validation. Dispatch and fallbacks therefore live beside the model integration;
+migration to a shared operator tier can follow once #6305 defines one.
+"""
 
 from __future__ import annotations
 
