@@ -48,6 +48,18 @@ def _qk_reference(x, cos, sin):
     )
 
 
+def _vit_norm_input(_module, hidden_states):
+    return hidden_states.float()
+
+
+def _same_dtype_norm_input(_module, hidden_states):
+    return hidden_states
+
+
+def _failing_norm_input(_module, _hidden_states):
+    raise RuntimeError("unsupported remote normalization semantics")
+
+
 @pytest.mark.parametrize(("batch", "sequence"), [(1, 1), (1, 195), (2, 1797)])
 def test_h3_vae_qk_norm_rope_is_bit_exact(batch, sequence):
     device, operators = _selected_operators()
@@ -295,24 +307,18 @@ def test_h3_vae_install_leaves_unsupported_target_untouched(monkeypatch):
         assert block.attn.forward.__func__.__name__ == "forward"
 
 
-@pytest.mark.parametrize(
-    ("name", "value"),
-    [
-        ("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "0"),
-        ("MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "1"),
-        ("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "true"),
-    ],
-)
-def test_h3_vae_install_preserves_nondefault_official_semantics(monkeypatch, name, value):
+@pytest.mark.parametrize("norm_input", [None, _same_dtype_norm_input, _failing_norm_input])
+def test_h3_vae_install_requires_fp32_attention_norm_semantics(monkeypatch, norm_input):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
-    monkeypatch.setenv(name, value)
     monkeypatch.setattr(
         vae_ops,
         "resolve_h3_vae_operators",
         lambda _device: _operator_set(),
     )
     decoder = _make_decoder()
+    forward_globals = type(decoder.transformer_blocks[0].attn).forward.__globals__
+    monkeypatch.setitem(forward_globals, "_vit_norm_input", norm_input)
 
     assert not vae_ops.install_h3_vae_optimizations(
         decoder,

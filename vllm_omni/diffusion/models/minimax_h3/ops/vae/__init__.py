@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from types import MethodType
 from typing import Any
 
@@ -16,25 +15,29 @@ from vllm_omni.diffusion.layers.activation import SiluAndMul
 from .dispatch import resolve_h3_vae_operators
 
 
-def _env_flag(name: str, default: str) -> bool:
-    value = os.environ.get(name, default)
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _official_execution_semantics_supported() -> bool:
-    """Return whether replacing the official eager forwards is semantics-safe."""
-
-    return (
-        _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1")
-        and not _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "0")
-        and not _env_flag("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "0")
-    )
-
-
 def _is_boolean_flag(value: Any) -> bool:
     """Accept bools and the JSON-derived 0/1 flags used by remote VAE code."""
 
     return isinstance(value, bool) or type(value) is int and value in (0, 1)
+
+
+def _uses_fp32_attention_norm(attention: nn.Module) -> bool:
+    """Probe the loaded remote module's Q/K normalization semantics."""
+
+    forward = getattr(type(attention), "forward", None)
+    namespace = getattr(forward, "__globals__", None)
+    norm_input = namespace.get("_vit_norm_input") if isinstance(namespace, dict) else None
+    if not callable(norm_input):
+        return False
+
+    probe = torch.empty(1, dtype=torch.float16)
+    try:
+        normalized = norm_input(attention.norm_q, probe)
+    except Exception:
+        return False
+    return (
+        isinstance(normalized, torch.Tensor) and normalized.shape == probe.shape and normalized.dtype == torch.float32
+    )
 
 
 def _optimized_feed_forward(self: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -140,6 +143,7 @@ def _decoder_block_linears(decoder: nn.Module) -> tuple[nn.Linear, ...] | None:
             or attention.norm_q.weight is not None
             or attention.norm_k.weight is not None
             or attention.norm_q.eps != attention.norm_k.eps
+            or not _uses_fp32_attention_norm(attention)
             or not isinstance(getattr(block, "norm1", None), nn.RMSNorm)
             or not isinstance(getattr(block, "norm2", None), nn.RMSNorm)
             or block.norm1.weight is None
@@ -185,8 +189,6 @@ def install_h3_vae_optimizations(
 
     if getattr(decoder, "_omni_h3_vae_optimizations_installed", False):
         return True
-    if not _official_execution_semantics_supported():
-        return False
     operators = resolve_h3_vae_operators(device)
     if operators is None:
         return False
