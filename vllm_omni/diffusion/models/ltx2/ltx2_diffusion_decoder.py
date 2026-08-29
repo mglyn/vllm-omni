@@ -17,8 +17,25 @@ from diffusers.models.autoencoders import (
 from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
     LTX2VideoDiffusionDecoder3d as DiffusersLTX2VideoDiffusionDecoder3d,
 )
+from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
+    LTX2VideoVaeDiffusionNABlock as DiffusersLTX2VideoVaeDiffusionNABlock,
+)
+from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
+    LTX2VideoVaeNeighborhoodAttention as DiffusersLTX2VideoVaeNeighborhoodAttention,
+)
+from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
+    LTX2VideoVaeSwiGLU as DiffusersLTX2VideoVaeSwiGLU,
+)
 from diffusers.models.autoencoders.vae import DecoderOutput
 from safetensors import safe_open
+
+from .ops.diffvae import (
+    try_qk_rms_norm_scale_rope_3d_exact,
+    try_qk_scale_rope_3d_exact,
+    try_residual_add3_exact,
+    try_residual_rms_norm_modulate_exact,
+    try_swiglu_tiled_exact,
+)
 
 LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID = "Lightricks/LTX-2.5"
 LTX25_NATIVE_ARTIFACT_REVISION = "8a4ff96f581e72bedc1b44367581c49d544a05f1"
@@ -131,6 +148,124 @@ def load_ltx25_native_diffusion_decoder_state_dict(path: str) -> dict[str, torch
     return convert_ltx25_native_diffusion_decoder_state_dict(native_state_dict)
 
 
+class LTX2VideoVaeNeighborhoodAttention(DiffusersLTX2VideoVaeNeighborhoodAttention):
+    """DiffVAE attention with a fail-closed exact eager fast path."""
+
+    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, num_frames, height, width, _ = hidden_states.shape
+        shape = (batch_size, num_frames, height, width, self.heads, self.head_dim)
+        query = self.to_q(hidden_states).view(shape)
+        key = self.to_k(hidden_states).view(shape)
+        value = self.to_v(hidden_states).view(shape)
+
+        optimized = try_qk_rms_norm_scale_rope_3d_exact(
+            query,
+            key,
+            self.norm_q.weight,
+            self.norm_k.weight,
+            self.norm_q.eps,
+            self.scale,
+            self.rope.rope_dim_split,
+            self.rope.base,
+        )
+        if optimized is not None:
+            query, key = optimized
+            return query, key, value
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        optimized = try_qk_scale_rope_3d_exact(
+            query,
+            key,
+            self.scale,
+            self.rope.rope_dim_split,
+            self.rope.base,
+        )
+        if optimized is not None:
+            query, key = optimized
+            return query, key, value
+
+        query = query * self.scale
+        return self.rope(query), self.rope(key), value
+
+
+class LTX2VideoVaeSwiGLU(DiffusersLTX2VideoVaeSwiGLU):
+    """DiffVAE SwiGLU with an exact workspace-reusing eager path."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        optimized = try_swiglu_tiled_exact(
+            hidden_states,
+            self.w_gate.weight,
+            self.w_up.weight,
+            self.w_down.weight,
+        )
+        if optimized is not None:
+            return optimized
+        return super().forward(hidden_states)
+
+
+class LTX2VideoVaeDiffusionNABlock(DiffusersLTX2VideoVaeDiffusionNABlock):
+    """DiffVAE block with exact eager residual-AdaLN fusions."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        latent_context: torch.Tensor,
+        modulation: tuple[torch.Tensor, ...],
+        block_mask=None,
+    ) -> torch.Tensor:
+        scale_msa, shift_msa, _, scale_mlp, shift_mlp, _, _ = [
+            modulation[i] + self.scale_shift_table[i].view(1, 1, 1, 1, -1) for i in range(self.num_mod_params)
+        ]
+        context_output = self.context_proj(latent_context)
+        attention_input = try_residual_rms_norm_modulate_exact(
+            hidden_states,
+            context_output,
+            None,
+            self.norm1.weight,
+            scale_msa,
+            shift_msa,
+            self.norm1.eps,
+        )
+        if attention_input is None:
+            # Preserve the original expression for unsupported platforms and
+            # torch.compile instead of exposing the eager fusion internals.
+            hidden_states = hidden_states + context_output
+            hidden_states = hidden_states + self.attn(
+                self.norm1(hidden_states) * (1 + scale_msa) + shift_msa,
+                block_mask,
+            )
+            hidden_states = hidden_states + self.mlp(self.norm2(hidden_states) * (1 + scale_mlp) + shift_mlp)
+            return hidden_states
+
+        attention_output = self.attn(attention_input, block_mask)
+        mlp_input = try_residual_rms_norm_modulate_exact(
+            hidden_states,
+            context_output,
+            attention_output,
+            self.norm2.weight,
+            scale_mlp,
+            shift_mlp,
+            self.norm2.eps,
+        )
+        if mlp_input is None:
+            residual = hidden_states + context_output
+            residual = residual + attention_output
+            mlp_input = self.norm2(residual) * (1 + scale_mlp) + shift_mlp
+        mlp_output = self.mlp(mlp_input)
+        output = try_residual_add3_exact(
+            hidden_states,
+            context_output,
+            attention_output,
+            mlp_output,
+        )
+        if output is not None:
+            return output
+        residual = hidden_states + context_output
+        residual = residual + attention_output
+        return residual + mlp_output
+
+
 class LTX2VideoDiffusionDecoder3d(DiffusersLTX2VideoDiffusionDecoder3d):
     """Diffusers decoder core with the short-clip NATTEN context fix."""
 
@@ -200,6 +335,13 @@ class LTX2VideoDiffusionDecoderModel(DiffusersLTX2VideoDiffusionDecoderModel):
         # to this behavior-only subclass preserves parameters and state-dict keys.
         self.decoder.__class__ = LTX2VideoDiffusionDecoder3d
         self.decoder.stage5_kernel = tuple(decoder_stage5_kernel)
+        for module in self.decoder.modules():
+            if isinstance(module, DiffusersLTX2VideoVaeDiffusionNABlock):
+                module.__class__ = LTX2VideoVaeDiffusionNABlock
+            if isinstance(module, DiffusersLTX2VideoVaeNeighborhoodAttention):
+                module.__class__ = LTX2VideoVaeNeighborhoodAttention
+            if isinstance(module, DiffusersLTX2VideoVaeSwiGLU):
+                module.__class__ = LTX2VideoVaeSwiGLU
 
     @classmethod
     def from_ltx25_native_checkpoint(
