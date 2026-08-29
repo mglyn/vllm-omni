@@ -41,6 +41,8 @@ class TestLTXDiffusionDecoder:
     def test_diffusion_decoder_installs_optimized_attention_behavior(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
             LTX2VideoDiffusionDecoderModel,
+        )
+        from vllm_omni.diffusion.models.ltx2.ops.diffvae.modules import (
             LTX2VideoVaeNeighborhoodAttention,
         )
 
