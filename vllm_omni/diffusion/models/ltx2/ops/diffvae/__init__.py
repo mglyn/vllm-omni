@@ -8,12 +8,10 @@ from .residual_adaln import (
     try_residual_add3_exact,
     try_residual_rms_norm_modulate_exact,
 )
-from .rope_3d import try_qk_scale_rope_3d_exact
 from .swiglu import try_swiglu_tiled_exact
 
 __all__ = [
     "try_qk_rms_norm_scale_rope_3d_exact",
-    "try_qk_scale_rope_3d_exact",
     "try_residual_add3_exact",
     "try_residual_rms_norm_modulate_exact",
     "try_swiglu_tiled_exact",

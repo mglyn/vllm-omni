@@ -8,6 +8,7 @@ from __future__ import annotations
 from functools import cache
 
 import torch
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -18,7 +19,7 @@ _VERIFIED_CUDA_COMPUTE_CAPABILITIES = frozenset({90})
 
 @cache
 def _is_verified_cuda_device(device_index: int) -> bool:
-    if not current_omni_platform.is_cuda() or not current_omni_platform.is_available():
+    if not HAS_TRITON or not current_omni_platform.is_cuda() or not current_omni_platform.is_available():
         return False
     capability = current_omni_platform.get_device_capability(device_id=device_index)
     return capability is not None and capability.to_int() in _VERIFIED_CUDA_COMPUTE_CAPABILITIES

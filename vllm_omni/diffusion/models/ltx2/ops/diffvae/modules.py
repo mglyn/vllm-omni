@@ -19,12 +19,12 @@ from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
 )
 from torch import nn
 
+from ..platform import is_ltx2_ops_eligible
 from .qk_rms_norm import try_qk_rms_norm_scale_rope_3d_exact
 from .residual_adaln import (
     try_residual_add3_exact,
     try_residual_rms_norm_modulate_exact,
 )
-from .rope_3d import try_qk_scale_rope_3d_exact
 from .swiglu import try_swiglu_tiled_exact
 
 
@@ -54,17 +54,6 @@ class LTX2VideoVaeNeighborhoodAttention(DiffusersLTX2VideoVaeNeighborhoodAttenti
 
         query = self.norm_q(query)
         key = self.norm_k(key)
-        optimized = try_qk_scale_rope_3d_exact(
-            query,
-            key,
-            self.scale,
-            self.rope.rope_dim_split,
-            self.rope.base,
-        )
-        if optimized is not None:
-            query, key = optimized
-            return query, key, value
-
         query = query * self.scale
         return self.rope(query), self.rope(key), value
 
@@ -94,6 +83,9 @@ class LTX2VideoVaeDiffusionNABlock(DiffusersLTX2VideoVaeDiffusionNABlock):
         modulation: tuple[torch.Tensor, ...],
         block_mask: Any = None,
     ) -> torch.Tensor:
+        if hidden_states.dtype is not torch.bfloat16 or not is_ltx2_ops_eligible(hidden_states):
+            return super().forward(hidden_states, latent_context, modulation, block_mask)
+
         scale_msa, shift_msa, _, scale_mlp, shift_mlp, _, _ = [
             modulation[i] + self.scale_shift_table[i].view(1, 1, 1, 1, -1) for i in range(self.num_mod_params)
         ]

@@ -21,7 +21,7 @@ from ..numerics import (
     shfl_down_f32,
 )
 from ..platform import is_ltx2_ops_eligible
-from .rope_3d import get_rope_tables
+from .rope_tables import get_rope_tables
 
 _HEAD_DIM = 64
 _ROWS_PER_PROGRAM = 2
