@@ -26,18 +26,9 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 )
 
 from .ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
+from .ltx2_diffusion_decoder_tiling import plan_ltx2_distributed_tiles
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-
-def _tile_intervals(length: int, tile_size: int, stride: int, min_size: int) -> list[tuple[int, int]]:
-    """Build overlapping intervals, merging a too-small trailing remnant."""
-    if length <= tile_size:
-        return [(0, length)]
-    starts = list(range(0, length, stride))
-    while len(starts) > 1 and length - starts[-1] < min_size:
-        starts.pop()
-    return [(start, min(start + tile_size, length)) for start in starts[:-1]] + [(starts[-1], length)]
 
 
 @dataclass(frozen=True)
@@ -53,12 +44,6 @@ class LTX2VideoDiffusionTilePlan:
     scale_t: int
     scale_h: int
     scale_w: int
-    stride_t: int
-    stride_h: int
-    stride_w: int
-    blend_frames: int
-    blend_height: int
-    blend_width: int
     single_step_x0: bool
 
 
@@ -125,22 +110,38 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         )
         num_frames = features.shape[1] - ghost_frames
         height, width = features.shape[2:4]
+        parallel_size = min(
+            int(self.distributed_executor.parallel_size),
+            int(self.distributed_executor.world_size),
+        )
+        geometry = plan_ltx2_distributed_tiles(
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            ghost_frames=ghost_frames,
+            parallel_size=parallel_size,
+            default_tile=(tile_t, tile_h, tile_w),
+            default_stride=(stride_t, stride_h, stride_w),
+            min_sizes=tuple(min_sizes),
+        )
+        logger.debug(
+            "LTX-2.5 distributed DiffVAE tile plan: strategy=%s grid=%s max_volume=%d reference=%d imbalance=%.3f",
+            geometry.strategy,
+            geometry.grid_shape,
+            geometry.selected_max_volume,
+            geometry.reference_max_volume,
+            geometry.workload_imbalance,
+        )
         return LTX2VideoDiffusionTilePlan(
-            temporal_tiles=tuple(_tile_intervals(num_frames, tile_t, stride_t, min_sizes[0])),
-            height_tiles=tuple(_tile_intervals(height, tile_h, stride_h, min_sizes[1])),
-            width_tiles=tuple(_tile_intervals(width, tile_w, stride_w, min_sizes[2])),
+            temporal_tiles=geometry.temporal_tiles,
+            height_tiles=geometry.height_tiles,
+            width_tiles=geometry.width_tiles,
             num_frames=num_frames,
             height=height,
             width=width,
             scale_t=scale_t,
             scale_h=scale_h,
             scale_w=scale_w,
-            stride_t=stride_t,
-            stride_h=stride_h,
-            stride_w=stride_w,
-            blend_frames=(tile_t - stride_t) * scale_t,
-            blend_height=(tile_h - stride_h) * scale_h,
-            blend_width=(tile_w - stride_w) * scale_w,
             single_step_x0=num_inference_steps == 1 and decoder.model_output_type == "x0",
         )
 
@@ -230,11 +231,25 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
                 result_row = []
                 for w_idx, tile in enumerate(row):
                     if h_idx > 0:
-                        tile = self.blend_v(rows[h_idx - 1][w_idx], tile, plan.blend_height)
+                        previous_end = plan.height_tiles[h_idx - 1][1]
+                        current_start = plan.height_tiles[h_idx][0]
+                        blend_height = (previous_end - current_start) * plan.scale_h
+                        tile = self.blend_v(rows[h_idx - 1][w_idx], tile, blend_height)
                     if w_idx > 0:
-                        tile = self.blend_h(row[w_idx - 1], tile, plan.blend_width)
-                    keep_height = plan.stride_h * plan.scale_h if h_idx < len(rows) - 1 else tile.shape[3]
-                    keep_width = plan.stride_w * plan.scale_w if w_idx < len(row) - 1 else tile.shape[4]
+                        previous_end = plan.width_tiles[w_idx - 1][1]
+                        current_start = plan.width_tiles[w_idx][0]
+                        blend_width = (previous_end - current_start) * plan.scale_w
+                        tile = self.blend_h(row[w_idx - 1], tile, blend_width)
+                    keep_height = (
+                        (plan.height_tiles[h_idx + 1][0] - plan.height_tiles[h_idx][0]) * plan.scale_h
+                        if h_idx < len(rows) - 1
+                        else tile.shape[3]
+                    )
+                    keep_width = (
+                        (plan.width_tiles[w_idx + 1][0] - plan.width_tiles[w_idx][0]) * plan.scale_w
+                        if w_idx < len(row) - 1
+                        else tile.shape[4]
+                    )
                     result_row.append(tile[:, :, :, :keep_height, :keep_width])
                 result_rows.append(torch.cat(result_row, dim=4))
             frame_groups.append(torch.cat(result_rows, dim=3))
@@ -242,9 +257,19 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         result = []
         for t_idx, group in enumerate(frame_groups):
             if t_idx > 0:
-                group = self.blend_t(frame_groups[t_idx - 1], group, plan.blend_frames)
+                previous_end = plan.temporal_tiles[t_idx - 1][1]
+                current_start = plan.temporal_tiles[t_idx][0]
+                blend_frames = (previous_end - current_start) * plan.scale_t
+                group = self.blend_t(frame_groups[t_idx - 1], group, blend_frames)
             if t_idx < len(frame_groups) - 1:
-                keep_frames = plan.stride_t * plan.scale_t - (1 if t_idx == 0 and plan.scale_t == 2 else 0)
+                current_start = plan.temporal_tiles[t_idx][0]
+                next_start = plan.temporal_tiles[t_idx + 1][0]
+                current_pixel_start = current_start * plan.scale_t
+                next_pixel_start = next_start * plan.scale_t
+                if plan.scale_t == 2:
+                    current_pixel_start -= int(current_start != 0)
+                    next_pixel_start -= int(next_start != 0)
+                keep_frames = next_pixel_start - current_pixel_start
                 group = group[:, :, :keep_frames]
             result.append(group)
         return torch.cat(result, dim=2)

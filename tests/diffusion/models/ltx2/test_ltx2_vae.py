@@ -38,6 +38,160 @@ def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
 
 
 class TestLTXDiffusionDecoder:
+    def test_distributed_diffusion_tile_planner_uses_one_balanced_pp8_wave_at_1080p(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_tiling import (
+            plan_ltx2_distributed_tiles,
+        )
+
+        geometry = plan_ltx2_distributed_tiles(
+            num_frames=61,
+            height=136,
+            width=240,
+            ghost_frames=8,
+            parallel_size=8,
+            default_tile=(40, 96, 96),
+            default_stride=(28, 88, 88),
+            min_sizes=(6, 6, 6),
+        )
+
+        assert geometry.grid_shape == (1, 2, 4)
+        assert geometry.temporal_tiles == ((0, 61),)
+        assert geometry.height_tiles == ((0, 72), (64, 136))
+        assert geometry.width_tiles == ((0, 66), (58, 124), (116, 182), (174, 240))
+        assert geometry.selected_max_volume < geometry.reference_max_volume
+        assert geometry.workload_imbalance == 1.0
+
+    def test_distributed_diffusion_tile_planner_grows_only_when_memory_requires_it(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_tiling import (
+            plan_ltx2_distributed_tiles,
+        )
+
+        geometry = plan_ltx2_distributed_tiles(
+            num_frames=61,
+            height=272,
+            width=480,
+            ghost_frames=8,
+            parallel_size=8,
+            default_tile=(40, 96, 96),
+            default_stride=(28, 88, 88),
+            min_sizes=(6, 6, 6),
+        )
+
+        assert geometry.grid_shape == (1, 4, 8)
+        assert geometry.tile_count == 4 * 8
+        assert geometry.selected_max_volume <= geometry.reference_max_volume
+
+    def test_distributed_diffusion_decoder_builds_adaptive_plan_from_native_geometry(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        with torch.device("meta"):
+            model = DistributedLTX2VideoDiffusionDecoderModel()
+            features = torch.empty(1, 69, 136, 240, 256)
+        model.distributed_executor = SimpleNamespace(parallel_size=8, world_size=8)
+
+        plan = model._build_tiled_decode_plan(features, num_inference_steps=1)
+
+        assert plan.num_frames == 61
+        assert (
+            len(plan.temporal_tiles),
+            len(plan.height_tiles),
+            len(plan.width_tiles),
+        ) == (1, 2, 4)
+
+    @pytest.mark.parametrize(
+        ("parallel_size", "expected_grid"),
+        [
+            (2, (1, 2, 4)),
+            (3, (1, 3, 3)),
+            (4, (1, 2, 4)),
+            (5, (1, 2, 5)),
+            (8, (1, 2, 4)),
+            (16, (1, 4, 4)),
+        ],
+    )
+    def test_distributed_diffusion_tile_planner_supports_variable_parallel_sizes(
+        self,
+        parallel_size,
+        expected_grid,
+    ):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_tiling import (
+            plan_ltx2_distributed_tiles,
+        )
+
+        geometry = plan_ltx2_distributed_tiles(
+            num_frames=61,
+            height=136,
+            width=240,
+            ghost_frames=8,
+            parallel_size=parallel_size,
+            default_tile=(40, 96, 96),
+            default_stride=(28, 88, 88),
+            min_sizes=(6, 6, 6),
+        )
+
+        assert geometry.grid_shape == expected_grid
+        axes = (geometry.temporal_tiles, geometry.height_tiles, geometry.width_tiles)
+        for length, intervals in zip((61, 136, 240), axes, strict=True):
+            assert intervals[0][0] == 0
+            assert intervals[-1][1] == length
+            assert len({end - start for start, end in intervals}) == 1
+            assert all(left_end > right_start for (_, left_end), (right_start, _) in zip(intervals, intervals[1:]))
+
+    def test_distributed_diffusion_tile_merge_supports_variable_overlap(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+            LTX2VideoDiffusionTilePlan,
+        )
+
+        blend_calls = []
+
+        class FakeDecoder:
+            def blend_v(self, _previous, current, blend_height):
+                blend_calls.append(("height", blend_height))
+                return current
+
+            def blend_h(self, _previous, current, blend_width):
+                blend_calls.append(("width", blend_width))
+                return current
+
+            def blend_t(self, _previous, current, blend_frames):
+                blend_calls.append(("frames", blend_frames))
+                return current
+
+        plan = LTX2VideoDiffusionTilePlan(
+            temporal_tiles=((0, 4), (2, 6), (5, 9)),
+            height_tiles=((0, 1),),
+            width_tiles=((0, 5), (3, 8), (7, 12)),
+            num_frames=9,
+            height=1,
+            width=12,
+            scale_t=2,
+            scale_h=2,
+            scale_w=2,
+            single_step_x0=True,
+        )
+        temporal_lengths = (7, 8, 8)
+        tiles = {
+            (t_idx, 0, w_idx): torch.full(
+                (1, 1, temporal_lengths[t_idx], 2, 10),
+                float(t_idx * 3 + w_idx),
+            )
+            for t_idx in range(3)
+            for w_idx in range(3)
+        }
+
+        result = DistributedLTX2VideoDiffusionDecoderModel._merge_tiled_decode(
+            FakeDecoder(),
+            tiles,
+            plan,
+        )
+
+        assert result.shape == (1, 1, 17, 2, 24)
+        assert [value for axis, value in blend_calls if axis == "width"] == [4, 2] * 3
+        assert [value for axis, value in blend_calls if axis == "frames"] == [4, 2]
+
     def test_diffusion_decoder_installs_all_optimized_behavior_once(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
             LTX2VideoDiffusionDecoderModel,
@@ -495,6 +649,7 @@ class TestLTXDiffusionDecoder:
         assert output.output[1].numel() == 0
 
     def test_diffusion_decoder_patch_parallel_size_one_uses_native_tiling(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed as distributed_decoder
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
@@ -510,6 +665,11 @@ class TestLTXDiffusionDecoder:
             return expected
 
         monkeypatch.setattr(LTX2VideoDiffusionDecoderModel, "tiled_decode", native_tiled_decode)
+        monkeypatch.setattr(
+            distributed_decoder,
+            "plan_ltx2_distributed_tiles",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("single-rank decode must not build a plan")),
+        )
         model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
         torch.nn.Module.__init__(model)
         model.is_distributed_enabled = lambda: False
@@ -555,7 +715,7 @@ class TestLTXDiffusionDecoder:
         model.tile_sample_stride_height = 1
         model.tile_sample_min_width = 2
         model.tile_sample_stride_width = 1
-        model.distributed_executor = SimpleNamespace(group=None)
+        model.distributed_executor = SimpleNamespace(group=None, parallel_size=2, world_size=2)
         model.decoder.forward_stages_1_to_3 = lambda z: z.permute(0, 2, 3, 4, 1)
         monkeypatch.setattr(torch.distributed, "broadcast", lambda *_args, **_kwargs: None)
 
@@ -564,7 +724,7 @@ class TestLTXDiffusionDecoder:
         reference_generator = torch.Generator().manual_seed(123)
         tasks, grid_spec = model._distributed_tile_split(z, distributed_generator, num_inference_steps=1)
 
-        assert grid_spec.grid_shape == (1, 3, 3)
+        assert grid_spec.grid_shape == (1, 2, 2)
         assert grid_spec.split_dims == (2, 3, 4)
         for task in tasks:
             tile_shape = model._tiled_pixel_shape_from_features(
