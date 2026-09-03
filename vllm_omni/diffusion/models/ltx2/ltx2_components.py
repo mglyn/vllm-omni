@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
-from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
@@ -49,6 +48,7 @@ from .ltx2_transformer import (
     apply_split_rotary_emb,
     to_ltx_padding_mask,
 )
+from .ops.diffvae.modules import LTX2VideoVaeNeighborhoodNattenProcessor
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
