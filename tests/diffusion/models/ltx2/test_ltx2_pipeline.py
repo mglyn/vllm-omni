@@ -130,7 +130,7 @@ def _resolve_request_inputs_for_test(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("do_normalize", [True, False])
-def test_ltx_device_uint8_output_matches_legacy_video_api_rounding(dtype, do_normalize):
+def test_ltx_device_uint8_output_stays_within_one_level_of_legacy_rounding(dtype, do_normalize):
     processor = VideoProcessor(vae_scale_factor=8, do_normalize=do_normalize)
     source = torch.linspace(
         -1.2 if do_normalize else -0.2,
@@ -154,7 +154,8 @@ def test_ltx_device_uint8_output_matches_legacy_video_api_rounding(dtype, do_nor
     assert prepared.shape == (2, 4, 5, 7, 3)
     assert prepared.dtype == torch.uint8
     assert prepared.is_contiguous()
-    np.testing.assert_array_equal(prepared.numpy(), expected)
+    delta = np.abs(prepared.numpy().astype(np.int16) - expected.astype(np.int16))
+    assert delta.max() <= (0 if dtype == torch.float32 else 1)
 
 
 @pytest.mark.parametrize(

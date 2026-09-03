@@ -91,10 +91,10 @@ def _prepare_ltx2_video_output(
 ) -> torch.Tensor:
     """Consume decoded BCTHW video and return contiguous uint8 BTHWC frames.
 
-    Keep denormalization in the decoder output dtype to match Diffusers' current
-    LTX postprocess, then use FP32 for the API server's ``* 255`` and ``rint``
-    semantics.  Performing the reduction before worker IPC cuts the video D2H
-    payload from FP32 to uint8.
+    Keep denormalization, scaling, and rounding in the decoder output dtype,
+    then convert directly to uint8.  Performing the reduction before worker IPC
+    cuts the video D2H payload from FP32 to uint8 without materializing a
+    full-size FP32 CUDA tensor.
     """
     if video.ndim != 5:
         raise ValueError(f"Expected decoded BCTHW video, got shape {tuple(video.shape)}")
@@ -112,9 +112,8 @@ def _prepare_ltx2_video_output(
     else:
         video.clamp_(0.0, 1.0)
 
-    # Diffusers converts to FP32 before NumPy output and the API server then
-    # scales and rounds in FP32. Preserve that order for byte-identical frames.
-    video = video.float()
+    # Source-dtype quantization can differ from the legacy FP32 presentation
+    # path by at most one uint8 level, while avoiding a full-size FP32 tensor.
     video.mul_(255.0).round_()
     return video.permute(0, 2, 3, 4, 1).to(
         dtype=torch.uint8,
