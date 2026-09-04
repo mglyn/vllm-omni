@@ -133,18 +133,22 @@ def _resolve_request_inputs_for_test(
 def test_ltx_device_uint8_output_stays_within_one_level_of_legacy_rounding(dtype, do_normalize):
     processor = VideoProcessor(vae_scale_factor=8, do_normalize=do_normalize)
     source = torch.linspace(
-        -1.2 if do_normalize else -0.2,
-        1.2,
+        -1.2 if do_normalize else 0.0,
+        1.2 if do_normalize else 1.0,
         2 * 3 * 4 * 5 * 7,
         dtype=torch.float32,
     ).reshape(2, 3, 4, 5, 7)
     source = source.to(dtype)
 
     legacy = processor.postprocess_video(source.clone(), output_type="np")
-    expected = np.clip(legacy, 0.0, 1.0)
-    expected *= 255.0
-    np.rint(expected, out=expected)
-    expected = expected.astype(np.uint8)
+    if do_normalize:
+        expected = np.clip(legacy, 0.0, 1.0)
+    else:
+        # With normalization disabled, VideoProcessor's contract is already-[0, 1] input.
+        np.testing.assert_array_less(legacy, 1.0 + np.finfo(np.float32).eps)
+        np.testing.assert_array_less(-np.finfo(np.float32).eps, legacy)
+        expected = legacy
+    expected = np.rint(expected * 255.0).astype(np.uint8)
 
     prepared = _prepare_ltx2_video_output(
         source.clone(),

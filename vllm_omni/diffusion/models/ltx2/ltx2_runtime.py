@@ -92,9 +92,11 @@ def _prepare_ltx2_video_output(
     """Consume decoded BCTHW video and return contiguous uint8 BTHWC frames.
 
     Keep denormalization, scaling, and rounding in the decoder output dtype,
-    then convert directly to uint8.  Performing the reduction before worker IPC
-    cuts the video D2H payload from FP32 to uint8 without materializing a
-    full-size FP32 CUDA tensor.
+    then convert directly to uint8.  ``do_normalize=False`` means the decoder
+    output is expected to already be in ``[0, 1]``; the clamp remains a
+    defensive bound before byte conversion. Performing the reduction before
+    worker IPC cuts the video D2H payload from FP32 to uint8 without
+    materializing a full-size FP32 CUDA tensor.
     """
     if video.ndim != 5:
         raise ValueError(f"Expected decoded BCTHW video, got shape {tuple(video.shape)}")

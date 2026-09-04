@@ -23,8 +23,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 def test_ltx_uint8_output_runs_on_cuda_with_bounded_rounding_drift(dtype, do_normalize):
     processor = VideoProcessor(vae_scale_factor=8, do_normalize=do_normalize)
     source = torch.linspace(
-        -1.2 if do_normalize else -0.2,
-        1.2,
+        -1.2 if do_normalize else 0.0,
+        1.2 if do_normalize else 1.0,
         2 * 3 * 4 * 5 * 7,
         device="cuda",
         dtype=torch.float32,
@@ -32,10 +32,14 @@ def test_ltx_uint8_output_runs_on_cuda_with_bounded_rounding_drift(dtype, do_nor
     source = source.to(dtype)
 
     legacy = processor.postprocess_video(source.clone(), output_type="np")
-    expected = np.clip(legacy, 0.0, 1.0)
-    expected *= 255.0
-    np.rint(expected, out=expected)
-    expected = expected.astype(np.uint8)
+    if do_normalize:
+        expected = np.clip(legacy, 0.0, 1.0)
+    else:
+        # With normalization disabled, VideoProcessor's contract is already-[0, 1] input.
+        np.testing.assert_array_less(legacy, 1.0 + np.finfo(np.float32).eps)
+        np.testing.assert_array_less(-np.finfo(np.float32).eps, legacy)
+        expected = legacy
+    expected = np.rint(expected * 255.0).astype(np.uint8)
 
     prepared = _prepare_ltx2_video_output(source.clone(), do_normalize=do_normalize)
 
@@ -45,6 +49,23 @@ def test_ltx_uint8_output_runs_on_cuda_with_bounded_rounding_drift(dtype, do_nor
     assert prepared.is_contiguous()
     delta = np.abs(prepared.cpu().numpy().astype(np.int16) - expected.astype(np.int16))
     assert delta.max() <= 1
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_ltx_uint8_output_defensively_clamps_unnormalized_values_on_cuda():
+    source = (
+        torch.tensor([-0.2, 0.0, 0.5, 1.0, 1.2], device="cuda", dtype=torch.bfloat16)
+        .reshape(1, 1, 1, 1, 5)
+        .expand(1, 3, 1, 1, 5)
+        .clone()
+    )
+
+    prepared = _prepare_ltx2_video_output(source, do_normalize=False)
+
+    expected = torch.tensor([0, 0, 128, 255, 255], device="cuda", dtype=torch.uint8).reshape(1, 1, 1, 5)
+    assert torch.equal(prepared[..., 0], expected)
+    assert torch.equal(prepared[..., 1], expected)
+    assert torch.equal(prepared[..., 2], expected)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
