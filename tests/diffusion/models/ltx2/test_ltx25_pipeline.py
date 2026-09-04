@@ -311,7 +311,7 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     assert calls["scheduler"][1]["revision"] == revision
 
 
-def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_artifact(monkeypatch):
+def test_ltx25_native_diffusion_decoder_uses_native_config_and_canonical_artifact(monkeypatch):
     revision = "diffusers-revision"
     config = {"decoder_stage_channels": [8, 8, 8, 8, 8]}
     calls: dict[str, Any] = {}
@@ -322,8 +322,8 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
 
     expected = FakeDecoder()
 
-    def fake_load_config(model, **kwargs):
-        calls["config"] = (model, kwargs)
+    def fake_load_config(path):
+        calls["config"] = path
         return config
 
     def fake_resolve(model, repo_id, filename, **kwargs):
@@ -334,11 +334,7 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
         calls["load"] = (path, passed_config, dtype)
         return expected
 
-    monkeypatch.setattr(
-        ltx2_components.DistributedLTX2VideoDiffusionDecoderModel,
-        "load_config",
-        staticmethod(fake_load_config),
-    )
+    monkeypatch.setattr(ltx2_components, "load_ltx25_native_diffusion_decoder_config", fake_load_config)
     monkeypatch.setattr(ltx2_components, "resolve_ltx_artifact", fake_resolve)
     monkeypatch.setattr(
         ltx2_components.DistributedLTX2VideoDiffusionDecoderModel,
@@ -354,14 +350,7 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
     )
 
     assert actual is expected
-    assert calls["config"] == (
-        "Lightricks/LTX-2.5-Diffusers",
-        {
-            "subfolder": "diffusion_decoder",
-            "local_files_only": False,
-            "revision": revision,
-        },
-    )
+    assert calls["config"] == "/models/native-diffvae.safetensors"
     assert calls["artifact"] == (
         "Lightricks/LTX-2.5-Diffusers",
         "Lightricks/LTX-2.5",

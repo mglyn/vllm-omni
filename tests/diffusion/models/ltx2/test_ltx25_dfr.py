@@ -20,6 +20,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2AudioVideoRotaryPosEmbed
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx25_dfr import (
     LTX25DFRPipeline,
+    _carry_decode_generators,
     _DFRVideoConditioning,
     resolve_dfr_canvas,
 )
@@ -52,6 +53,20 @@ def test_dfr_recipe_is_distilled_three_stage_4k():
     assert not stage2.freeze_audio
     assert epilogue.freeze_audio
     assert LTX25_DFR_RECIPE.audio_output_phase == 0
+
+
+def test_dfr_carry_decode_uses_independent_official_seed_offsets():
+    request_generator = torch.Generator().manual_seed(17)
+    state = request_generator.get_state()
+
+    plane_0 = _carry_decode_generators(request_generator, 0)
+    plane_3 = _carry_decode_generators(request_generator, 3)
+
+    assert isinstance(plane_0, torch.Generator)
+    assert isinstance(plane_3, torch.Generator)
+    assert plane_0.initial_seed() == 4017
+    assert plane_3.initial_seed() == 4020
+    assert torch.equal(request_generator.get_state(), state)
 
 
 def _tiny_dfr_pipe() -> LTX25DFRPipeline:
@@ -159,4 +174,3 @@ def test_dfr_epilogue_tiles_blend_every_base_token_to_one():
     for indices, blend in tiles:
         accumulated[indices[: blend.numel()]] += blend
     torch.testing.assert_close(accumulated, torch.ones_like(accumulated))
-

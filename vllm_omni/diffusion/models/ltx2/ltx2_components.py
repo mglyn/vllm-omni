@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
-from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
@@ -40,6 +39,8 @@ from .ltx2_diffusion_decoder import (
     LTX25_NATIVE_ARTIFACT_REVISION,
     LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
     LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
+    load_ltx25_native_diffusion_decoder_config,
 )
 from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
@@ -77,7 +78,6 @@ _LTX_COMPONENT_SUBFOLDERS = (
 logger = logging.getLogger(__name__)
 
 _LTX2_CONV_VAE_EXTRA = "ltx2_use_conv_vae"
-_LTX2_DIFFUSION_DECODER_SUBFOLDER = "diffusion_decoder"
 
 
 def _ltx2_use_diffusion_decoder(od_config: Any, model_version: str) -> bool:
@@ -612,13 +612,8 @@ def _load_ltx25_native_diffusion_decoder(
     dtype: torch.dtype,
     revision: str | None,
 ) -> DistributedLTX2VideoDiffusionDecoderModel:
-    """Load canonical Native weights into the local Diffusers-compatible class."""
-    config = DistributedLTX2VideoDiffusionDecoderModel.load_config(
-        model,
-        subfolder=_LTX2_DIFFUSION_DECODER_SUBFOLDER,
-        local_files_only=local_files_only,
-        revision=revision,
-    )
+    """Load canonical Native weights into vLLM-Omni's native decoder."""
+    del local_files_only
     checkpoint_path = resolve_ltx_artifact(
         model,
         LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
@@ -626,6 +621,7 @@ def _load_ltx25_native_diffusion_decoder(
         model_revision=revision,
         artifact_revision=LTX25_NATIVE_ARTIFACT_REVISION,
     )
+    config = load_ltx25_native_diffusion_decoder_config(checkpoint_path)
     decoder = DistributedLTX2VideoDiffusionDecoderModel.from_ltx25_native_checkpoint(
         checkpoint_path,
         config,

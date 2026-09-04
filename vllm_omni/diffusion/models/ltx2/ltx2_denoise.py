@@ -21,6 +21,7 @@ from .ltx2_latents import LTXAVState, unpack_audio_latents, unpad_audio_latents
 
 if TYPE_CHECKING:
     from .ltx2_conditioning import LTXPromptContext
+    from .ltx2_diffusion_decoder_keyframes import LTX2DecodeKeyframes
     from .ltx2_recipes import LTXPhaseRecipe
     from .ltx2_request import LTXRequestInputs
 
@@ -110,6 +111,7 @@ class LTXPhaseResult:
     audio: torch.Tensor
     audio_for_next_phase: torch.Tensor | None = None
     generated_keyframes: torch.Tensor | None = None
+    decode_keyframes: LTX2DecodeKeyframes | None = None
 
 
 class LTXDenoisePipeline(Protocol):

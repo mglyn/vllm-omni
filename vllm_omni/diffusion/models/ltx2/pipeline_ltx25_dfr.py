@@ -30,12 +30,14 @@ from .ltx2_denoise import (
     LTXPhaseResult,
     LTXPreparedVideoState,
 )
+from .ltx2_diffusion_decoder_keyframes import LTX2DecodeKeyframes
 from .ltx2_recipes import LTX25_DFR_RECIPE, LTXPhaseRecipe
 from .ltx2_request import LTXRequestInputs
 from .ltx2_runtime import LTXRuntime
 
 _DFR_SEGMENT_CANDIDATES = (24, 32)
 _DFR_SPATIAL_OVERLAP = 12
+_DFR_CARRY_DECODE_SEED_OFFSET = 4000
 
 
 def resolve_dfr_canvas(num_frames: int, temporal_scale: int = 8) -> tuple[int, tuple[int, ...]]:
@@ -96,17 +98,30 @@ def _trapezoid(length: int, left: int, right: int, *, device: torch.device, dtyp
 def _lanczos_x2_frame(frame: torch.Tensor) -> torch.Tensor:
     """Resize one ``(C,H,W)`` VAE-range frame with official PIL Lanczos."""
     image_array = (
-        ((frame.detach().float().clamp(-1, 1) + 1) * 127.5)
-        .round()
-        .to(torch.uint8)
-        .permute(1, 2, 0)
-        .cpu()
-        .numpy()
+        ((frame.detach().float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
     )
     image = PIL.Image.fromarray(image_array, mode="RGB")
     image = image.resize((image.width * 2, image.height * 2), resample=PIL.Image.Resampling.LANCZOS)
     resized = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).permute(2, 0, 1)
     return resized / 127.5 - 1
+
+
+def _carry_decode_generators(
+    generator: torch.Generator | list[torch.Generator] | None,
+    plane_index: int,
+) -> torch.Generator | list[torch.Generator] | None:
+    """Create the official independent ``seed + 4000 + plane`` stream."""
+    if generator is None:
+        return None
+
+    def offset(source: torch.Generator) -> torch.Generator:
+        return torch.Generator(device=source.device).manual_seed(
+            source.initial_seed() + _DFR_CARRY_DECODE_SEED_OFFSET + plane_index
+        )
+
+    if isinstance(generator, list):
+        return [offset(source) for source in generator]
+    return offset(generator)
 
 
 class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
@@ -127,6 +142,12 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
         super().__init__(*args, **kwargs)
         if self.model_version != "2.5":
             raise ValueError("LTX25DFRPipeline requires an LTX-2.5 distilled checkpoint.")
+        if not self.use_diffusion_decoder:
+            raise ValueError("LTX25DFRPipeline requires the LTX-2.5 keyframe-aware diffusion video decoder.")
+        # UHD decoding cannot safely take the untiled stage-4/stage-5 path.
+        # This also activates the existing distributed tile executor when the
+        # request configured vae_patch_parallel_size > 1.
+        self.diffusion_decoder.enable_tiling()
         if not getattr(self.transformer.config, "use_keyframes_abs_pos_embedding", False):
             raise ValueError(
                 "LTX25DFRPipeline requires a checkpoint whose transformer config enables "
@@ -238,6 +259,7 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
             latent_height,
             latent_width,
         )
+        latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
         if request_inputs.latents is None:
             base = torch.zeros(latent_shape, device=device, dtype=prompt_context.positive_connector_prompt_embeds.dtype)
         else:
@@ -247,9 +269,9 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
                 )
             base = latent_ops.normalize_latents(
                 request_inputs.latents.to(device=device),
-                self.vae.latents_mean,
-                self.vae.latents_std,
-                self.vae.config.scaling_factor,
+                latents_mean,
+                latents_std,
+                scaling_factor,
             ).to(prompt_context.positive_connector_prompt_embeds.dtype)
 
         base_tokens = latent_ops.pack_latents(
@@ -325,13 +347,15 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
             else:
                 initials = latent_ops.normalize_latents(
                     conditioning.generated_initials.to(device=device),
-                    self.vae.latents_mean,
-                    self.vae.latents_std,
-                    self.vae.config.scaling_factor,
+                    latents_mean,
+                    latents_std,
+                    scaling_factor,
                 ).to(base_tokens.dtype)
                 expected = (batch, base.shape[1], len(conditioning.generated_positions), latent_height, latent_width)
                 if tuple(initials.shape) != expected:
-                    raise ValueError(f"DFR generated keyframes have shape {tuple(initials.shape)}, expected {expected}.")
+                    raise ValueError(
+                        f"DFR generated keyframes have shape {tuple(initials.shape)}, expected {expected}."
+                    )
                 slot_tokens = torch.cat(
                     [
                         latent_ops.pack_latents(
@@ -370,9 +394,9 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
         if conditioning.reference_latent is not None:
             reference = latent_ops.normalize_latents(
                 conditioning.reference_latent.to(device=device),
-                self.vae.latents_mean,
-                self.vae.latents_std,
-                self.vae.config.scaling_factor,
+                latents_mean,
+                latents_std,
+                scaling_factor,
             ).to(base_tokens.dtype)
             ref_tokens = latent_ops.pack_latents(
                 reference,
@@ -453,9 +477,7 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
             f = torch.arange(frames, device=denoise_ctx.latents.device)
             h = torch.arange(h_interval.start, h_interval.end, device=denoise_ctx.latents.device)
             w = torch.arange(w_interval.start, w_interval.end, device=denoise_ctx.latents.device)
-            base_indices = (
-                f[:, None, None] * height * width + h[None, :, None] * width + w[None, None, :]
-            ).reshape(-1)
+            base_indices = (f[:, None, None] * height * width + h[None, :, None] * width + w[None, None, :]).reshape(-1)
             keep_indices = base_indices
             if denoise_ctx.latents.shape[1] > base_count:
                 tile_positions = denoise_ctx.video_coords[:, :, base_indices]
@@ -507,7 +529,17 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
         for keep_indices, blend in tiles:
             local_coords = denoise_ctx.video_coords[:, :, keep_indices].clone()
             base_in_tile = blend.numel()
-            offset = local_coords[:, :, :base_in_tile, :,].select(-1, 0).amin(dim=2, keepdim=True).unsqueeze(-1)
+            offset = (
+                local_coords[
+                    :,
+                    :,
+                    :base_in_tile,
+                    :,
+                ]
+                .select(-1, 0)
+                .amin(dim=2, keepdim=True)
+                .unsqueeze(-1)
+            )
             local_coords -= offset
             local_mask = (
                 None if denoise_ctx.conditioning_mask is None else denoise_ctx.conditioning_mask[:, keep_indices]
@@ -546,19 +578,22 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
     ) -> torch.Tensor:
         if keyframes.ndim != 5:
             raise ValueError(f"DFR carry keyframes must be 5D, got {tuple(keyframes.shape)}.")
+        video_decoder = self.diffusion_decoder if getattr(self, "use_diffusion_decoder", False) else self.vae
+        latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
         encoded = []
         for index in range(keyframes.shape[2]):
-            decoded = self.vae.decode(
-                keyframes[:, :, index : index + 1].to(self.vae.dtype),
-                None,
-                return_dict=False,
-            )[0]
+            plane = keyframes[:, :, index : index + 1].to(video_decoder.dtype)
+            plane_generator = _carry_decode_generators(generator, index)
+            if getattr(self, "use_diffusion_decoder", False):
+                decoded = video_decoder.decode(plane, generator=plane_generator, return_dict=False)[0]
+            else:
+                decoded = video_decoder.decode(plane, None, return_dict=False)[0]
             resized = torch.stack([_lanczos_x2_frame(frame[:, 0]) for frame in decoded], dim=0)
             resized = resized.to(device=self.device, dtype=self.vae.dtype).unsqueeze(2)
-            if isinstance(generator, list):
-                frame_generators = generator
+            if isinstance(plane_generator, list):
+                frame_generators = plane_generator
             else:
-                frame_generators = [generator] * resized.shape[0]
+                frame_generators = [plane_generator] * resized.shape[0]
             raw = torch.cat(
                 [
                     retrieve_latents(self.vae.encode(resized[item : item + 1]), frame_generators[item], "argmax")
@@ -569,9 +604,9 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
             encoded.append(
                 latent_ops.normalize_latents(
                     raw,
-                    self.vae.latents_mean,
-                    self.vae.latents_std,
-                    self.vae.config.scaling_factor,
+                    latents_mean,
+                    latents_std,
+                    scaling_factor,
                 )
             )
         return torch.cat(encoded, dim=2)
@@ -711,6 +746,20 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
         )
 
         keep_latent_frames = (requested_frames - 1) // self.vae_temporal_compression_ratio + 1
+        kept_keyframe_indices = [index for index, position in enumerate(positions) if position < requested_frames]
+        decode_keyframes = None
+        if kept_keyframe_indices:
+            decode_keyframes = LTX2DecodeKeyframes(
+                latents=torch.cat(
+                    [carry_keyframes[:, :, index : index + 1] for index in kept_keyframe_indices],
+                    dim=2,
+                ),
+                pixel_frame_indices=torch.tensor(
+                    [positions[index] for index in kept_keyframe_indices],
+                    device=carry_keyframes.device,
+                    dtype=torch.long,
+                ),
+            )
         final_phase = LTXPhaseResult(
             forward_context=replace(
                 stage3.forward_context,
@@ -718,6 +767,7 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
             ),
             video=stage3.video[:, :, :keep_latent_frames],
             audio=stage1.audio,
+            decode_keyframes=decode_keyframes,
         )
         output = self.decode_phase(final_phase)
         if not hasattr(output, "output") or not isinstance(output.output, tuple):
@@ -732,4 +782,3 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
 
 # Keep post-processing discoverable beside the public pipeline entry.
 from .ltx2_components import get_ltx2_post_process_func as get_ltx2_post_process_func  # noqa: E402,F401
-

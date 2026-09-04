@@ -179,6 +179,7 @@ def test_ltx_phase_adapter_selects_execution_from_quantization(
         "manifest": manifest,
         "dtype": dtype,
         "layer_fused": layer_fused,
+        "adapter_slot": LTX_DISTILLED_ADAPTER_SLOT,
     }
 
 

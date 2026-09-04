@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# SPDX-FileCopyrightText: Copyright 2026 Lightricks and The HuggingFace Team. All rights reserved.
+# SPDX-FileCopyrightText: Copyright 2026 Lightricks Ltd.
 #
-# Distributed tiling is copied and modified from Diffusers' serial LTX-2.5
-# tiling at commit d035dcd7cc7c88e0a154609b62887d50bba9fdc2 (Apache-2.0).
+# Adapted for vLLM-Omni's distributed tile executor from the native LTX-2
+# DiffVAE decode geometry at commit a95ab85.
 
 """LTX-2.5-specific distributed execution for the diffusion VAE decoder."""
 
@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 )
 
 from .ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
+from .ltx2_diffusion_decoder_keyframes import KeyframeStream, LTX2DecodeKeyframes, planes_for_tile
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -70,6 +71,11 @@ class LTX2VideoDiffusionTileTask(TileTask):
     crop_trailing_ghost: bool = False
     noise_generator: torch.Generator | list[torch.Generator] | None = None
     x_t: torch.Tensor | None = None
+    keyframe_features: KeyframeStream | None = None
+    keyframe_pixel_indices: torch.Tensor | None = None
+    stage4_time_origin: float = 0.0
+    pixel_time_origin: float = 0.0
+    clip_start_frame: int = 0
 
 
 class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, DistributedVaeMixin):
@@ -96,7 +102,7 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         features: torch.Tensor,
         num_inference_steps: int,
     ) -> LTX2VideoDiffusionTilePlan:
-        """Build the rank-independent tile schedule around Diffusers' decoder."""
+        """Build the rank-independent native DiffVAE tile schedule."""
         decoder = self.decoder
         patch_size = decoder.patch_size
         upsample_stride = decoder.upsamples[-1].stride
@@ -218,7 +224,7 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         tiles: dict[tuple[int, int, int], torch.Tensor],
         plan: LTX2VideoDiffusionTilePlan,
     ) -> torch.Tensor:
-        """Blend distributed RGB tiles in Diffusers' serial order."""
+        """Blend distributed RGB tiles in native serial order."""
         frame_groups = []
         for t_idx in range(len(plan.temporal_tiles)):
             rows = [
@@ -297,9 +303,14 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         z: torch.Tensor,
         generator: torch.Generator | list[torch.Generator] | None,
         num_inference_steps: int,
+        keyframes: LTX2DecodeKeyframes | None = None,
     ) -> tuple[list[LTX2VideoDiffusionTileTask], GridSpec]:
         decoder = self.decoder
-        features = decoder.forward_stages_1_to_3(z)
+        keyframe_features = None
+        if keyframes is None:
+            features = decoder.forward_stages_1_to_3(z)
+        else:
+            features, keyframe_features = decoder.forward_stages_1_to_3_with_keyframes(z, keyframes)
         plan = self._build_tiled_decode_plan(features, num_inference_steps)
         generators = self._sync_generators(generator, z.device)
 
@@ -344,6 +355,48 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
             else:
                 x_t = self._slice_tiled_noise(x_t_full, coord, tile_pixel_shape, plan)
 
+            selected_keyframe_features = None
+            selected_keyframe_indices = None
+            pixel_t0 = 0.0
+            if keyframes is not None:
+                if keyframe_features is None:
+                    raise RuntimeError("Missing keyframe features for a keyframe-aware tile plan.")
+                t_idx, h_idx, w_idx = coord
+                t0, _ = plan.temporal_tiles[t_idx]
+                h0, h1 = plan.height_tiles[h_idx]
+                w0, w1 = plan.width_tiles[w_idx]
+                pixel_t0 = float(t0 * plan.scale_t - (1 if t0 != 0 and plan.scale_t == 2 else 0))
+                plane_keep = planes_for_tile(
+                    keyframes.pixel_frame_indices,
+                    int(pixel_t0),
+                    int(pixel_t0) + tile_pixel_shape[2] - 1,
+                    clip_start_frame=keyframes.clip_start_frame,
+                )
+                selected_keyframe_indices = keyframes.pixel_frame_indices[plane_keep]
+                selected_keyframe_features = keyframe_features.select_planes(
+                    plane_keep.to(keyframe_features.x.device)
+                ).crop_spatial(slice(h0, h1), slice(w0, w1))
+
+                # A keyframe tile always draws a second pixel-noise stream.
+                # Save/advance its serial RNG state even when the video noise
+                # came from the shared multi-step canvas.
+                if tile_generator is None:
+                    tile_generator = self._clone_generators(generators)
+                keyframe_noise_shape = (
+                    tile_pixel_shape[0],
+                    tile_pixel_shape[1],
+                    selected_keyframe_features.num_planes,
+                    tile_pixel_shape[3],
+                    tile_pixel_shape[4],
+                )
+                discarded_keyframe_noise = randn_tensor(
+                    keyframe_noise_shape,
+                    generator=generators,
+                    device=z.device,
+                    dtype=z.dtype,
+                )
+                del discarded_keyframe_noise
+
             tasks.append(
                 LTX2VideoDiffusionTileTask(
                     tile_id=tile_id,
@@ -354,6 +407,11 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
                     crop_trailing_ghost=is_trailing,
                     noise_generator=tile_generator,
                     x_t=x_t,
+                    keyframe_features=selected_keyframe_features,
+                    keyframe_pixel_indices=selected_keyframe_indices,
+                    stage4_time_origin=float(plan.temporal_tiles[coord[0]][0]),
+                    pixel_time_origin=pixel_t0,
+                    clip_start_frame=0 if keyframes is None else keyframes.clip_start_frame,
                 )
             )
 
@@ -369,6 +427,22 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         task: LTX2VideoDiffusionTileTask,
         num_inference_steps: int,
     ) -> torch.Tensor:
+        if task.keyframe_features is not None:
+            if task.keyframe_pixel_indices is None:
+                raise RuntimeError("A keyframe tile is missing its pixel-frame indices.")
+            return self.decoder.decode_tile_with_keyframes(
+                task.tensor,
+                task.keyframe_features,
+                task.keyframe_pixel_indices,
+                drop_leading_frame=task.drop_leading_frame,
+                crop_trailing_ghost=task.crop_trailing_ghost,
+                stage4_time_origin=task.stage4_time_origin,
+                pixel_time_origin=task.pixel_time_origin,
+                clip_start_frame=task.clip_start_frame,
+                generator=task.noise_generator,
+                num_inference_steps=num_inference_steps,
+                x_t=task.x_t,
+            )
         context = self.decoder.forward_stage_4(
             task.tensor,
             drop_leading_frame=task.drop_leading_frame,
@@ -407,16 +481,28 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         z: torch.Tensor,
         generator: torch.Generator | list[torch.Generator] | None = None,
         num_inference_steps: int | None = None,
+        keyframes: LTX2DecodeKeyframes | None = None,
     ) -> torch.Tensor:
         if not self.is_distributed_enabled():
-            return super().tiled_decode(z, generator=generator, num_inference_steps=num_inference_steps)
+            kwargs: dict[str, Any] = {
+                "generator": generator,
+                "num_inference_steps": num_inference_steps,
+            }
+            if keyframes is not None:
+                kwargs["keyframes"] = keyframes
+            return super().tiled_decode(z, **kwargs)
 
         logger.debug("LTX-2.5 diffusion decoder running with distributed stage-4/stage-5 tiles")
         num_inference_steps = num_inference_steps or self.decoder.default_num_inference_steps
         result = self.distributed_executor.execute(
             z,
             DistributedOperator(
-                split=lambda tensor: self._distributed_tile_split(tensor, generator, num_inference_steps),
+                split=lambda tensor: self._distributed_tile_split(
+                    tensor,
+                    generator,
+                    num_inference_steps,
+                    keyframes,
+                ),
                 exec=lambda task: self._distributed_tile_exec(task, num_inference_steps),
                 merge=self._distributed_tile_merge,
             ),
