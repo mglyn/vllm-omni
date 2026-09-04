@@ -199,7 +199,7 @@ class LTXRuntime(
     connector_batches_cfg = False
     distributed_video_decode = True
     support_image_input = False
-    dummy_run_num_frames = 1
+    dummy_run_num_frames: ClassVar[int] = 0
     preserve_sp_padded_audio_duration = False
     reports_stage_durations = False
 

@@ -1409,7 +1409,22 @@ def test_ltx_distilled_forward_rejects_fixed_recipe_overrides(direct_kwargs, sam
         pipeline.forward(req, **direct_kwargs)
 
 
-def test_ltx_distilled_dummy_run_uses_fixed_recipe_values():
+@pytest.mark.parametrize(
+    "pipeline_cls",
+    [
+        LTX2Pipeline,
+        LTX2DistilledOneStagePipeline,
+        LTX2TwoStagePipeline,
+        LTX2DistilledTwoStagePipeline,
+        LTX2T2VDMD2Pipeline,
+        LTX2I2VDMD2Pipeline,
+    ],
+)
+def test_ltx_pipelines_disable_startup_dummy_run(pipeline_cls):
+    assert pipeline_cls.dummy_run_num_frames == 0
+
+
+def test_ltx_distilled_dummy_request_uses_fixed_recipe_values():
     from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -1421,7 +1436,7 @@ def test_ltx_distilled_dummy_run_uses_fixed_recipe_values():
                 sampling_params=OmniDiffusionSamplingParams(
                     height=512,
                     width=512,
-                    num_frames=LTX2DistilledPipeline.dummy_run_num_frames,
+                    num_frames=1,
                     num_inference_steps=1,
                     guidance_scale=0.0,
                 ),
