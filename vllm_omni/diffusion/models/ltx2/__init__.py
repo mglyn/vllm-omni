@@ -18,6 +18,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
     LTX2DistilledTwoStagePipeline,
     LTX2TwoStagePipeline,
 )
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx25_dfr import LTX25DFRPipeline
 
 __all__ = [
     "LTX2Pipeline",
@@ -27,6 +28,7 @@ __all__ = [
     "LTX2TwoStagePipeline",
     "LTX2DistilledPipeline",
     "LTX2DistilledTwoStagePipeline",
+    "LTX25DFRPipeline",
     "get_ltx2_post_process_func",
     "load_transformer_config",
     "create_transformer_from_config",

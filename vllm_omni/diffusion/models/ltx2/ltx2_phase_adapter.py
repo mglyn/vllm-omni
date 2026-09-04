@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import vllm.envs as envs
+from safetensors import safe_open
 from vllm.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_reduce,
@@ -36,7 +37,7 @@ from vllm.platforms import current_platform
 
 from .ltx2_adapter_parser import AdapterManifest, AdapterTarget, iter_adapter_tensors, parse_ltx_adapter
 from .ltx2_components import resolve_ltx_artifact
-from .ltx2_recipes import LTX_DISTILLED_ADAPTER_SLOT
+from .ltx2_recipes import LTX_DETAILING_ADAPTER_SLOT, LTX_DISTILLED_ADAPTER_SLOT
 
 logger = init_logger(__name__)
 
@@ -273,7 +274,7 @@ class _PhaseAdapterLinear(nn.Module):
         pieces = [_AdapterPiece(target, _build_layout(base_layer, target)) for target in targets]
         self.pieces = nn.ModuleList(pieces)
         self._pieces_by_target = {piece.target: piece for piece in pieces}
-        self._enabled = False
+        self._scale = 0.0
 
     def load_target(self, target: AdapterTarget, lora_a: torch.Tensor, lora_b: torch.Tensor) -> None:
         try:
@@ -282,16 +283,18 @@ class _PhaseAdapterLinear(nn.Module):
             raise ValueError(f"Adapter target {target.module!r} is not installed on this layer.") from exc
         piece.load(lora_a, lora_b, device=_module_device(self.base_layer), dtype=self.adapter_dtype)
 
-    def set_enabled(self, enabled: bool) -> None:
-        self._enabled = enabled
+    def set_enabled(self, enabled: bool, scale: float = 1.0) -> None:
+        self._scale = float(scale) if enabled else 0.0
 
     def _add_adapter_delta(self, input_: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
-        if not self._enabled:
+        if self._scale == 0.0:
             return output
         if output.requires_grad:
             output = output.clone()
         for piece in self.pieces:
             delta = piece.delta(input_).to(dtype=output.dtype)
+            if self._scale != 1.0:
+                delta = delta * self._scale
             start = piece.layout.output_start
             output[..., start : start + piece.layout.b_output_size].add_(delta)
         return output
@@ -304,6 +307,8 @@ class _PhaseAdapterLinear(nn.Module):
             start = piece.layout.output_start
             base_slice = base_weight.narrow(0, start, piece.layout.b_output_size)
             delta = piece.weight_delta()
+            if self._scale != 1.0:
+                delta = delta.mul(self._scale)
             if delta.shape != base_slice.shape:
                 raise ValueError(
                     f"LTX layer-fused delta shape {tuple(delta.shape)} does not match base weight slice "
@@ -316,7 +321,7 @@ class _PhaseAdapterLinear(nn.Module):
         return fused_weight
 
     def forward(self, input_: torch.Tensor):
-        if not self._enabled:
+        if self._scale == 0.0:
             return self.base_layer(input_)
         if self.layer_fused:
             return _forward_with_weight(self.base_layer, input_, self._fused_weight())
@@ -334,11 +339,13 @@ class LTXPhaseAdapterRuntime:
         transformer: nn.Module,
         manifest: AdapterManifest,
         *,
+        adapter_slot: str = LTX_DISTILLED_ADAPTER_SLOT,
         dtype: torch.dtype,
         layer_fused: bool = False,
     ) -> None:
         self.transformer = transformer
         self.manifest = manifest
+        self.adapter_slot = adapter_slot
         self._wrappers: dict[str, _PhaseAdapterLinear] = {}
         self._target_names: tuple[str, ...] = ()
         self._materialized = False
@@ -387,14 +394,33 @@ class LTXPhaseAdapterRuntime:
         self._materialized = True
         logger.info("Materialized %d LTX phase-adapter tensor pairs", len(self.manifest.targets))
 
-    def activate(self, adapter_slot: str | None) -> None:
+    def activate(self, adapter_slot: str | None, scale: float = 1.0) -> None:
         if adapter_slot is not None:
-            if adapter_slot != LTX_DISTILLED_ADAPTER_SLOT:
+            if adapter_slot != self.adapter_slot:
                 raise ValueError(f"Unknown LTX phase adapter slot {adapter_slot!r}.")
             if not self._materialized:
                 raise RuntimeError("LTX phase adapter data must be materialized before activation.")
         for wrapper in self._wrappers.values():
-            wrapper.set_enabled(adapter_slot is not None)
+            wrapper.set_enabled(adapter_slot is not None, scale)
+
+
+def _single_lora_path(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+        return value[0]
+    raise ValueError("LTX phase adapters accept exactly one `lora_path`.")
+
+
+def _reference_downscale_factor(path: str) -> int:
+    try:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            return int((handle.metadata() or {}).get("reference_downscale_factor", 1))
+    except Exception:
+        logger.warning("Unable to read reference_downscale_factor from %s; using 1", path)
+        return 1
 
 
 def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
@@ -402,13 +428,24 @@ def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
     adapter_slots = {phase.adapter_slot for phase in pipeline.pipeline_recipe.phases if phase.adapter_slot is not None}
     if not adapter_slots:
         return None
-    if adapter_slots != {LTX_DISTILLED_ADAPTER_SLOT}:
+    supported_slots = {LTX_DISTILLED_ADAPTER_SLOT, LTX_DETAILING_ADAPTER_SLOT}
+    if len(adapter_slots) != 1 or not adapter_slots <= supported_slots:
         raise ValueError(f"Unsupported LTX phase adapter slots: {sorted(adapter_slots)}.")
+    adapter_slot = next(iter(adapter_slots))
 
     profile = pipeline.component_profile
-    if profile.distilled_lora_filename is None or profile.artifact_repo_id is None:
-        raise ValueError(f"{profile.name} does not declare the required distilled adapter artifact.")
-    if getattr(pipeline.od_config, "lora_path", None) is not None:
+    explicit_path = _single_lora_path(getattr(pipeline.od_config, "lora_path", None))
+    if adapter_slot == LTX_DISTILLED_ADAPTER_SLOT:
+        adapter_repo_id = profile.artifact_repo_id
+        adapter_filename = profile.distilled_lora_filename
+        adapter_revision = profile.artifact_revision
+    else:
+        adapter_repo_id = profile.detailing_lora_repo_id
+        adapter_filename = profile.detailing_lora_filename
+        adapter_revision = profile.detailing_lora_revision
+    if adapter_filename is None or adapter_repo_id is None:
+        raise ValueError(f"{profile.name} does not declare the required {adapter_slot!r} adapter artifact.")
+    if explicit_path is not None and adapter_slot != LTX_DETAILING_ADAPTER_SLOT:
         raise ValueError(
             f"{pipeline.__class__.__name__} reserves LoRA execution for its phase adapter; "
             "request or static LoRA composition is not supported yet."
@@ -416,13 +453,15 @@ def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
 
     quantization_config = getattr(pipeline.od_config, "quantization_config", None)
     layer_fused = quantization_config is None
-    adapter_path = resolve_ltx_artifact(
+    adapter_path = explicit_path or resolve_ltx_artifact(
         pipeline.od_config.model,
-        profile.artifact_repo_id,
-        profile.distilled_lora_filename,
+        adapter_repo_id,
+        adapter_filename,
         model_revision=getattr(pipeline.od_config, "revision", None),
-        artifact_revision=profile.artifact_revision,
+        artifact_revision=adapter_revision,
     )
+    if adapter_slot == LTX_DETAILING_ADAPTER_SLOT:
+        pipeline._dfr_reference_downscale = _reference_downscale_factor(adapter_path)
 
     if layer_fused and pipeline.od_config.dtype is not torch.bfloat16:
         raise ValueError("LTX layer-fused phase LoRA requires a bfloat16 pipeline dtype.")
@@ -431,6 +470,7 @@ def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
     runtime = LTXPhaseAdapterRuntime(
         pipeline.transformer,
         manifest,
+        adapter_slot=adapter_slot,
         dtype=pipeline.od_config.dtype,
         layer_fused=layer_fused,
     )

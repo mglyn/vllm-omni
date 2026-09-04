@@ -38,6 +38,7 @@ from .ltx2_conditioning import LTXPromptContext, LTXTextConditioningMixin
 from .ltx2_denoise import (
     LTXDenoiseContext,
     LTXForwardContext,
+    LTXGeneratedKeyframeLayout,
     LTXPhaseExecutor,
     LTXPhaseResult,
     build_transformer_kwargs,
@@ -394,7 +395,7 @@ class LTXRuntime(
             if phase.adapter_slot is not None:
                 raise RuntimeError(f"LTX phase {phase.name!r} requires adapter slot {phase.adapter_slot!r}.")
             return
-        phase_adapter.activate(phase.adapter_slot)
+        phase_adapter.activate(phase.adapter_slot, phase.adapter_scale)
 
     def eval(self):
         result = super().eval()
@@ -896,6 +897,40 @@ class LTXRuntime(
             num_mel_bins=forward_ctx.latent_mel_bins,
         )
         return latents, audio_latents
+
+    def _unpack_generated_keyframes(
+        self,
+        tokens: torch.Tensor,
+        layout: LTXGeneratedKeyframeLayout,
+        forward_ctx: LTXForwardContext,
+    ) -> torch.Tensor:
+        """Turn generated slot tokens into independent raw VAE latent frames."""
+        expected_tokens = layout.num_keyframes * layout.tokens_per_keyframe
+        if tokens.shape[1] != expected_tokens:
+            raise ValueError(
+                f"Generated-keyframe layout expects {expected_tokens} tokens, got {tokens.shape[1]}."
+            )
+        frames = []
+        for index in range(layout.num_keyframes):
+            start = index * layout.tokens_per_keyframe
+            frame_tokens = tokens[:, start : start + layout.tokens_per_keyframe]
+            frame = latent_ops.unpack_latents(
+                frame_tokens,
+                1,
+                forward_ctx.latent_height,
+                forward_ctx.latent_width,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            )
+            frames.append(
+                latent_ops.denormalize_latents(
+                    frame,
+                    self.vae.latents_mean,
+                    self.vae.latents_std,
+                    self.vae.config.scaling_factor,
+                )
+            )
+        return torch.cat(frames, dim=2)
 
     def run_phase(
         self,

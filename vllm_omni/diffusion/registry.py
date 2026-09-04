@@ -96,6 +96,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_two_stage",
         "LTX2DistilledPipeline",
     ),
+    "LTX25DFRPipeline": (
+        "ltx2",
+        "pipeline_ltx25_dfr",
+        "LTX25DFRPipeline",
+    ),
     "LTX2T2VDMD2Pipeline": (
         "ltx2",
         "pipeline_ltx2",
@@ -557,6 +562,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledPipeline": "get_ltx2_post_process_func",
+    "LTX25DFRPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",

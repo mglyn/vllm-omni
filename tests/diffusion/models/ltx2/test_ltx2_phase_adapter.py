@@ -226,6 +226,37 @@ def test_ltx_phase_adapter_keeps_one_transformer_and_switches_a_fixed_slot(tmp_p
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[10.0, 13.0]]))
 
 
+def test_ltx_phase_adapter_applies_phase_scale(tmp_path):
+    class TinyTransformer(torch.nn.Module):
+        stacked_params_mapping = ()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 2, bias=False)
+
+    adapter_path = tmp_path / "detailing.safetensors"
+    save_file(
+        {
+            "diffusion_model.proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+            "diffusion_model.proj.lora_B.weight": torch.tensor([[3.0], [4.0]]),
+        },
+        adapter_path,
+    )
+    transformer = TinyTransformer()
+    runtime = LTXPhaseAdapterRuntime(
+        transformer,
+        parse_ltx_adapter(transformer, str(adapter_path)),
+        adapter_slot="detail",
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        transformer.proj.base_layer.weight.copy_(torch.eye(2))
+    runtime.finalize()
+    runtime.activate("detail", scale=0.5)
+
+    torch.testing.assert_close(transformer.proj(torch.ones(1, 2)), torch.tensor([[5.5, 7.0]]))
+
+
 def test_ltx_layer_fused_adapter_matches_official_bf16_weight_fusion():
     layer = torch.nn.Linear(4, 3, bias=True, dtype=torch.bfloat16)
     base_weight = torch.tensor(
