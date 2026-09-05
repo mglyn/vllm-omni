@@ -128,10 +128,10 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
   --stage-init-timeout 900
 ```
 
-Ulysses shards sequence work, not model weights, so each GPU must still fit the
-resident components. Strict Ulysses rejects non-divisible packed sequences;
-the canonical 1920x1088, 121-frame shape supports Ulysses 4. Use the same
-production shape for warmup requests.
+Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
+SP attention head counts must be divisible by `ulysses_degree`. Use each
+phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
+Each GPU must still fit the resident weights. Warm up with the production shape.
 
 ## Offline inference
 

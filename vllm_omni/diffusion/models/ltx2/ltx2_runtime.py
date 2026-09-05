@@ -211,6 +211,14 @@ class LTXRuntime(
                 f"{self.__class__.__name__} does not support ulysses_mode='advanced_uaa'. "
                 "Use the default ulysses_mode='strict' for LTX sequence parallelism."
             )
+        ring_degree = getattr(parallel_config, "ring_degree", 1)
+        allgather_degree = getattr(parallel_config, "allgather_degree", 1)
+        if ring_degree != 1 or allgather_degree != 1:
+            raise ValueError(
+                f"{self.__class__.__name__} supports pure Ulysses sequence parallelism only. "
+                "Set ring_degree=1 and allgather_degree=1; "
+                f"got {ring_degree=} and {allgather_degree=}."
+            )
         self.model_version = detect_ltx_model_version(od_config.model, revision=getattr(od_config, "revision", None))
         self.use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config, self.model_version)
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
