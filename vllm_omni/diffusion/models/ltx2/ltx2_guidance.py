@@ -298,6 +298,8 @@ class LTXGuidanceExecutor:
                     denoise_ctx.audio_attention_mask,
                     model_pass_count,
                 )
+            if denoise_ctx.keyframes_mask is not None:
+                denoise_ctx.keyframes_mask = _repeat_batch(denoise_ctx.keyframes_mask, model_pass_count)
         return denoise_ctx
 
     @staticmethod

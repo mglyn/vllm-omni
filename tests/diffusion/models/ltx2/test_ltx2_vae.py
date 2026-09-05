@@ -123,6 +123,116 @@ class TestLTXDiffusionDecoder:
         output = model.decode(torch.zeros(1, 4, 1, 2, 3), generator=None, return_dict=False)[0]
         assert output.shape == (1, 3, 1, 4, 6)
 
+    def test_dfr_joint_attention_rejects_non_cuda_execution(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodAttention
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_keyframes import KeyframeStream
+
+        attention = LTX2VideoVaeNeighborhoodAttention(dim=16, kernel_size=(1, 1, 1), head_dim=16)
+        video = torch.zeros(1, 2, 2, 2, 16)
+        keyframes = KeyframeStream(
+            x=torch.zeros(1, 2, 2, 2, 16),
+            times=torch.tensor([0.0, 1.0]),
+            valid=torch.ones(2, dtype=torch.bool),
+        )
+
+        with pytest.raises(RuntimeError, match="requires CUDA"):
+            attention.forward_with_keyframes(video, keyframes)
+
+    def test_distributed_keyframe_tiles_match_serial_noise_order(self, monkeypatch):
+        from diffusers.utils.torch_utils import randn_tensor
+
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_keyframes import (
+            KeyframeStream,
+            LTX2DecodeKeyframes,
+        )
+
+        model = DistributedLTX2VideoDiffusionDecoderModel(
+            out_channels=1,
+            latent_channels=1,
+            patch_size=1,
+            decoder_head_dim=16,
+            decoder_stage_channels=(16, 16, 16, 16, 16),
+            decoder_stage_depths=(1, 1, 1, 1, 1),
+            decoder_stage_kernels=((1, 1, 1),) * 4,
+            decoder_upsample_strides=((1, 1, 1),) * 4,
+            decoder_upsample_channel_reductions=(1, 1, 1, 1),
+            decoder_stage5_kernel=(1, 1, 1),
+            spatial_compression_ratio=1,
+            temporal_compression_ratio=1,
+        )
+        model.enable_tiling(
+            tile_sample_min_height=2,
+            tile_sample_min_width=2,
+            tile_sample_min_num_frames=2,
+            tile_sample_stride_height=1,
+            tile_sample_stride_width=1,
+            tile_sample_stride_num_frames=1,
+        )
+        model.distributed_executor = SimpleNamespace(group=None)
+        monkeypatch.setattr(torch.distributed, "broadcast", lambda *_args, **_kwargs: None)
+
+        def prepare_features(video, keyframes):
+            return video.permute(0, 2, 3, 4, 1), KeyframeStream(
+                x=keyframes.latents.permute(0, 2, 3, 4, 1),
+                times=keyframes.pixel_frame_indices.to(torch.float32),
+                valid=torch.ones_like(keyframes.pixel_frame_indices, dtype=torch.bool),
+            )
+
+        def decode_tile(features, keyframe_features, _pixel_frame_indices, **kwargs):
+            generator = kwargs["generator"]
+            x_t = kwargs["x_t"]
+            if x_t is None:
+                x_t = randn_tensor(
+                    (features.shape[0], 1, features.shape[1], features.shape[2], features.shape[3]),
+                    generator=generator,
+                    device=features.device,
+                    dtype=features.dtype,
+                )
+            # Preserve the official serial RNG contract: keyframe-aware decode
+            # draws a separate pixel-noise stream after the video stream.
+            randn_tensor(
+                (
+                    features.shape[0],
+                    1,
+                    keyframe_features.num_planes,
+                    features.shape[2],
+                    features.shape[3],
+                ),
+                generator=generator,
+                device=features.device,
+                dtype=features.dtype,
+            )
+            return x_t
+
+        model.decoder.forward_stages_1_to_3_with_keyframes = prepare_features
+        model.decoder.decode_tile_with_keyframes = decode_tile
+        video = torch.zeros(1, 1, 3, 3, 3)
+        keyframes = LTX2DecodeKeyframes(
+            latents=torch.zeros(1, 1, 2, 3, 3),
+            pixel_frame_indices=torch.tensor([0, 2]),
+        )
+
+        with torch.inference_mode():
+            serial = model._tiled_decode_with_keyframes(
+                video,
+                keyframes,
+                generator=torch.Generator().manual_seed(9),
+                num_inference_steps=1,
+            )
+            tasks, grid_spec = model._distributed_tile_split(
+                video,
+                torch.Generator().manual_seed(9),
+                num_inference_steps=1,
+                keyframes=keyframes,
+            )
+            tiles = {task.grid_coord: model._distributed_tile_exec(task, 1) for task in tasks}
+            distributed = model._distributed_tile_merge(tiles, grid_spec)
+
+        torch.testing.assert_close(distributed, serial, rtol=0, atol=0)
+
     @pytest.mark.parametrize(
         ("model_version", "extras", "expected"),
         [
@@ -174,6 +284,7 @@ class TestLTXDiffusionDecoder:
 
         torch.testing.assert_close(converted["latents_mean"], mean)
         torch.testing.assert_close(converted["latents_std"], std)
+        torch.testing.assert_close(converted["decoder.type_emb"], torch.ones(2))
         torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_q.weight"], qkv_weight[:2])
         torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_k.weight"], qkv_weight[2:4])
         torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_v.weight"], qkv_weight[4:])
@@ -187,7 +298,46 @@ class TestLTXDiffusionDecoder:
         )
         torch.testing.assert_close(converted["decoder.diff_blocks.0.attn.to_out.0.bias"], gate * projection_bias)
         assert "decoder.t_embedder.timestep_embedder.linear_1.weight" in converted
-        assert not any("type_emb" in key or "coarse" in key or "gate_msa" in key for key in converted)
+        assert not any("coarse" in key or "gate_msa" in key for key in converted)
+
+    def test_native_diffusion_decoder_config_comes_from_official_metadata(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+            convert_ltx25_native_diffusion_decoder_config,
+        )
+
+        config = convert_ltx25_native_diffusion_decoder_config(
+            {
+                "vae": {
+                    "decoder": {
+                        "in_channels": 128,
+                        "out_channels": 3,
+                        "patch_size": 4,
+                        "head_dim": 64,
+                        "stage_channels": [2048, 1024, 512, 512, 256],
+                        "stage_depths": [4, 6, 4, 2, 8],
+                        "stage_kernels": [[3, 7, 7], [3, 7, 7], [3, 5, 5], [3, 5, 5], [11, 11, 11]],
+                        "upsamples": [
+                            [[1, 2, 2], 2],
+                            [[2, 1, 1], 2],
+                            [[2, 2, 2], 1],
+                            [[2, 2, 2], 2],
+                        ],
+                        "stage5_kernel": [11, 11, 11],
+                        "timestep_scale_multiplier": 1000.0,
+                        "default_num_inference_steps": 1,
+                    },
+                    "model_output_type": "x0",
+                }
+            }
+        )
+
+        assert config["decoder_stage_channels"] == (2048, 1024, 512, 512, 256)
+        assert config["decoder_stage_kernels"] == ((3, 7, 7), (3, 7, 7), (3, 5, 5), (3, 5, 5))
+        assert config["decoder_stage5_kernel"] == (11, 11, 11)
+        assert config["decoder_model_output_type"] == "x0"
+        assert config["decoder_num_inference_steps"] == 1
+        assert config["spatial_compression_ratio"] == 32
+        assert config["temporal_compression_ratio"] == 8
 
     def test_native_diffusion_decoder_conversion_rejects_invalid_fused_qkv(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
@@ -432,8 +582,8 @@ class TestLTXDiffusionDecoder:
             out_channels=1,
             latent_channels=1,
             patch_size=1,
-            decoder_head_dim=8,
-            decoder_stage_channels=(8, 8, 8, 8, 8),
+            decoder_head_dim=16,
+            decoder_stage_channels=(16, 16, 16, 16, 16),
             decoder_stage_depths=(1, 1, 1, 1, 1),
             decoder_stage_kernels=((1, 1, 1),) * 4,
             decoder_upsample_strides=((1, 1, 1),) * 4,

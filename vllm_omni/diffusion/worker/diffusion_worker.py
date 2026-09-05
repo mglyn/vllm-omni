@@ -545,6 +545,14 @@ class DiffusionWorker:
             logger.info("LoRA was fused into the checkpoint at load time; skipping the dynamic LoRA manager.")
             return
 
+        # LTX multi-phase pipelines consume their fixed adapter internally.
+        # In particular, DFR may receive the detailing IC-LoRA through
+        # ``--lora-path``; do not also install it as a permanently active
+        # request/static adapter.
+        if getattr(self.model_runner.pipeline, "_phase_adapter", None) is not None:
+            self.lora_manager = None
+            return
+
         lora_path = self.od_config.lora_path
         if isinstance(lora_path, list) and len(lora_path) == 1:
             lora_path = lora_path[0]

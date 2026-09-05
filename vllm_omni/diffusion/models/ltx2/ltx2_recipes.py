@@ -30,6 +30,7 @@ LTX25_DEFAULT_NEGATIVE_PROMPT = (
 LTX_DISTILLED_SIGMAS = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
 LTX_STAGE_2_DISTILLED_SIGMAS = (0.909375, 0.725, 0.421875, 0.0)
 LTX_DISTILLED_ADAPTER_SLOT = "ltx_distilled"
+LTX_DETAILING_ADAPTER_SLOT = "ltx25_dfr_detailing"
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,9 @@ class LTXPhaseRecipe:
     noise_scale: float = 0.0
     input_transform: Literal["initial", "spatial_upsample"] = "initial"
     adapter_slot: str | None = None
+    adapter_scale: float = 1.0
     sampler: Literal["euler", "euler_ancestral"] = "euler"
+    freeze_audio: bool = False
     allow_guidance_override: bool = True
     use_official_sigma_schedule: bool = True
 
@@ -54,6 +57,8 @@ class LTXPhaseRecipe:
             raise ValueError("An explicit LTX sigma schedule must contain at least two denoise sigmas.")
         if self.sampler not in ("euler", "euler_ancestral"):
             raise ValueError(f"Unsupported LTX sampler: {self.sampler!r}.")
+        if self.adapter_scale < 0:
+            raise ValueError("LTX phase adapter_scale must be non-negative.")
 
     @property
     def num_inference_steps(self) -> int | None:
@@ -299,6 +304,58 @@ LTX23_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX23_ONE_STAGE_RECIPE)
 LTX25_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX25_FULL_RECIPE)
 
 
+LTX25_DFR_RECIPE = LTXPipelineRecipe(
+    # UHD 4K in the official DFR implementation is 3840x2176, not 3840x2160.
+    height=2176,
+    width=3840,
+    num_inference_steps=len(LTX_DISTILLED_SIGMAS) - 1,
+    negative_prompt="",
+    phases=(
+        LTXPhaseRecipe(
+            name="generate_quarterres",
+            guidance=LTXGuidanceSpec.positive_only(),
+            spatial_downscale=4,
+            sigmas=LTX_DISTILLED_SIGMAS,
+            noise_scale=1.0,
+            sampler="euler_ancestral",
+            allow_guidance_override=False,
+            use_official_sigma_schedule=False,
+        ),
+        LTXPhaseRecipe(
+            name="detail_halfres",
+            guidance=LTXGuidanceSpec.positive_only(),
+            spatial_downscale=2,
+            sigmas=LTX_STAGE_2_DISTILLED_SIGMAS,
+            noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
+            input_transform="spatial_upsample",
+            adapter_slot=LTX_DETAILING_ADAPTER_SLOT,
+            adapter_scale=0.5,
+            allow_guidance_override=False,
+            use_official_sigma_schedule=False,
+        ),
+        LTXPhaseRecipe(
+            name="detail_fullres",
+            guidance=LTXGuidanceSpec.positive_only(),
+            sigmas=LTX_STAGE_2_DISTILLED_SIGMAS,
+            noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
+            input_transform="spatial_upsample",
+            adapter_slot=LTX_DETAILING_ADAPTER_SLOT,
+            adapter_scale=0.5,
+            freeze_audio=True,
+            allow_guidance_override=False,
+            use_official_sigma_schedule=False,
+        ),
+    ),
+    video_output_phase=2,
+    audio_output_phase=0,
+    allow_request_sigmas=False,
+    allow_request_phase_sigmas=True,
+    allow_request_latents=False,
+    allow_negative_prompt=False,
+    fixed_num_inference_steps=True,
+)
+
+
 _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
     ("one_stage", "2"): LTX2_ONE_STAGE_RECIPE,
     ("one_stage", "2.3"): LTX23_ONE_STAGE_RECIPE,
@@ -312,6 +369,7 @@ _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
     ("distilled_two_stage", "2"): LTX2_DISTILLED_TWO_STAGE_RECIPE,
     ("distilled_two_stage", "2.3"): LTX23_DISTILLED_TWO_STAGE_RECIPE,
     ("distilled_two_stage", "2.5"): LTX25_DISTILLED_TWO_STAGE_RECIPE,
+    ("dfr", "2.5"): LTX25_DFR_RECIPE,
     ("dmd2", "2"): LTX_POSITIVE_ONLY_RECIPE,
     ("dmd2", "2.3"): LTX_POSITIVE_ONLY_RECIPE,
 }

@@ -38,11 +38,13 @@ from .ltx2_conditioning import LTXPromptContext, LTXTextConditioningMixin
 from .ltx2_denoise import (
     LTXDenoiseContext,
     LTXForwardContext,
+    LTXGeneratedKeyframeLayout,
     LTXPhaseExecutor,
     LTXPhaseResult,
     build_transformer_kwargs,
     step_denoised_latents,
 )
+from .ltx2_diffusion_decoder_keyframes import LTX2DecodeKeyframes
 from .ltx2_guidance import (
     LTX_GUIDANCE_EXECUTOR,
     LTXGuidanceExecutor,
@@ -394,7 +396,7 @@ class LTXRuntime(
             if phase.adapter_slot is not None:
                 raise RuntimeError(f"LTX phase {phase.name!r} requires adapter slot {phase.adapter_slot!r}.")
             return
-        phase_adapter.activate(phase.adapter_slot)
+        phase_adapter.activate(phase.adapter_slot, phase.adapter_scale)
 
     def eval(self):
         result = super().eval()
@@ -600,6 +602,7 @@ class LTXRuntime(
         decode_timestep: float | list[float],
         decode_noise_scale: float | list[float] | None,
         prompt_batch_size: int,
+        decode_keyframes: LTX2DecodeKeyframes | None = None,
     ) -> DiffusionOutput:
         if output_type == "latent":
             return self._make_output((latents, audio_latents))
@@ -634,10 +637,15 @@ class LTXRuntime(
         should_decode_video = not self.distributed_video_decode or is_output_rank or vae_decode_needs_all_ranks
         if should_decode_video:
             if use_diffusion_decoder:
+                decoder_kwargs: dict[str, Any] = {
+                    "generator": generator,
+                    "return_dict": False,
+                }
+                if decode_keyframes is not None:
+                    decoder_kwargs["keyframes"] = decode_keyframes
                 video = self.diffusion_decoder.decode(
                     latents.to(self.diffusion_decoder.dtype),
-                    generator=generator,
-                    return_dict=False,
+                    **decoder_kwargs,
                 )[0]
             else:
                 video = self.vae.decode(latents.to(self.vae.dtype), timestep_decode, return_dict=False)[0]
@@ -897,6 +905,39 @@ class LTXRuntime(
         )
         return latents, audio_latents
 
+    def _unpack_generated_keyframes(
+        self,
+        tokens: torch.Tensor,
+        layout: LTXGeneratedKeyframeLayout,
+        forward_ctx: LTXForwardContext,
+    ) -> torch.Tensor:
+        """Turn generated slot tokens into independent raw VAE latent frames."""
+        expected_tokens = layout.num_keyframes * layout.tokens_per_keyframe
+        if tokens.shape[1] != expected_tokens:
+            raise ValueError(f"Generated-keyframe layout expects {expected_tokens} tokens, got {tokens.shape[1]}.")
+        latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
+        frames = []
+        for index in range(layout.num_keyframes):
+            start = index * layout.tokens_per_keyframe
+            frame_tokens = tokens[:, start : start + layout.tokens_per_keyframe]
+            frame = latent_ops.unpack_latents(
+                frame_tokens,
+                1,
+                forward_ctx.latent_height,
+                forward_ctx.latent_width,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            )
+            frames.append(
+                latent_ops.denormalize_latents(
+                    frame,
+                    latents_mean,
+                    latents_std,
+                    scaling_factor,
+                )
+            )
+        return torch.cat(frames, dim=2)
+
     def run_phase(
         self,
         req: DiffusionRequestBatch,
@@ -1011,6 +1052,7 @@ class LTXRuntime(
             decode_timestep=request_inputs.decode_timestep,
             decode_noise_scale=request_inputs.decode_noise_scale,
             prompt_batch_size=forward_ctx.batch_size,
+            decode_keyframes=phase.decode_keyframes,
         )
         if not self.supports_request_batch:
             return output

@@ -36,7 +36,7 @@ from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_test
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
-LTX25_OFFICIAL_REVISION = "7954dcb0d986bdc36ef272564a9789ade07fcc65"
+LTX25_OFFICIAL_REVISION = "a95ab856bf29407b6b066ede0abe1846050db56c"
 LTX25_OMNI_MODEL_ID = "Lightricks/LTX-2.5-Diffusers"
 LTX25_OMNI_MODEL_REVISION = "a6de4b5354f078db24d9cf4778c14846788aea3d"
 LTX25_OFFICIAL_MODEL_ID = "Lightricks/LTX-2.5"

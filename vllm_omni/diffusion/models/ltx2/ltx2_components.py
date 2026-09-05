@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
-from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
@@ -40,6 +39,8 @@ from .ltx2_diffusion_decoder import (
     LTX25_NATIVE_ARTIFACT_REVISION,
     LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
     LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
+    load_ltx25_native_diffusion_decoder_config,
 )
 from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
@@ -77,7 +78,6 @@ _LTX_COMPONENT_SUBFOLDERS = (
 logger = logging.getLogger(__name__)
 
 _LTX2_CONV_VAE_EXTRA = "ltx2_use_conv_vae"
-_LTX2_DIFFUSION_DECODER_SUBFOLDER = "diffusion_decoder"
 
 
 def _ltx2_use_diffusion_decoder(od_config: Any, model_version: str) -> bool:
@@ -106,6 +106,9 @@ class LTXComponentProfile:
     artifact_revision: str | None = None
     latent_upsampler_filename: str | None = None
     distilled_lora_filename: str | None = None
+    detailing_lora_repo_id: str | None = None
+    detailing_lora_filename: str | None = None
+    detailing_lora_revision: str | None = None
     transformer_subfolder: str = "transformer"
     scheduler_use_dynamic_shifting: bool = False
     scheduler_shift_terminal: float | None = None
@@ -227,6 +230,16 @@ LTX25_TWO_STAGE_COMPONENT_PROFILE = replace(
     distilled_lora_filename="loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
 )
 
+LTX25_DFR_COMPONENT_PROFILE = replace(
+    LTX25_DISTILLED_COMPONENT_PROFILE,
+    name="ltx2_5_dfr",
+    artifact_repo_id="Lightricks/LTX-2.5",
+    artifact_revision=LTX25_NATIVE_ARTIFACT_REVISION,
+    latent_upsampler_filename=("latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
+    detailing_lora_repo_id="Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler",
+    detailing_lora_filename="ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors",
+)
+
 _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("one_stage", "2"): LTX2_COMPONENT_PROFILE,
     ("one_stage", "2.3"): LTX23_COMPONENT_PROFILE,
@@ -240,6 +253,7 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("distilled_two_stage", "2"): LTX2_DISTILLED_COMPONENT_PROFILE,
     ("distilled_two_stage", "2.3"): LTX23_DISTILLED_COMPONENT_PROFILE,
     ("distilled_two_stage", "2.5"): LTX25_DISTILLED_COMPONENT_PROFILE,
+    ("dfr", "2.5"): LTX25_DFR_COMPONENT_PROFILE,
     ("dmd2", "2"): LTX2_COMPONENT_PROFILE,
     ("dmd2", "2.3"): LTX23_COMPONENT_PROFILE,
 }
@@ -249,7 +263,7 @@ def resolve_ltx_checkpoint_kind(pipeline_kind: str) -> LTXCheckpointKind | None:
     """Derive checkpoint requirements from the execution contract."""
     if pipeline_kind in {"one_stage", "two_stage"}:
         return "regular"
-    if pipeline_kind in {"distilled_one_stage", "distilled_two_stage"}:
+    if pipeline_kind in {"distilled_one_stage", "distilled_two_stage", "dfr"}:
         return "distilled"
     if pipeline_kind == "dmd2":
         return None
@@ -273,6 +287,9 @@ def resolve_ltx_artifact(
     candidate = Path(model) / filename
     if candidate.is_file():
         return str(candidate)
+    lora_candidate = Path(model) / "loras" / filename
+    if lora_candidate.is_file():
+        return str(lora_candidate)
 
     # Hub revisions are repository-scoped. Reuse the model revision only when
     # the model and artifact are in the same repository; otherwise use the
@@ -286,7 +303,7 @@ def resolve_ltx_artifact(
         )
     except Exception as exc:
         raise FileNotFoundError(
-            f"Unable to resolve LTX artifact {filename!r}. Searched {candidate}; "
+            f"Unable to resolve LTX artifact {filename!r}. Searched {candidate} and {lora_candidate}; "
             f"place the file in the model root or make {repo_id} available."
         ) from exc
 
@@ -595,13 +612,8 @@ def _load_ltx25_native_diffusion_decoder(
     dtype: torch.dtype,
     revision: str | None,
 ) -> DistributedLTX2VideoDiffusionDecoderModel:
-    """Load canonical Native weights into the local Diffusers-compatible class."""
-    config = DistributedLTX2VideoDiffusionDecoderModel.load_config(
-        model,
-        subfolder=_LTX2_DIFFUSION_DECODER_SUBFOLDER,
-        local_files_only=local_files_only,
-        revision=revision,
-    )
+    """Load canonical Native weights into vLLM-Omni's native decoder."""
+    del local_files_only
     checkpoint_path = resolve_ltx_artifact(
         model,
         LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
@@ -609,6 +621,7 @@ def _load_ltx25_native_diffusion_decoder(
         model_revision=revision,
         artifact_revision=LTX25_NATIVE_ARTIFACT_REVISION,
     )
+    config = load_ltx25_native_diffusion_decoder_config(checkpoint_path)
     decoder = DistributedLTX2VideoDiffusionDecoderModel.from_ltx25_native_checkpoint(
         checkpoint_path,
         config,

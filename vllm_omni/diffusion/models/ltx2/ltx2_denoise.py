@@ -21,6 +21,7 @@ from .ltx2_latents import LTXAVState, unpack_audio_latents, unpad_audio_latents
 
 if TYPE_CHECKING:
     from .ltx2_conditioning import LTXPromptContext
+    from .ltx2_diffusion_decoder_keyframes import LTX2DecodeKeyframes
     from .ltx2_recipes import LTXPhaseRecipe
     from .ltx2_request import LTXRequestInputs
 
@@ -66,6 +67,39 @@ class LTXDenoiseContext:
     audio_attention_mask: torch.Tensor | None = None
     conditioning_mask: torch.Tensor | None = None
     conditioning_mask_for_model: torch.Tensor | None = None
+    keyframes_mask: torch.Tensor | None = None
+    base_video_token_count: int | None = None
+    generated_keyframe_layout: LTXGeneratedKeyframeLayout | None = None
+
+
+@dataclass(frozen=True)
+class LTXGeneratedKeyframeLayout:
+    """Token range occupied by DFR-generated single-frame slots."""
+
+    pixel_frame_indices: tuple[int, ...]
+    tokens_per_keyframe: int
+    first_token: int
+
+    @property
+    def num_keyframes(self) -> int:
+        return len(self.pixel_frame_indices)
+
+    @property
+    def token_slice(self) -> slice:
+        count = self.num_keyframes * self.tokens_per_keyframe
+        return slice(self.first_token, self.first_token + count)
+
+
+@dataclass
+class LTXPreparedVideoState:
+    """Packed video state after optional DFR conditioning was appended."""
+
+    latents: torch.Tensor
+    conditioning_mask: torch.Tensor | None
+    video_coords: torch.Tensor | None = None
+    keyframes_mask: torch.Tensor | None = None
+    base_video_token_count: int | None = None
+    generated_keyframe_layout: LTXGeneratedKeyframeLayout | None = None
 
 
 @dataclass
@@ -76,6 +110,8 @@ class LTXPhaseResult:
     video: torch.Tensor
     audio: torch.Tensor
     audio_for_next_phase: torch.Tensor | None = None
+    generated_keyframes: torch.Tensor | None = None
+    decode_keyframes: LTX2DecodeKeyframes | None = None
 
 
 class LTXDenoisePipeline(Protocol):
@@ -147,6 +183,8 @@ class LTXVideoAudioStepAdapter:
         sampler: str = "euler",
         generator: torch.Generator | list[torch.Generator] | None = None,
         conditioning_mask: torch.Tensor | None = None,
+        tokenwise_conditioning: bool = False,
+        freeze_audio: bool = False,
     ) -> None:
         self._pipeline = pipeline
         self._audio_scheduler = audio_scheduler
@@ -156,6 +194,8 @@ class LTXVideoAudioStepAdapter:
         self._image_conditioned = image_conditioned
         self._sampler = sampler
         self._conditioning_mask = conditioning_mask
+        self._tokenwise_conditioning = tokenwise_conditioning
+        self._freeze_audio = freeze_audio
         self._ancestral_generators = (
             _make_ancestral_generators(generator, pipeline.device) if sampler == "euler_ancestral" else None
         )
@@ -174,7 +214,7 @@ class LTXVideoAudioStepAdapter:
             if self._conditioning_mask is not None:
                 mask = self._conditioning_mask.unsqueeze(-1).to(video_out.dtype)
                 video_out = torch.lerp(video_out, latents[0], mask)
-        elif self._image_conditioned:
+        elif self._image_conditioned and not self._tokenwise_conditioning:
             video_out = self._pipeline._step_video_latents_i2v(
                 noise_pred[0],
                 latents[0],
@@ -190,7 +230,12 @@ class LTXVideoAudioStepAdapter:
                 self._pipeline.scheduler.sigmas,
                 self._step_index,
             )
-        if self._sampler == "euler_ancestral":
+            if self._conditioning_mask is not None:
+                mask = self._conditioning_mask.unsqueeze(-1).to(video_out.dtype)
+                video_out = torch.lerp(video_out, latents[0], mask)
+        if self._freeze_audio:
+            audio_out = latents[1]
+        elif self._sampler == "euler_ancestral":
             audio_out = _ancestral_euler_step_from_velocity(
                 latents[1],
                 noise_pred[1],
@@ -332,6 +377,8 @@ def prepare_scheduler_stage(
     sampler: str = "euler",
     generator: torch.Generator | list[torch.Generator] | None = None,
     conditioning_mask: torch.Tensor | None = None,
+    tokenwise_conditioning: bool = False,
+    freeze_audio: bool = False,
 ) -> tuple[Any, Any, torch.Tensor]:
     if sigmas is not None and timesteps is not None:
         raise ValueError("Only one of `sigmas` or `timesteps` may be provided.")
@@ -347,6 +394,8 @@ def prepare_scheduler_stage(
         sampler=sampler,
         generator=generator,
         conditioning_mask=conditioning_mask,
+        tokenwise_conditioning=tokenwise_conditioning,
+        freeze_audio=freeze_audio,
     )
     if sigmas is not None:
         scheduler_sigmas = torch.as_tensor(sigmas, dtype=torch.float32, device=device)
@@ -442,8 +491,8 @@ def build_transformer_kwargs(
     attention_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     del encoder_attention_mask, audio_encoder_attention_mask
-    keyframes_mask = None
-    if getattr(pipeline.transformer.config, "use_keyframes_abs_pos_embedding", False):
+    keyframes_mask = denoise_ctx.keyframes_mask
+    if keyframes_mask is None and getattr(pipeline.transformer.config, "use_keyframes_abs_pos_embedding", False):
         keyframes_mask = _first_frame_keyframes_mask(hidden_states, forward_ctx.latent_num_frames)
     return {
         "hidden_states": hidden_states,
@@ -529,19 +578,25 @@ class LTXPhaseExecutor:
             )
 
         latent_num_frames, latent_height, latent_width = pipeline._resolve_video_latent_dimensions(request_inputs)
-        latents, conditioning_mask = pipeline._prepare_video_latents_stage(
+        prepared_video = pipeline._prepare_video_latents_stage(
             request_inputs,
             prompt_context,
             device=device,
             noise_scale=noise_scale,
             image=image,
         )
+        if isinstance(prepared_video, LTXPreparedVideoState):
+            latents = prepared_video.latents
+            conditioning_mask = prepared_video.conditioning_mask
+        else:
+            latents, conditioning_mask = prepared_video
+            prepared_video = LTXPreparedVideoState(latents, conditioning_mask)
         audio_latents, original_audio_num_frames, padded_audio_num_frames, latent_mel_bins = (
             pipeline._prepare_audio_latents_stage(
                 request_inputs,
                 prompt_context,
                 device=device,
-                noise_scale=noise_scale,
+                noise_scale=0.0 if phase_recipe.freeze_audio else noise_scale,
             )
         )
         audio_scheduler, video_audio_step_adapter, timesteps_tensor = prepare_scheduler_stage(
@@ -558,6 +613,8 @@ class LTXPhaseExecutor:
             sampler=phase_recipe.sampler,
             generator=request_inputs.generator,
             conditioning_mask=conditioning_mask,
+            tokenwise_conditioning=prepared_video.video_coords is not None,
+            freeze_audio=phase_recipe.freeze_audio,
         )
         forward_ctx = LTXForwardContext(
             req=req,
@@ -577,7 +634,15 @@ class LTXPhaseExecutor:
             audio_scheduler=audio_scheduler,
             video_audio_step_adapter=video_audio_step_adapter,
         )
-        video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
+        if prepared_video.video_coords is None:
+            video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
+        else:
+            video_coords = prepared_video.video_coords
+            audio_coords = pipeline.transformer.audio_rope.prepare_audio_coords(
+                audio_latents.shape[0],
+                padded_audio_num_frames,
+                audio_latents.device,
+            )
         ring_degree = getattr(pipeline.od_config.parallel_config, "ring_degree", 1) or 1
         if padded_audio_num_frames > original_audio_num_frames and ring_degree > 1:
             raise ValueError(
@@ -598,6 +663,9 @@ class LTXPhaseExecutor:
                 else None
             ),
             conditioning_mask=conditioning_mask,
+            keyframes_mask=prepared_video.keyframes_mask,
+            base_video_token_count=prepared_video.base_video_token_count,
+            generated_keyframe_layout=prepared_video.generated_keyframe_layout,
         )
         denoise_ctx = pipeline._prepare_denoise_context_for_guidance(forward_ctx, denoise_ctx)
         state = LTXDenoiseExecutor.run(
@@ -614,9 +682,20 @@ class LTXPhaseExecutor:
         )
         denoise_ctx.latents = state.video
         denoise_ctx.audio_latents = state.audio
+        packed_video = state.video
+        generated_keyframes = None
+        if denoise_ctx.generated_keyframe_layout is not None:
+            layout = denoise_ctx.generated_keyframe_layout
+            generated_keyframes = pipeline._unpack_generated_keyframes(
+                packed_video[:, layout.token_slice],
+                layout,
+                forward_ctx,
+            )
+        if denoise_ctx.base_video_token_count is not None:
+            packed_video = packed_video[:, : denoise_ctx.base_video_token_count]
         latents, audio_latents = pipeline._unpack_and_denormalize_stage(
             forward_ctx,
-            state.video,
+            packed_video,
             state.audio,
         )
         normalized_audio = unpack_audio_latents(
@@ -628,4 +707,5 @@ class LTXPhaseExecutor:
             video=latents,
             audio=audio_latents,
             audio_for_next_phase=normalized_audio,
+            generated_keyframes=generated_keyframes,
         )
