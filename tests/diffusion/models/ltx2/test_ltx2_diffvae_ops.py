@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import importlib
+import sys
+
 import pytest
 import torch
 
@@ -24,6 +27,14 @@ _DIM_SPLIT = (16, 24, 24)
 
 def _sm90_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+
+
+def test_diffvae_residual_wrapper_does_not_import_tilelang_backend(monkeypatch) -> None:
+    backend_name = "vllm_omni.diffusion.models.ltx2.ops.diffvae.residual_adaln_tilelang"
+    # Metadata/model imports must work before a CUDA operator is requested.
+    # This is deferred compiler loading, not an alternate attention backend.
+    monkeypatch.setitem(sys.modules, backend_name, None)
+    importlib.reload(residual_adaln_ops)
 
 
 def test_diffvae_fna_tile_map_covers_exact_neighborhood() -> None:

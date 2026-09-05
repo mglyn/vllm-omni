@@ -14,7 +14,6 @@ from vllm.triton_utils import tl, triton
 
 from ..numerics import add_rn_f32, round_bf16_to_fp32
 from ..platform import is_ltx2_ops_eligible
-from .residual_adaln_tilelang import launch_residual_rms_norm_modulate_tilelang
 
 _HIDDEN_SIZE = 256
 _POINTWISE_BLOCK = 1024
@@ -148,6 +147,8 @@ def _launch_adaln(
     shift: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
+    from .residual_adaln_tilelang import launch_residual_rms_norm_modulate_tilelang
+
     return launch_residual_rms_norm_modulate_tilelang(
         x,
         residual_a,
