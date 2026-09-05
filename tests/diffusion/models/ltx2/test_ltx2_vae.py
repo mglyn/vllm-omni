@@ -192,15 +192,12 @@ class TestLTXDiffusionDecoder:
         assert [value for axis, value in blend_calls if axis == "width"] == [4, 2] * 3
         assert [value for axis, value in blend_calls if axis == "frames"] == [4, 2]
 
-    def test_diffusion_decoder_installs_all_optimized_behavior_once(self):
+    def test_diffusion_decoder_owns_all_modules(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
             LTX2VideoDiffusionDecoderModel,
-        )
-        from vllm_omni.diffusion.models.ltx2.ops.diffvae.modules import (
             LTX2VideoVaeDiffusionNABlock,
             LTX2VideoVaeNeighborhoodAttention,
             LTX2VideoVaeSwiGLU,
-            install_ltx2_diffvae_ops,
         )
 
         with torch.device("meta"):
@@ -215,12 +212,15 @@ class TestLTXDiffusionDecoder:
             == model.config.decoder_stage_depths[-1]
         )
 
-        installed_types = tuple(type(module) for module in modules)
-        install_ltx2_diffvae_ops(model.decoder)
-        assert tuple(type(module) for module in model.decoder.modules()) == installed_types
+        assert type(model.decoder).__module__.startswith("vllm_omni.")
+        assert not any(
+            "diffusers.models.autoencoders.ltx2_diffusion_decoder" in cls.__module__
+            for module in modules
+            for cls in type(module).__mro__
+        )
 
     def test_natten_processor_routes_stage5_through_tilelang_fna(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2.ops.diffvae import modules as diffvae_modules
+        from vllm_omni.diffusion.models.ltx2 import ltx2_diffusion_decoder as diffvae_modules
 
         processor = object.__new__(diffvae_modules.LTX2VideoVaeNeighborhoodNattenProcessor)
         processor.backend = None
@@ -269,8 +269,8 @@ class TestLTXDiffusionDecoder:
         assert fast_path_calls[0][3:] == ((11, 11, 11), (11, 11, 11))
         assert not fallback_calls
 
-    def test_diffusion_decoder_noneligible_block_uses_upstream_forward(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2.ops.diffvae import modules as diffvae_modules
+    def test_diffusion_decoder_noneligible_block_uses_owned_unfused_forward(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_diffusion_decoder as diffvae_modules
 
         block = object.__new__(diffvae_modules.LTX2VideoVaeDiffusionNABlock)
         torch.nn.Module.__init__(block)
@@ -282,8 +282,8 @@ class TestLTXDiffusionDecoder:
             return expected
 
         monkeypatch.setattr(
-            diffvae_modules.DiffusersLTX2VideoVaeDiffusionNABlock,
-            "forward",
+            diffvae_modules.LTX2VideoVaeDiffusionNABlock,
+            "_forward_unfused",
             upstream_forward,
         )
         hidden_states = torch.randn(1, 1, 1, 1, 1)

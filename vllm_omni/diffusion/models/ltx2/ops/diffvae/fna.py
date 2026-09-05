@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""TileLang FNA for the LTX-2.5 DiffVAE SM90 stage-5 schedule.
+"""TileLang FNA for the LTX-2.5 DiffVAE stage-5 schedule.
 
 This intentionally reuses NATTEN's token permutation.  It only replaces the
 middle BF16 attention kernel for Q tiles (4, 4, 4), KV tiles (4, 4, 8),
@@ -9,15 +9,12 @@ head_dim=64, stride=dilation=1, and scale=1.0.
 """
 
 import functools
-import logging
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
 from vllm.tilelang_utils import T, tilelang
-
-from ..platform import is_ltx2_ops_eligible
 
 Q_TILE = (4, 4, 4)
 KV_TILE = (4, 4, 8)
@@ -30,9 +27,6 @@ KV_BUCKET_LIMITS = (32, 48, 60, 75)
 PATTERN_TABLE_SIZE = 16
 KV_TILE_ID_BITS = 15
 SHAPE_CACHE_SIZE = 16
-_FAILED_KEYS: set[tuple[int | None, tuple[int, int, int], int, tuple[int, int, int]]] = set()
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -234,10 +228,15 @@ def build_kv_tile_buckets(
     for limit in KV_BUCKET_LIMITS:
         q_tile_ids = torch.nonzero((counts > lower) & (counts <= limit), as_tuple=False).flatten()
         if q_tile_ids.numel():
+            # Small grids can have fewer columns than the first bucket limit.
+            # Zero metadata encodes an all-masked tile, preserving the fixed ABI.
+            bucket_metadata = torch.zeros((q_tile_ids.numel(), limit), dtype=torch.int32)
+            columns = min(limit, metadata.shape[1])
+            bucket_metadata[:, :columns] = metadata[q_tile_ids, :columns]
             buckets.append(
                 (
                     q_tile_ids.to(torch.int32),
-                    metadata[q_tile_ids, :limit].contiguous(),
+                    bucket_metadata,
                     limit,
                 )
             )
@@ -247,10 +246,11 @@ def build_kv_tile_buckets(
     return tuple(buckets)
 
 
-@functools.lru_cache(maxsize=len(KV_BUCKET_LIMITS))
+@functools.lru_cache(maxsize=32)
 def compile_kernel(
     max_kv_tiles: int,
     *,
+    target: str = "auto",
     num_stages: int = 1,
     threads: int = 128,
 ):
@@ -426,7 +426,7 @@ def compile_kernel(
     return tilelang.compile(
         main,
         out_idx=None,
-        target={"kind": "cuda", "arch": "sm_90a"},
+        target="auto" if target == "auto" else {"kind": "cuda", "arch": target},
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
             # Keeping all work in the 128-thread consumer warpgroup avoids a
@@ -476,72 +476,53 @@ def _fna3d_tilelang(
     pattern_tables, buckets = device_inputs
     output = torch.empty_like(query)
     for q_tile_ids, metadata, limit in buckets:
-        kernel = compile_kernel(limit)
-        kernel(
-            query[0],
-            key[0],
-            value[0],
-            q_tile_ids,
-            metadata,
-            *pattern_tables,
-            output[0],
-        )
+        from tilelang.backend.target import determine_target
+
+        target = str(determine_target("auto", return_object=True).attrs["arch"])
+        kernel = compile_kernel(limit, target=target)
+        for batch in range(query.shape[0]):
+            kernel(query[batch], key[batch], value[batch], q_tile_ids, metadata, *pattern_tables, output[batch])
     return output
 
 
-def try_fna3d_tilelang(
+def fna3d_tilelang(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     *,
     shape: tuple[int, int, int],
     window: tuple[int, int, int],
-) -> torch.Tensor | None:
-    """Run the bounded-drift stage-5 FNA fast path or return ``None``."""
+) -> torch.Tensor:
+    """Run native stage-5 FNA, or raise for unsupported inputs/launch failures.
 
+    Q and KV use the documented token-tiled layout. Batch members share spatial
+    metadata; compilation is cached by target architecture and KV-count bucket.
+    """
     if not (
-        is_ltx2_ops_eligible(query)
+        query.is_cuda
         and query.dtype is torch.bfloat16
-        and query.ndim == 4
-        and query.shape[0] == 1
-        and query.shape[2] == HEADS
-        and query.shape[-1] == HEAD_DIM
+        and query.ndim == key.ndim == value.ndim == 4
+        and query.shape[0] > 0
+        and query.shape[-2:] == (HEADS, HEAD_DIM)
         and query.numel() > 0
         and query.is_contiguous()
-        and key.device == query.device
-        and key.dtype is query.dtype
+        and key.device == value.device == query.device
+        and key.dtype is value.dtype is query.dtype
         and key.is_contiguous()
-        and value.device == query.device
-        and value.dtype is query.dtype
-        and value.shape == key.shape
         and value.is_contiguous()
-        and key.shape[0] == 1
+        and value.shape == key.shape
+        and key.shape[0] == query.shape[0]
         and key.shape[-2:] == query.shape[-2:]
         and len(shape) == 3
-        and len(window) == 3
         and tuple(window) == (11, 11, 11)
     ):
-        return None
-
-    runtime_key = (query.device.index, tuple(shape), query.shape[2], tuple(window))
-    if runtime_key in _FAILED_KEYS:
-        return None
-    try:
-        return _fna3d_tilelang(
-            query,
-            key,
-            value,
-            shape=tuple(shape),
-            window=tuple(window),
+        raise ValueError(
+            "LTX DiffVAE FNA requires contiguous CUDA BF16 [B, tokens, 4, 64] Q/K/V and an 11x11x11 window."
         )
-    except Exception as exc:  # noqa: BLE001 - fail closed after optimized-path failure
-        _FAILED_KEYS.add(runtime_key)
-        logger.warning(
-            "Disabling LTX DiffVAE TileLang FNA for %s after failure: %s",
-            runtime_key,
-            exc,
-        )
-        return None
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (query, key, value)):
+        raise RuntimeError("LTX DiffVAE FNA is inference-only.")
+    with torch.accelerator.device_index(query.device.index):
+        return _fna3d_tilelang(query, key, value, shape=tuple(shape), window=tuple(window))
 
 
-__all__ = ["try_fna3d_tilelang"]
+__all__ = ["fna3d_tilelang"]

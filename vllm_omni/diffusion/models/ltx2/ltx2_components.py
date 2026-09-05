@@ -39,6 +39,7 @@ from .ltx2_diffusion_decoder import (
     LTX25_NATIVE_ARTIFACT_REVISION,
     LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
     LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
 )
 from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
@@ -48,7 +49,6 @@ from .ltx2_transformer import (
     apply_split_rotary_emb,
     to_ltx_padding_mask,
 )
-from .ops.diffvae.modules import LTX2VideoVaeNeighborhoodNattenProcessor
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE

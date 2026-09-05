@@ -26,17 +26,6 @@ def _sm90_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
 
 
-@pytest.fixture
-def isolated_fna_runtime_state():
-    failed_keys = set(fna_ops._FAILED_KEYS)
-    fna_ops._FAILED_KEYS.clear()
-    try:
-        yield
-    finally:
-        fna_ops._FAILED_KEYS.clear()
-        fna_ops._FAILED_KEYS.update(failed_keys)
-
-
 def test_diffvae_fna_tile_map_covers_exact_neighborhood() -> None:
     problem = fna_ops.Problem(13, 14, 17, 1, (11, 11, 11))
     indices, counts = fna_ops.build_kv_tile_map(problem)
@@ -68,11 +57,13 @@ def test_diffvae_fna_tile_map_covers_exact_neighborhood() -> None:
 
 
 def test_diffvae_fna_metadata_uses_static_kernel_shapes() -> None:
-    for shape in ((13, 14, 17), (66, 96, 128), (79, 192, 192)):
+    for shape in ((11, 11, 11), (13, 14, 17), (66, 96, 128), (79, 192, 192)):
         problem = fna_ops.Problem(*shape, 4, (11, 11, 11))
         _, t_patterns, h_patterns, w_patterns = fna_ops.build_kv_tile_metadata(problem)
         assert {table.numel() for table in (t_patterns, h_patterns, w_patterns)} == {fna_ops.PATTERN_TABLE_SIZE}
         assert {limit for _, _, limit in fna_ops.build_kv_tile_buckets(problem)} <= set(fna_ops.KV_BUCKET_LIMITS)
+        for ids, metadata, limit in fna_ops.build_kv_tile_buckets(problem):
+            assert metadata.shape == (ids.numel(), limit)
 
 
 def test_diffvae_fna_rejects_oversized_packed_tile_grid() -> None:
@@ -81,9 +72,8 @@ def test_diffvae_fna_rejects_oversized_packed_tile_grid() -> None:
 
 
 @pytest.mark.skipif(not _sm90_available(), reason="CUDA SM90 required")
-def test_diffvae_fna_permanently_falls_back_after_failure(
+def test_diffvae_fna_propagates_launch_failures(
     monkeypatch: pytest.MonkeyPatch,
-    isolated_fna_runtime_state,
 ) -> None:
     problem = fna_ops.Problem(11, 11, 11, fna_ops.HEADS, (11, 11, 11))
     query = torch.randn(1, problem.q_length, fna_ops.HEADS, 64, device="cuda", dtype=torch.bfloat16)
@@ -99,18 +89,15 @@ def test_diffvae_fna_permanently_falls_back_after_failure(
     monkeypatch.setattr(fna_ops, "_fna3d_tilelang", fail_launch)
     with torch.inference_mode():
         for _ in range(2):
-            assert (
-                fna_ops.try_fna3d_tilelang(
+            with pytest.raises(RuntimeError, match="injected launch failure"):
+                fna_ops.fna3d_tilelang(
                     query,
                     key,
                     value,
                     shape=problem.shape,
                     window=problem.window,
                 )
-                is None
-            )
-
-    assert calls == 1
+    assert calls == 2
 
 
 @pytest.fixture

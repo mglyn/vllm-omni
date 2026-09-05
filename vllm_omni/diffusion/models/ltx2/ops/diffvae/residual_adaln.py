@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Exact LTX DiffVAE residual, RMSNorm, and AdaLN Triton fusions."""
+"""Exact LTX DiffVAE residual, RMSNorm, and AdaLN fusions."""
 
 from __future__ import annotations
 
@@ -12,15 +12,9 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import tl, triton
 
-from ..numerics import (
-    add_rn_f32,
-    fma_rn_f32,
-    mul_rn_f32,
-    round_bf16_to_fp32,
-    rsqrt_approx_f32,
-    shfl_down_f32,
-)
+from ..numerics import add_rn_f32, round_bf16_to_fp32
 from ..platform import is_ltx2_ops_eligible
+from .residual_adaln_tilelang import launch_residual_rms_norm_modulate_tilelang
 
 _HIDDEN_SIZE = 256
 _POINTWISE_BLOCK = 1024
@@ -32,161 +26,6 @@ _FAILED_ADD_DEVICES: set[int | None] = set()
 _VERIFIED_ADD_DEVICES: set[int | None] = set()
 
 logger = logging.getLogger(__name__)
-
-
-@triton.jit
-def _two_warp_sum(values):
-    values = add_rn_f32(values, shfl_down_f32(values, 16))
-    values = add_rn_f32(values, shfl_down_f32(values, 8))
-    values = add_rn_f32(values, shfl_down_f32(values, 4))
-    values = add_rn_f32(values, shfl_down_f32(values, 2))
-    values = add_rn_f32(values, shfl_down_f32(values, 1))
-    threads = tl.arange(0, 64)
-    warp_0 = tl.sum(tl.where(threads == 0, values, 0.0))
-    warp_1 = tl.sum(tl.where(threads == 32, values, 0.0))
-    return add_rn_f32(warp_0, warp_1)
-
-
-@triton.jit
-def _load_ordered_residual(
-    x_ptr,
-    residual_a_ptr,
-    residual_b_ptr,
-    offset,
-    valid,
-    residual_count: tl.constexpr,
-):
-    value = add_rn_f32(
-        tl.load(x_ptr + offset, mask=valid, other=0.0).to(tl.float32),
-        tl.load(residual_a_ptr + offset, mask=valid, other=0.0).to(tl.float32),
-    )
-    value = round_bf16_to_fp32(value)
-    if residual_count == 2:
-        value = add_rn_f32(
-            value,
-            tl.load(residual_b_ptr + offset, mask=valid, other=0.0).to(tl.float32),
-        )
-        value = round_bf16_to_fp32(value)
-    return value
-
-
-@triton.jit
-def _store_modulated(
-    output_ptr,
-    norm_weight_ptr,
-    scale_ptr,
-    shift_ptr,
-    value,
-    offset,
-    column,
-    modulation_base,
-    reciprocal_rms,
-    valid,
-):
-    normalized = mul_rn_f32(value, reciprocal_rms)
-    norm_weight = tl.load(norm_weight_ptr + column, mask=valid, other=0.0).to(tl.float32)
-    normalized = round_bf16_to_fp32(mul_rn_f32(normalized, norm_weight))
-    scale = tl.load(scale_ptr + modulation_base + column, mask=valid, other=0.0).to(tl.float32)
-    shift = tl.load(shift_ptr + modulation_base + column, mask=valid, other=0.0).to(tl.float32)
-    one_plus_scale = round_bf16_to_fp32(add_rn_f32(1.0, scale))
-    product = round_bf16_to_fp32(mul_rn_f32(normalized, one_plus_scale))
-    tl.store(output_ptr + offset, add_rn_f32(product, shift), mask=valid)
-
-
-@triton.jit
-def _residual_rms_norm_modulate_kernel(
-    output_ptr,
-    x_ptr,
-    residual_a_ptr,
-    residual_b_ptr,
-    norm_weight_ptr,
-    scale_ptr,
-    shift_ptr,
-    rows_per_batch,
-    eps,
-    residual_count: tl.constexpr,
-    hidden_size: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    batch = row // rows_per_batch
-    threads = tl.arange(0, 64)
-    row_base = row * hidden_size
-
-    # PyTorch's BF16 RMSNorm kernel uses four contiguous values per thread for
-    # hidden=256. Keep the four ordered BF16 residual values in registers so
-    # the output pass does not read the large activations a second time.
-    column_0 = threads * 4
-    column_1 = column_0 + 1
-    column_2 = column_0 + 2
-    column_3 = column_0 + 3
-    valid_0 = column_0 < hidden_size
-    valid_1 = column_1 < hidden_size
-    valid_2 = column_2 < hidden_size
-    valid_3 = column_3 < hidden_size
-    offset_0 = row_base + column_0
-    offset_1 = row_base + column_1
-    offset_2 = row_base + column_2
-    offset_3 = row_base + column_3
-    value_0 = _load_ordered_residual(x_ptr, residual_a_ptr, residual_b_ptr, offset_0, valid_0, residual_count)
-    value_1 = _load_ordered_residual(x_ptr, residual_a_ptr, residual_b_ptr, offset_1, valid_1, residual_count)
-    value_2 = _load_ordered_residual(x_ptr, residual_a_ptr, residual_b_ptr, offset_2, valid_2, residual_count)
-    value_3 = _load_ordered_residual(x_ptr, residual_a_ptr, residual_b_ptr, offset_3, valid_3, residual_count)
-    accumulator = fma_rn_f32(value_0, value_0, tl.zeros((64,), dtype=tl.float32))
-    accumulator = fma_rn_f32(value_1, value_1, accumulator)
-    accumulator = fma_rn_f32(value_2, value_2, accumulator)
-    accumulator = fma_rn_f32(value_3, value_3, accumulator)
-
-    total = _two_warp_sum(accumulator)
-    reciprocal_rms = rsqrt_approx_f32(total / hidden_size + eps)
-    modulation_base = batch * hidden_size
-    _store_modulated(
-        output_ptr,
-        norm_weight_ptr,
-        scale_ptr,
-        shift_ptr,
-        value_0,
-        offset_0,
-        column_0,
-        modulation_base,
-        reciprocal_rms,
-        valid_0,
-    )
-    _store_modulated(
-        output_ptr,
-        norm_weight_ptr,
-        scale_ptr,
-        shift_ptr,
-        value_1,
-        offset_1,
-        column_1,
-        modulation_base,
-        reciprocal_rms,
-        valid_1,
-    )
-    _store_modulated(
-        output_ptr,
-        norm_weight_ptr,
-        scale_ptr,
-        shift_ptr,
-        value_2,
-        offset_2,
-        column_2,
-        modulation_base,
-        reciprocal_rms,
-        valid_2,
-    )
-    _store_modulated(
-        output_ptr,
-        norm_weight_ptr,
-        scale_ptr,
-        shift_ptr,
-        value_3,
-        offset_3,
-        column_3,
-        modulation_base,
-        reciprocal_rms,
-        valid_3,
-    )
 
 
 @triton.jit
@@ -309,25 +148,15 @@ def _launch_adaln(
     shift: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    output = torch.empty_like(x)
-    rows = x.numel() // _HIDDEN_SIZE
-    rows_per_batch = rows // x.shape[0]
-    with torch.accelerator.device_index(x.device.index):
-        _residual_rms_norm_modulate_kernel[(rows,)](
-            output,
-            x,
-            residual_a,
-            x if residual_b is None else residual_b,
-            norm_weight,
-            scale,
-            shift,
-            rows_per_batch,
-            eps,
-            residual_count=1 if residual_b is None else 2,
-            hidden_size=_HIDDEN_SIZE,
-            num_warps=2,
-        )
-    return output
+    return launch_residual_rms_norm_modulate_tilelang(
+        x,
+        residual_a,
+        residual_b,
+        norm_weight,
+        scale,
+        shift,
+        eps,
+    )
 
 
 def _verify_adaln_prefix(
