@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     create_transformer_from_config,
@@ -18,6 +18,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
     LTX2DistilledTwoStagePipeline,
     LTX2TwoStagePipeline,
 )
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx25_dfr import LTX25DFRPipeline
 
 __all__ = [
     "LTX2Pipeline",
@@ -27,6 +28,7 @@ __all__ = [
     "LTX2TwoStagePipeline",
     "LTX2DistilledPipeline",
     "LTX2DistilledTwoStagePipeline",
+    "LTX25DFRPipeline",
     "get_ltx2_post_process_func",
     "load_transformer_config",
     "create_transformer_from_config",

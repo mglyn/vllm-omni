@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Official multi-modal guidance for the LTX model family."""
 
@@ -298,6 +298,8 @@ class LTXGuidanceExecutor:
                     denoise_ctx.audio_attention_mask,
                     model_pass_count,
                 )
+            if denoise_ctx.keyframes_mask is not None:
+                denoise_ctx.keyframes_mask = _repeat_batch(denoise_ctx.keyframes_mask, model_pass_count)
         return denoise_ctx
 
     @staticmethod

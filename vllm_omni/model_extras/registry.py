@@ -231,6 +231,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledOneStagePipeline",
             "LTX2DistilledPipeline",
             "LTX2DistilledTwoStagePipeline",
+            "LTX25DFRPipeline",
         )
     },
     "SanaVideoPipeline": {
