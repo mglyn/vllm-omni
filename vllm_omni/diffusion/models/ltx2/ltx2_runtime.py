@@ -24,6 +24,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.platforms import current_omni_platform
@@ -208,6 +209,15 @@ class LTXRuntime(
     component_profile: ClassVar[LTXComponentProfile]
     pipeline_recipe: ClassVar[LTXPipelineRecipe]
     guidance_executor: ClassVar[LTXGuidanceExecutor] = LTX_GUIDANCE_EXECUTOR
+    _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+        block_attrs={"transformer": ("transformer_blocks",)},
+        encoder_component_types={"text_encoder": "text_encoder"},
+        # Gemma 3 (LTX-2/2.3) and Gemma 4 (LTX-2.5) share this stack path.
+        encoder_block_attrs={"text_encoder": ("model.language_model.layers",)},
+        # Every LTX worker loads a complete Gemma, including under Ulysses;
+        # there are no encoder-TP shards in this runtime.
+        encoder_dlo_weight_replication=frozenset({"text_encoder"}),
+    )
     supports_request_batch = False
     connector_batches_cfg = False
     distributed_video_decode = True

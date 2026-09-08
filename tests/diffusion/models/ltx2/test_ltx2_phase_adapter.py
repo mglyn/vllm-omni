@@ -72,6 +72,56 @@ def _wrap(
     return wrapper
 
 
+@pytest.mark.parametrize("layer_fused", [False, True])
+def test_ltx_phase_adapter_survives_dlo_ring_and_stage_switches(monkeypatch, layer_fused):
+    from tests.diffusion.offloader.helpers import patch_offload_runtime
+    from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+    from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
+        DistributedLayerwiseOffloadBackend,
+        current_omni_platform,
+    )
+
+    patch_offload_runtime(monkeypatch, current_omni_platform, synchronize=True)
+    blocks = torch.nn.ModuleList(
+        [
+            _wrap(
+                torch.nn.Linear(4, 4),
+                torch.randn(2, 4),
+                torch.randn(4, 2),
+                layer_fused=layer_fused,
+            )
+            for _ in range(3)
+        ]
+    )
+    inputs = torch.randn(2, 4)
+    scales = (0.0, 0.5, 0.5, 0.0)
+
+    def forward(scale):
+        output = inputs.clone()
+        for block in blocks:
+            block.set_enabled(scale != 0.0, scale)
+            output = block(output)
+        return output
+
+    with torch.inference_mode():
+        expected = [forward(scale) for scale in scales]
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+        )
+        hooks = backend._install_hook_group(blocks, "dit")
+        buffers = backend._allocate_shared_buffers(hooks)
+        for hook in hooks:
+            hook.gpu_buffers = buffers
+
+        for scale, reference in zip(scales, expected):
+            torch.testing.assert_close(forward(scale), reference, rtol=0, atol=0)
+
+
 class _LoRAAttention(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()

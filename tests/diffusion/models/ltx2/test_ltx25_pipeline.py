@@ -8,6 +8,7 @@ from dataclasses import replace
 from threading import Lock
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -60,6 +61,41 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"enable_cpu_offload": True},
+        {"enable_layerwise_offload": True},
+        {"enable_distributed_layerwise_offload": True},
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit", "text_encoder"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            }
+        },
+        {"parallel_config": SimpleNamespace(use_hsdp=True)},
+        {},
+    ],
+)
+def test_ltx_aux_placement_defers_to_selected_offloader(monkeypatch, config):
+    modules = [Mock(), Mock(), Mock()]
+    monkeypatch.setattr(
+        ltx2_components.ModuleDiscovery,
+        "discover",
+        lambda _: SimpleNamespace(encoders=modules[:1], vaes=modules[1:2], resident_modules=modules[2:]),
+    )
+    pipeline = SimpleNamespace(od_config=SimpleNamespace(**config), device=torch.device("cpu"))
+
+    ltx2_components._place_aux_components(pipeline)
+
+    for module in modules:
+        if config:
+            module.to.assert_not_called()
+        else:
+            module.to.assert_called_once_with(pipeline.device)
 
 
 @pytest.mark.parametrize("model_version", ["2", "2.3", "2.5"])
