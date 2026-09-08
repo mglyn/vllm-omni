@@ -16,9 +16,9 @@ import itertools
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
-import numpy as np
 import PIL.Image
 import torch
+import torch.nn.functional as F
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 
 from . import ltx2_latents as latent_ops
@@ -96,14 +96,60 @@ def _trapezoid(length: int, left: int, right: int, *, device: torch.device, dtyp
 
 
 def _lanczos_x2_frame(frame: torch.Tensor) -> torch.Tensor:
-    """Resize one ``(C,H,W)`` VAE-range frame with official PIL Lanczos."""
-    image_array = (
-        ((frame.detach().float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+    """Resize one ``(C,H,W)`` VAE-range frame with GPU Lanczos-3.
+
+    DFR always uses a fixed 2x resize. Expressing its two polyphase filters as
+    grouped transposed convolutions keeps pixels on the input device and avoids
+    materializing the six-tap gather tensor of a generic resampler. Boundary
+    normalization matches the clipped support used by image resizers.
+    """
+    if frame.ndim != 3:
+        raise ValueError(f"DFR Lanczos input must be CHW, got {tuple(frame.shape)}.")
+    pixels = ((frame.detach().float().clamp(-1, 1) + 1) * 127.5).round().unsqueeze(0)
+    channels, height, width = frame.shape
+
+    # output coordinate o samples input coordinate o / 2 - 1 / 4. An input
+    # sample contributes for offsets d=o-2*i in [-5, 6].
+    offsets = torch.arange(-5, 7, device=frame.device, dtype=torch.float32)
+    distance = offsets / 2 - 0.25
+    kernel = torch.sinc(distance) * torch.sinc(distance / 3)
+    kernel = torch.where(distance.abs() < 3, kernel, torch.zeros_like(kernel))
+
+    horizontal_kernel = kernel.view(1, 1, 1, -1)
+    horizontal = F.conv_transpose2d(
+        pixels,
+        horizontal_kernel.expand(channels, 1, 1, -1).contiguous(),
+        stride=(1, 2),
+        padding=(0, 5),
+        groups=channels,
     )
-    image = PIL.Image.fromarray(image_array, mode="RGB")
-    image = image.resize((image.width * 2, image.height * 2), resample=PIL.Image.Resampling.LANCZOS)
-    resized = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).permute(2, 0, 1)
-    return resized / 127.5 - 1
+    horizontal_norm = F.conv_transpose2d(
+        pixels.new_ones((1, 1, 1, width)),
+        horizontal_kernel,
+        stride=(1, 2),
+        padding=(0, 5),
+    )
+    # PIL's uint8 separable path quantizes the horizontal pass before applying
+    # the vertical filter. Retaining that boundary makes the GPU result differ
+    # by at most one code value in tie-breaking cases.
+    horizontal = (horizontal / horizontal_norm).round().clamp_(0, 255)
+
+    vertical_kernel = kernel.view(1, 1, -1, 1)
+    resized = F.conv_transpose2d(
+        horizontal,
+        vertical_kernel.expand(channels, 1, -1, 1).contiguous(),
+        stride=(2, 1),
+        padding=(5, 0),
+        groups=channels,
+    )
+    vertical_norm = F.conv_transpose2d(
+        pixels.new_ones((1, 1, height, 1)),
+        vertical_kernel,
+        stride=(2, 1),
+        padding=(5, 0),
+    )
+    resized = (resized / vertical_norm).round().clamp_(0, 255)
+    return (resized.squeeze(0) / 127.5 - 1).to(frame.dtype)
 
 
 def _carry_decode_generators(

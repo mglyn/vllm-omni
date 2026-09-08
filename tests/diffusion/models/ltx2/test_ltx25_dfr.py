@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from dataclasses import fields
 from types import SimpleNamespace
 
+import numpy as np
+import PIL.Image
 import pytest
 import torch
 
@@ -24,6 +26,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx25_dfr import (
     LTX25DFRPipeline,
     _carry_decode_generators,
     _DFRVideoConditioning,
+    _lanczos_x2_frame,
     resolve_dfr_canvas,
 )
 
@@ -73,6 +76,18 @@ def test_dfr_carry_decode_uses_independent_official_seed_offsets():
     assert plane_0.initial_seed() == 4017
     assert plane_3.initial_seed() == 4020
     assert torch.equal(request_generator.get_state(), state)
+
+
+def test_dfr_gpu_lanczos_matches_pil_uint8_path():
+    frame = torch.rand(3, 19, 27, generator=torch.Generator().manual_seed(7)) * 2 - 1
+    image = ((frame + 1) * 127.5).round().byte().permute(1, 2, 0).numpy()
+    expected = PIL.Image.fromarray(image, mode="RGB").resize((54, 38), PIL.Image.Resampling.LANCZOS)
+    expected = torch.from_numpy(np.asarray(expected, dtype=np.float32).copy()).permute(2, 0, 1) / 127.5 - 1
+
+    actual = _lanczos_x2_frame(frame)
+
+    assert actual.shape == expected.shape
+    assert (actual - expected).abs().max() <= 1 / 127.5
 
 
 def _tiny_dfr_pipe() -> LTX25DFRPipeline:
