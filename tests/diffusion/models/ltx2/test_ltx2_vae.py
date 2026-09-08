@@ -63,7 +63,7 @@ def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
 class TestLTXDiffusionDecoder:
     @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
     def test_distributed_diffusion_decoder_rejects_non_tile_parallel_modes(self, mode):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 
@@ -75,7 +75,7 @@ class TestLTXDiffusionDecoder:
             model.set_parallel_size(2, mode=mode)
 
     def test_distributed_diffusion_decoder_accepts_tile_parallel_mode(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 
@@ -91,7 +91,7 @@ class TestLTXDiffusionDecoder:
         assert calls == [(4, "tile")]
 
     def test_short_clip_keeps_stage5_temporal_context_then_crops_output(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
             LTX2VideoDiffusionDecoder3d,
             LTX2VideoDiffusionDecoderModel,
         )
@@ -166,7 +166,7 @@ class TestLTXDiffusionDecoder:
             _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_conv_vae": "true"}), "2.5")
 
     def test_native_diffusion_decoder_conversion_splits_qkv_and_folds_gates(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
             convert_ltx25_native_diffusion_decoder_state_dict,
         )
 
@@ -213,7 +213,7 @@ class TestLTXDiffusionDecoder:
         assert not any("type_emb" in key or "coarse" in key or "gate_msa" in key for key in converted)
 
     def test_native_diffusion_decoder_conversion_rejects_invalid_fused_qkv(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
             convert_ltx25_native_diffusion_decoder_state_dict,
         )
 
@@ -411,8 +411,8 @@ class TestLTXDiffusionDecoder:
         assert output.output[1].numel() == 0
 
     def test_diffusion_decoder_patch_parallel_size_one_uses_native_tiling(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import LTX2VideoDiffusionDecoderModel
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 
@@ -447,7 +447,7 @@ class TestLTXDiffusionDecoder:
     def test_distributed_diffusion_tiles_preserve_serial_noise_order(self, monkeypatch):
         from diffusers.utils.torch_utils import randn_tensor
 
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 

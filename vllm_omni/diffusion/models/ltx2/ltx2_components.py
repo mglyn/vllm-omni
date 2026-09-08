@@ -36,12 +36,6 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from .ltx2_diffusion_decoder import (
-    LTX25_NATIVE_ARTIFACT_REVISION,
-    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
-    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
-)
-from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -49,6 +43,12 @@ from .ltx2_transformer import (
     apply_split_rotary_emb,
     to_ltx_padding_mask,
 )
+from .vae.decoder import (
+    LTX25_NATIVE_ARTIFACT_REVISION,
+    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+)
+from .vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
