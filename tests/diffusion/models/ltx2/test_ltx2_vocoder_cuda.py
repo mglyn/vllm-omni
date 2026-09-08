@@ -25,8 +25,10 @@ class _BWEConvVocoder(torch.nn.Module):
         self.bwe_generator = torch.nn.Identity()
         self.input_dtype = None
         self.conv_output_dtype = None
+        self.cudnn_deterministic = None
 
     def forward(self, value):
+        self.cudnn_deterministic = torch.backends.cudnn.deterministic
         self.input_dtype = value.dtype
         output = self.conv(value)
         self.conv_output_dtype = output.dtype
@@ -40,9 +42,16 @@ def test_ltx_bwe_vocoder_runs_real_cuda_autocast_in_fp32():
     vocoder = _BWEConvVocoder()
     generated_mel = torch.ones((1, 1, 4), device="cuda", dtype=torch.bfloat16)
 
-    output = _run_ltx_vocoder(vocoder, generated_mel)
+    original_deterministic = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.deterministic = False
+    try:
+        output = _run_ltx_vocoder(vocoder, generated_mel)
+        assert not torch.backends.cudnn.deterministic
+    finally:
+        torch.backends.cudnn.deterministic = original_deterministic
 
     assert next(vocoder.parameters()).dtype == torch.bfloat16
+    assert vocoder.cudnn_deterministic
     assert vocoder.input_dtype == torch.float32
     assert vocoder.conv_output_dtype == torch.float32
     assert output.dtype == torch.bfloat16

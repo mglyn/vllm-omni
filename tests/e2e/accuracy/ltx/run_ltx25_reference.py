@@ -114,6 +114,30 @@ def _insert_official_paths(official_root: Path) -> None:
             sys.path.insert(0, path)
 
 
+def _configure_official_vocoder_determinism() -> None:
+    """Make the pinned official LTX-2.5 vocoder a stable reference."""
+    from ltx_core.model.audio_vae.vocoder import VocoderWithBWE
+
+    original_forward = VocoderWithBWE.forward
+    if getattr(original_forward, "_vllm_omni_deterministic", False):
+        return
+
+    def deterministic_forward(self: Any, mel_spec: torch.Tensor) -> torch.Tensor:
+        device_type = mel_spec.device.type
+        if device_type != "cuda":
+            return original_forward(self, mel_spec)
+        with torch.backends.cudnn.flags(
+            enabled=torch.backends.cudnn.enabled,
+            benchmark=torch.backends.cudnn.benchmark,
+            deterministic=True,
+            allow_tf32=torch.backends.cudnn.allow_tf32,
+        ):
+            return original_forward(self, mel_spec)
+
+    setattr(deterministic_forward, "_vllm_omni_deterministic", True)
+    setattr(VocoderWithBWE, "forward", deterministic_forward)
+
+
 def _configure_official_sdpa(pipeline: Any) -> None:
     """Pin official connector and denoiser attention to cuDNN, with MATH fallback."""
     from ltx_core.loader.attention_ops import set_attention_module_op
@@ -187,6 +211,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     if args.official_root is None:
         raise ValueError("Official backend requires --official-root")
     _insert_official_paths(args.official_root)
+    _configure_official_vocoder_determinism()
     # Keep Gemma on the same SDPA path in both subprocesses. DiT attention is
     # still pinned independently to the explicit cuDNN backend below.
     torch.backends.cuda.enable_cudnn_sdp(False)
