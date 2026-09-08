@@ -133,6 +133,41 @@ SP attention head counts must be divisible by `ulysses_degree`. Use each
 phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
 Each GPU must still fit the resident weights. Warm up with the production shape.
 
+## Spatial 4K DFR
+
+`LTX25DFRPipeline` supports text-to-video and first-frame image-to-video
+Diffusion Fidelity Rendering (DFR) at 24 fps. Its three stages run at
+960x544, 1920x1088, and 3840x2176 with an 8 + 3 + 3 step schedule,
+tiled final-stage refinement, and ordinary LTX-2.5 DiffVAE decoding.
+
+LTX pipelines support CPU layerwise offload for the DiT and text encoder.
+The following example enables both offload and VAE tiling to reduce GPU
+memory usage:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model "${MODEL}" \
+  --model-class-name LTX25DFRPipeline \
+  --prompt "A cinematic shot of a red fox walking through a snowy forest at dawn." \
+  --width 3840 \
+  --height 2176 \
+  --num-frames 121 \
+  --num-inference-steps 8 \
+  --frame-rate 24 \
+  --fps 24 \
+  --vae-use-tiling \
+  --diffusion-offload-config '{"mode":"layer","components":["dit","text_encoder"]}' \
+  --seed 42 \
+  --output ltx25-dfr-4k.mp4
+```
+
+The same offload JSON is supported by `vllm serve` and the Python
+`Omni(diffusion_offload_config=...)` argument. This configuration uses
+rank-local layerwise transfers; the legacy `--enable-layerwise-offload`
+flag selects only the DiT. Offload trades GPU weight memory for CPU RAM
+and transfer overhead. See the
+[offload configuration guide](../../docs/user_guide/diffusion/offloader/distributed_layerwise_offload.md).
+
 ## Offline inference
 
 Choose values from the pipeline table. For example, the distilled two-stage
