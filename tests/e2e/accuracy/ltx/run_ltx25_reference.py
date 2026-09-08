@@ -126,13 +126,12 @@ def _configure_official_vocoder_determinism() -> None:
         device_type = mel_spec.device.type
         if device_type != "cuda":
             return original_forward(self, mel_spec)
-        with torch.backends.cudnn.flags(
-            enabled=torch.backends.cudnn.enabled,
-            benchmark=torch.backends.cudnn.benchmark,
-            deterministic=True,
-            allow_tf32=torch.backends.cudnn.allow_tf32,
-        ):
+        previous = torch.backends.cudnn.deterministic
+        try:
+            torch.backends.cudnn.deterministic = True
             return original_forward(self, mel_spec)
+        finally:
+            torch.backends.cudnn.deterministic = previous
 
     setattr(deterministic_forward, "_vllm_omni_deterministic", True)
     setattr(VocoderWithBWE, "forward", deterministic_forward)

@@ -65,19 +65,20 @@ from .ltx2_request import (
 logger = init_logger(__name__)
 
 
+@contextmanager
+def _deterministic_ltx_vocoder():
+    previous = torch.backends.cudnn.deterministic
+    try:
+        torch.backends.cudnn.deterministic = True
+        yield
+    finally:
+        torch.backends.cudnn.deterministic = previous
+
+
 def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
     """Run the BWE vocoder in FP32, matching the official LTX pipeline."""
     device_type = generated_mel.device.type
-    cudnn_context = (
-        torch.backends.cudnn.flags(
-            enabled=torch.backends.cudnn.enabled,
-            benchmark=torch.backends.cudnn.benchmark,
-            deterministic=True,
-            allow_tf32=torch.backends.cudnn.allow_tf32,
-        )
-        if device_type == "cuda"
-        else nullcontext()
-    )
+    cudnn_context = _deterministic_ltx_vocoder() if device_type == "cuda" else nullcontext()
     with cudnn_context:
         if not hasattr(vocoder, "bwe_generator"):
             return vocoder(generated_mel)
