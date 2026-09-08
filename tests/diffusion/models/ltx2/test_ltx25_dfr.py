@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields
 from types import SimpleNamespace
 
@@ -10,6 +10,7 @@ import PIL.Image
 import pytest
 import torch
 
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX25_DFR_COMPONENT_PROFILE,
     resolve_ltx_checkpoint_kind,
@@ -88,6 +89,63 @@ def test_dfr_gpu_lanczos_matches_pil_uint8_path():
 
     assert actual.shape == expected.shape
     assert (actual - expected).abs().max() <= 1 / 127.5
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_dfr_distributed_carry_broadcasts_encoded_latents(batch_size):
+    """Non-output ranks get no RGB, but must receive every carry latent."""
+    pipe = _tiny_dfr_pipe()
+    pipe.use_diffusion_decoder = True
+    pipe._profile_phase_method = lambda *args: nullcontext()
+    transfers = []
+    encode_calls = []
+
+    class Decoder(DistributedVaeMixin):
+        dtype = torch.float32
+        latents_mean = torch.zeros(3)
+        latents_std = torch.ones(3)
+        enabled = False
+
+        def is_distributed_enabled(self):
+            return self.enabled
+
+        def decode(self, plane, **kwargs):
+            if self.enabled and self.distributed_executor.rank != 0:
+                return (torch.empty(0, 3, 0, 0, 0),)
+            return (plane,)
+
+    def encode(pixels):
+        encode_calls.append(pixels.shape)
+        return SimpleNamespace(latents=pixels)
+
+    def sync_result(value, ndim, device, dtype):
+        assert ndim == 5 and dtype == torch.float32 and device == pipe.device
+        if decoder.distributed_executor.rank == 0:
+            transfers.append(value.clone())
+            return value
+        assert value.numel() == 0
+        return transfers.pop(0).clone()
+
+    decoder = Decoder()
+    decoder.distributed_executor = SimpleNamespace(rank=0, _sync_final_result=sync_result)
+    pipe.diffusion_decoder = decoder
+    pipe.vae = SimpleNamespace(dtype=torch.float32, encode=encode)
+    keyframes = torch.rand(batch_size, 3, 2, 3, 4) * 2 - 1
+    generators = [torch.Generator().manual_seed(i) for i in range(batch_size)]
+    expected = pipe._decode_lanczos_reencode_keyframes(keyframes, generators)
+    encode_calls.clear()
+    decoder.enabled = True
+    actual = pipe._decode_lanczos_reencode_keyframes(keyframes, generators)
+    torch.testing.assert_close(actual, expected)
+    assert len(encode_calls) == batch_size * 2
+    assert len(transfers) == 2
+
+    encode_calls.clear()
+    decoder.distributed_executor.rank = 1
+    actual = pipe._decode_lanczos_reencode_keyframes(keyframes, generators)
+    torch.testing.assert_close(actual, expected)
+    assert not encode_calls
+    assert not transfers
 
 
 def _tiny_dfr_pipe() -> LTX25DFRPipeline:

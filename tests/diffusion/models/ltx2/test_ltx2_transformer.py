@@ -151,6 +151,9 @@ def test_ltx_sp_plan_only_shards_video_stream(rope_type):
     assert root_plan["timestep"].split_dim == 1
     assert root_plan["timestep"].expected_dims == 2
     assert not root_plan["timestep"].split_output
+    assert all(item.auto_pad for item in root_plan.values())
+    for name in ("rope", "cross_attn_rope"):
+        assert all(item.auto_pad for item in plan[name].values())
     assert set(plan) == {"", "rope", "cross_attn_rope", "proj_out"}
 
 

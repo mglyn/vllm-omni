@@ -54,7 +54,11 @@ from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
-from .ltx2_sequence_parallel import LTX2VideoToAudioParallelAttention
+from .ltx2_sequence_parallel import (
+    LTX2VideoToAudioParallelAttention,
+    build_ltx_sp_padding_mask,
+    reset_ltx_sp_padding,
+)
 
 logger = init_logger(__name__)
 
@@ -1608,20 +1612,28 @@ class LTX2VideoTransformer3DModel(nn.Module):
             "": {
                 # Keep only the long video stream sequence-sharded. Audio and
                 # prompt streams remain replicated on every SP rank.
-                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                "keyframes_mask": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
+                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+                "keyframes_mask": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
                 # Keep per-token video timestep embeddings aligned with the
                 # video latent shard. LTX guidance supplies a separate,
                 # replicated audio_timestep under SP.
-                "timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
+                "timestep": SequenceParallelInput(split_dim=1, expected_dims=2, auto_pad=True),
             },
             "rope": {
-                0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-                1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
+                0: SequenceParallelInput(
+                    split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True, auto_pad=True
+                ),
+                1: SequenceParallelInput(
+                    split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True, auto_pad=True
+                ),
             },
             "cross_attn_rope": {
-                0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-                1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
+                0: SequenceParallelInput(
+                    split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True, auto_pad=True
+                ),
+                1: SequenceParallelInput(
+                    split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True, auto_pad=True
+                ),
             },
             # Video output is sharded; audio output is already replicated.
             "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
@@ -1895,6 +1907,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
 
         self.gradient_checkpointing = False
         self._sp_plan = self._build_sp_plan(rope_type)
+        self.register_forward_pre_hook(reset_ltx_sp_padding)
 
     def _gradient_checkpointing_func(self, module: nn.Module, *inputs: Any):
         def custom_forward(*checkpoint_inputs: Any):
@@ -2126,6 +2139,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 return None
             return mask
 
+        video_padding_mask = build_ltx_sp_padding_mask(hidden_states.device)
+
         # 5. Run transformer blocks
         for block_idx, block in enumerate(self.transformer_blocks):
             block_kwargs = {
@@ -2143,6 +2158,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 "ca_audio_rotary_emb": audio_cross_attn_rotary_emb,
                 "encoder_attention_mask": encoder_attention_mask,
                 "audio_encoder_attention_mask": audio_encoder_attention_mask,
+                "self_attention_mask": video_padding_mask,
+                "v2a_cross_attention_mask": video_padding_mask,
                 "audio_self_attention_mask": audio_attention_mask,
                 "a2v_cross_attention_mask": audio_attention_mask,
                 "video_self_attention_perturbation_mask": perturbation_mask_for("video_self_attention", block_idx),

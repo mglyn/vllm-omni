@@ -16,6 +16,30 @@ from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import (
     SequenceParallelGroupCoordinator,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+
+def reset_ltx_sp_padding(module: torch.nn.Module, args: tuple) -> None:
+    """Reset padding before the SP plan shards a new phase/tile's inputs."""
+    # A PyTorch pre-hook runs before the SP plan's wrapped forward. DFR calls
+    # the transformer with changing sequence lengths in one ForwardContext.
+    if is_forward_context_available():
+        ctx = get_forward_context()
+        ctx.sp_original_seq_len = None
+        ctx.sp_padding_size = 0
+
+
+def build_ltx_sp_padding_mask(device: torch.device) -> torch.Tensor | None:
+    """Global key-only mask for video self-attention and video-to-audio SP."""
+    if not is_forward_context_available():
+        return None
+    ctx = get_forward_context()
+    if ctx.sp_original_seq_len is None or ctx.sp_padding_size == 0:
+        return None
+    # Replicate the full mask: both attention paths gather video K/V via
+    # all-to-all, while audio queries remain replicated across SP ranks.
+    padded_length = ctx.sp_original_seq_len + ctx.sp_padding_size
+    return (torch.arange(padded_length, device=device) < ctx.sp_original_seq_len)[None, None, None, :]
 
 
 @dataclass(frozen=True, slots=True)

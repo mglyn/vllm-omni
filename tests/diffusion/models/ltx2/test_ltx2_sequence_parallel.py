@@ -12,11 +12,28 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.diffusion.models.ltx2.ltx2_sequence_parallel import (
     LTX2VideoToAudioParallelAttention,
+    build_ltx_sp_padding_mask,
+    reset_ltx_sp_padding,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_ltx_sp_padding_mask_and_reset():
+    with set_forward_context():
+        ctx = get_forward_context()
+        assert build_ltx_sp_padding_mask(torch.device("cpu")) is None
+        ctx.sp_original_seq_len = 5
+        ctx.sp_padding_size = 3
+        mask = build_ltx_sp_padding_mask(torch.device("cpu"))
+        torch.testing.assert_close(mask, torch.tensor([[[[True] * 5 + [False] * 3]]]))
+        reset_ltx_sp_padding(torch.nn.Identity(), ())
+        assert ctx.sp_original_seq_len is None
+        assert ctx.sp_padding_size == 0
+        assert build_ltx_sp_padding_mask(torch.device("cpu")) is None
 
 
 def _run_video_to_audio_parity(rank: int, world_size: int, master_port: int) -> None:

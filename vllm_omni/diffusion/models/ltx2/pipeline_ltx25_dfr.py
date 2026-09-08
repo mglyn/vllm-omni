@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
+
 from . import ltx2_latents as latent_ops
 from .ltx2_components import LTX25_DFR_COMPONENT_PROFILE
 from .ltx2_conditioning import LTXI2VConditioningMixin, _preprocess_i2v_pil_images
@@ -625,6 +627,11 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
         if keyframes.ndim != 5:
             raise ValueError(f"DFR carry keyframes must be 5D, got {tuple(keyframes.shape)}.")
         video_decoder = self.diffusion_decoder if getattr(self, "use_diffusion_decoder", False) else self.vae
+        executor = (
+            video_decoder.distributed_executor
+            if isinstance(video_decoder, DistributedVaeMixin) and video_decoder.is_distributed_enabled()
+            else None
+        )
         latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
         encoded = []
         for index in range(keyframes.shape[2]):
@@ -635,29 +642,35 @@ class LTX25DFRPipeline(LTXI2VConditioningMixin, LTXRuntime):
                     decoded = video_decoder.decode(plane, generator=plane_generator, return_dict=False)[0]
                 else:
                     decoded = video_decoder.decode(plane, None, return_dict=False)[0]
-            with self._profile_phase_method("lanczos_x2", "keyframe_carry"):
-                resized = torch.stack([_lanczos_x2_frame(frame[:, 0]) for frame in decoded], dim=0)
-                resized = resized.to(device=self.device, dtype=self.vae.dtype).unsqueeze(2)
-            if isinstance(plane_generator, list):
-                frame_generators = plane_generator
-            else:
-                frame_generators = [plane_generator] * resized.shape[0]
-            with self._profile_phase_method("vae_encode", "keyframe_carry"):
-                raw = torch.cat(
-                    [
-                        retrieve_latents(self.vae.encode(resized[item : item + 1]), frame_generators[item], "argmax")
-                        for item in range(resized.shape[0])
-                    ],
-                    dim=0,
-                )
-                encoded.append(
-                    latent_ops.normalize_latents(
-                        raw,
-                        latents_mean,
-                        latents_std,
-                        scaling_factor,
+            # Distributed VAE merge returns pixels only on its output rank.
+            # Carry needs a replicated conditioning latent for the next DiT
+            # phase, unlike final video output. Encode once, then broadcast
+            # the compact latent instead of the much larger RGB frame.
+            if executor is None or executor.rank == 0:
+                with self._profile_phase_method("lanczos_x2", "keyframe_carry"):
+                    resized = torch.stack([_lanczos_x2_frame(frame[:, 0]) for frame in decoded], dim=0)
+                    resized = resized.to(device=self.device, dtype=self.vae.dtype).unsqueeze(2)
+                if isinstance(plane_generator, list):
+                    frame_generators = plane_generator
+                else:
+                    frame_generators = [plane_generator] * resized.shape[0]
+                with self._profile_phase_method("vae_encode", "keyframe_carry"):
+                    raw = torch.cat(
+                        [
+                            retrieve_latents(
+                                self.vae.encode(resized[item : item + 1]), frame_generators[item], "argmax"
+                            )
+                            for item in range(resized.shape[0])
+                        ],
+                        dim=0,
                     )
-                )
+                    encoded_plane = latent_ops.normalize_latents(raw, latents_mean, latents_std, scaling_factor)
+            else:
+                encoded_plane = torch.empty(0, device=self.device, dtype=self.vae.dtype)
+            if executor is not None:
+                with self._profile_phase_method("broadcast_latent", "keyframe_carry"):
+                    encoded_plane = executor._sync_final_result(encoded_plane, 5, self.device, self.vae.dtype)
+            encoded.append(encoded_plane)
         return torch.cat(encoded, dim=2)
 
     def _run_dfr_phase(

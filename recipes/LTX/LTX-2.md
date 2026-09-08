@@ -103,9 +103,10 @@ and automatically switches to dynamic LoRA when quantization is enabled.
 
 ## Sequence Parallelism
 
-Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
-SP attention head counts must be divisible by `ulysses_degree`. Use each
-phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
+LTX supports strict Ulysses with automatic video-token padding, attention
+masking, and output trimming. Frame counts and resolutions retain their
+pipeline constraints; TP-local attention head counts must be divisible by
+`ulysses_degree`. Audio and prompt tokens remain replicated.
 
 ## Serving
 

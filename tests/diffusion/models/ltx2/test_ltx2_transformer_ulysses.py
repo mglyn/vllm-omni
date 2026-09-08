@@ -80,27 +80,27 @@ def _omni_config(sp_size: int) -> OmniDiffusionConfig:
     )
 
 
-def _inputs(device: torch.device) -> dict[str, torch.Tensor | int | bool]:
+def _inputs(device: torch.device, tokens: int = 8) -> dict[str, torch.Tensor | int | bool]:
     generator = torch.Generator().manual_seed(123)
     return {
-        "hidden_states": torch.randn(1, 8, 4, generator=generator, device="cpu").to(device),
+        "hidden_states": torch.randn(1, tokens, 4, generator=generator, device="cpu").to(device),
         "audio_hidden_states": torch.randn(1, 4, 4, generator=generator, device="cpu").to(device),
         "encoder_hidden_states": torch.randn(1, 3, 8, generator=generator, device="cpu").to(device),
         "audio_encoder_hidden_states": torch.randn(1, 3, 8, generator=generator, device="cpu").to(device),
-        "timestep": torch.linspace(0.1, 0.8, 8, device=device).view(1, 8),
+        "timestep": torch.linspace(0.1, 0.8, tokens, device=device).view(1, tokens),
         "audio_timestep": torch.linspace(0.2, 0.5, 4, device=device).view(1, 4),
-        "keyframes_mask": torch.tensor([[[1.0], [0.0], [1.0], [0.0], [0.0], [1.0], [0.0], [0.0]]], device=device),
+        "keyframes_mask": (torch.arange(tokens, device=device) % 3 == 0).float().view(1, tokens, 1),
         "sigma": torch.tensor([0.1], device=device),
         "audio_sigma": torch.tensor([0.2], device=device),
-        "num_frames": 2,
-        "height": 2,
-        "width": 2,
+        "num_frames": 1,
+        "height": 1,
+        "width": tokens,
         "audio_num_frames": 4,
         "return_dict": False,
     }
 
 
-def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> None:
+def _run_transformer_parity(rank: int, world_size: int, master_port: int, rope_type: str = "split") -> None:
     device = torch.device(f"{current_omni_platform.device_type}:{rank}")
     current_omni_platform.set_device(device)
     os.environ.update(
@@ -120,15 +120,19 @@ def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> Non
         sp_config = _omni_config(world_size)
         torch.manual_seed(42)
         with set_forward_context(omni_diffusion_config=sp_config), set_current_diffusion_config(sp_config):
-            model = LTX2VideoTransformer3DModel(**_TINY_CONFIG).to(device).eval()
+            config = {**_TINY_CONFIG, "rope_type": rope_type}
+            model = LTX2VideoTransformer3DModel(**config).to(device).eval()
         with torch.no_grad():
             for _, parameter in sorted(model.named_parameters()):
                 torch.nn.init.normal_(parameter, mean=0.0, std=0.02)
 
-        inputs = _inputs(device)
+        # Alternate divisible/padded lengths in one context, including a case
+        # with an entirely padded rank. This also exercises keyframe markers
+        # and per-token timesteps, as used by I2V and DFR conditioning.
+        inputs = [_inputs(device, tokens) for tokens in (8, 7, 10, 1, 8)]
         reference_config = _omni_config(1)
         with torch.no_grad(), set_forward_context(omni_diffusion_config=reference_config):
-            expected_video, expected_audio = model(**inputs)
+            expected_outputs = [model(**item) for item in inputs]
 
         apply_sequence_parallel(
             model,
@@ -137,27 +141,29 @@ def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> Non
         )
         with torch.no_grad(), set_forward_context(omni_diffusion_config=sp_config):
             get_forward_context().sp_plan_hooks_applied = True
-            actual_video, actual_audio = model(**inputs)
+            actual_outputs = [model(**item) for item in inputs]
+            assert get_forward_context().sp_padding_size == 0
+            assert get_forward_context().sp_original_seq_len is None
 
         v2a_attention = model.transformer_blocks[0].video_to_audio_attn.attn
         assert v2a_attention._video_to_audio_strategy is not None
-        assert torch.isfinite(expected_video).all()
-        assert torch.isfinite(expected_audio).all()
-        for modality, actual, expected in (
-            ("video", actual_video, expected_video),
-            ("audio", actual_audio, expected_audio),
-        ):
-            drift = _relative_l2(actual, expected)
-            assert drift <= _FP32_REL_L2, (
-                f"LTX SP{world_size} {modality} output drifted rel_l2={drift:.3e} from SP1 (bound {_FP32_REL_L2:.1e})"
-            )
+        for actual_pair, expected_pair in zip(actual_outputs, expected_outputs):
+            for modality, actual, expected in zip(("video", "audio"), actual_pair, expected_pair):
+                assert actual.shape == expected.shape
+                assert torch.isfinite(actual).all()
+                drift = _relative_l2(actual, expected)
+                assert drift <= _FP32_REL_L2, (
+                    f"LTX SP{world_size} {modality} output drifted rel_l2={drift:.3e} "
+                    f"from SP1 (bound {_FP32_REL_L2:.1e})"
+                )
     finally:
         destroy_distributed_env()
 
 
 @pytest.mark.full_model
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
-def test_ltx_ulysses_transformer_matches_sp1(unused_tcp_port) -> None:
+@pytest.mark.parametrize("rope_type", ["split", "interleaved"])
+def test_ltx_ulysses_transformer_matches_sp1(unused_tcp_port, rope_type) -> None:
     """Exercise real plan hooks, RoPE/timestep sharding, and attention routing."""
     world_size = 2
     device_count = current_omni_platform.device_count()
@@ -166,6 +172,6 @@ def test_ltx_ulysses_transformer_matches_sp1(unused_tcp_port) -> None:
     )
     torch.multiprocessing.spawn(
         _run_transformer_parity,
-        args=(world_size, unused_tcp_port),
+        args=(world_size, unused_tcp_port, rope_type),
         nprocs=world_size,
     )
