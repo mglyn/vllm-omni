@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
-from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
@@ -47,6 +46,7 @@ from .vae.decoder import (
     LTX25_NATIVE_ARTIFACT_REVISION,
     LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
     LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
 )
 from .vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
 
