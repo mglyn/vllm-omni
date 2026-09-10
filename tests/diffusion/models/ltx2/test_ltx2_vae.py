@@ -661,11 +661,62 @@ class TestLTXDiffusionDecoder:
                 drop_leading_frame=task.drop_leading_frame,
                 crop_trailing_ghost=task.crop_trailing_ghost,
             )
+            assert task.output_shape == tile_shape
             expected = randn_tensor(tile_shape, generator=reference_generator, device=z.device, dtype=z.dtype)
             actual = randn_tensor(tile_shape, generator=task.noise_generator, device=z.device, dtype=z.dtype)
             torch.testing.assert_close(actual, expected)
 
         assert torch.equal(distributed_generator.get_state(), reference_generator.get_state())
+
+    def test_distributed_diffusion_sends_exact_size_tiles_to_rank_zero(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import GridSpec
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+            LTX2VideoDiffusionTileTask,
+        )
+
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.distributed_executor = SimpleNamespace(parallel_size=2, world_size=2, rank=1, group=None)
+        z = torch.zeros(1, 1, 1, 1, 1)
+        shapes = ((1, 1, 1, 2, 2), (1, 1, 1, 2, 1), (1, 1, 1, 1, 2), (1, 1, 1, 1, 1))
+        tasks = [
+            LTX2VideoDiffusionTileTask(
+                tile_id=index,
+                grid_coord=(0, index // 2, index % 2),
+                tensor=z,
+                workload=workload,
+                output_shape=shapes[index],
+            )
+            for index, workload in enumerate((4, 3, 2, 1))
+        ]
+        grid_spec = GridSpec(split_dims=(2, 3, 4), grid_shape=(1, 2, 2), output_dtype=torch.float32)
+        model._distributed_tile_split = lambda *_args: (tasks, grid_spec)
+        model._distributed_tile_exec = lambda task, _steps: torch.full(
+            model._distributed_tile_output_shape(task),
+            float(task.tile_id + 1),
+        )
+        model._distributed_tile_merge = lambda tiles, _spec: torch.stack(
+            [tiles[task.grid_coord].flatten()[0] for task in tasks]
+        )
+        transfers = []
+        monkeypatch.setattr(torch.distributed, "send", lambda tile, **_kwargs: transfers.append(tile.clone()))
+
+        nonzero_result = model._execute_distributed_exact_size_decode(z, None, 1)
+
+        assert nonzero_result.numel() == 0
+        assert [tuple(tile.shape) for tile in transfers] == [shapes[1], shapes[2]]
+
+        model.distributed_executor.rank = 0
+
+        def recv(tile, **_kwargs):
+            tile.copy_(transfers.pop(0))
+
+        monkeypatch.setattr(torch.distributed, "recv", recv)
+        rank_zero_result = model._execute_distributed_exact_size_decode(z, None, 1)
+
+        torch.testing.assert_close(rank_zero_result, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        assert not transfers
 
 
 class TestLTXOutputRank:
