@@ -78,6 +78,7 @@ _LTX_COMPONENT_SUBFOLDERS = (
 logger = logging.getLogger(__name__)
 
 _LTX2_CONV_VAE_EXTRA = "ltx2_use_conv_vae"
+_LTX2_DIFFVAE_SPATIAL_TILE_SIZE_EXTRA = "ltx2_diffvae_spatial_tile_size"
 _LTX2_DIFFUSION_DECODER_SUBFOLDER = "diffusion_decoder"
 
 
@@ -88,6 +89,63 @@ def _ltx2_use_diffusion_decoder(od_config: Any, model_version: str) -> bool:
     if not isinstance(use_conv_vae, bool):
         raise TypeError(f"{_LTX2_CONV_VAE_EXTRA} must be a bool, got {type(use_conv_vae)!r}")
     return model_version == "2.5" and not use_conv_vae
+
+
+def _ltx2_diffvae_spatial_tile_size(od_config: Any) -> int | None:
+    """Read the optional square DiffVAE tile size in decoded pixels."""
+    extras = getattr(od_config, "extras", {}) or {}
+    tile_size = extras.get(_LTX2_DIFFVAE_SPATIAL_TILE_SIZE_EXTRA)
+    if tile_size is None:
+        return None
+    if isinstance(tile_size, bool) or not isinstance(tile_size, int):
+        raise TypeError(f"{_LTX2_DIFFVAE_SPATIAL_TILE_SIZE_EXTRA} must be an int, got {type(tile_size)!r}")
+    return tile_size
+
+
+def _enable_ltx2_diffvae_tiling(decoder: Any, spatial_tile_size: int | None = None) -> None:
+    """Enable tiling, optionally resizing spatial tiles without changing overlap."""
+    if spatial_tile_size is None:
+        decoder.enable_tiling()
+        return
+
+    overlap_height = int(decoder.tile_sample_min_height) - int(decoder.tile_sample_stride_height)
+    overlap_width = int(decoder.tile_sample_min_width) - int(decoder.tile_sample_stride_width)
+    stride_height = spatial_tile_size - overlap_height
+    stride_width = spatial_tile_size - overlap_width
+
+    patch_size = int(decoder.decoder.patch_size)
+    upsample_stride = decoder.decoder.upsamples[-1].stride
+    cell_height = int(upsample_stride[1]) * patch_size
+    cell_width = int(upsample_stride[2]) * patch_size
+    if stride_height <= 0 or stride_width <= 0:
+        raise ValueError(
+            f"{_LTX2_DIFFVAE_SPATIAL_TILE_SIZE_EXTRA}={spatial_tile_size} must exceed the "
+            f"DiffVAE overlap ({overlap_height}x{overlap_width} pixels)."
+        )
+    if spatial_tile_size % cell_height or spatial_tile_size % cell_width:
+        raise ValueError(
+            f"{_LTX2_DIFFVAE_SPATIAL_TILE_SIZE_EXTRA}={spatial_tile_size} must be divisible by the "
+            f"DiffVAE spatial cell ({cell_height}x{cell_width} pixels)."
+        )
+    if stride_height % cell_height or stride_width % cell_width:
+        raise ValueError(
+            f"The derived DiffVAE stride {stride_height}x{stride_width} must be divisible by the "
+            f"spatial cell ({cell_height}x{cell_width} pixels)."
+        )
+
+    decoder.enable_tiling(
+        tile_sample_min_height=spatial_tile_size,
+        tile_sample_min_width=spatial_tile_size,
+        tile_sample_stride_height=stride_height,
+        tile_sample_stride_width=stride_width,
+    )
+    logger.info(
+        "Using LTX-2.5 DiffVAE spatial tiles of %dx%d pixels with the existing %dx%d-pixel overlap.",
+        spatial_tile_size,
+        spatial_tile_size,
+        overlap_height,
+        overlap_width,
+    )
 
 
 @dataclass(frozen=True)
@@ -724,8 +782,9 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         vae_patch_parallel_size = int(
             getattr(getattr(od_config, "parallel_config", None), "vae_patch_parallel_size", 1)
         )
-        if vae_patch_parallel_size > 1 or getattr(od_config, "vae_use_tiling", False):
-            pipeline.diffusion_decoder.enable_tiling()
+        spatial_tile_size = _ltx2_diffvae_spatial_tile_size(od_config)
+        if vae_patch_parallel_size > 1 or getattr(od_config, "vae_use_tiling", False) or spatial_tile_size is not None:
+            _enable_ltx2_diffvae_tiling(pipeline.diffusion_decoder, spatial_tile_size)
         pipeline.diffusion_decoder.set_parallel_size(
             vae_patch_parallel_size,
             mode=getattr(getattr(od_config, "parallel_config", None), "vae_parallel_mode", "tile"),

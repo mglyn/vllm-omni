@@ -338,6 +338,44 @@ class TestLTXDiffusionDecoder:
         with pytest.raises(TypeError, match="ltx2_use_conv_vae"):
             _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_conv_vae": "true"}), "2.5")
 
+    def test_diffvae_spatial_tile_size_preserves_overlap(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _enable_ltx2_diffvae_tiling
+
+        calls = []
+        decoder = SimpleNamespace(
+            tile_sample_min_height=768,
+            tile_sample_min_width=768,
+            tile_sample_stride_height=704,
+            tile_sample_stride_width=704,
+            decoder=SimpleNamespace(
+                patch_size=4,
+                upsamples=[SimpleNamespace(stride=(2, 2, 2))],
+            ),
+            enable_tiling=lambda **kwargs: calls.append(kwargs),
+        )
+
+        _enable_ltx2_diffvae_tiling(decoder, 512)
+
+        assert calls == [
+            {
+                "tile_sample_min_height": 512,
+                "tile_sample_min_width": 512,
+                "tile_sample_stride_height": 448,
+                "tile_sample_stride_width": 448,
+            }
+        ]
+        with pytest.raises(ValueError, match="must exceed"):
+            _enable_ltx2_diffvae_tiling(decoder, 64)
+        with pytest.raises(ValueError, match="must be divisible"):
+            _enable_ltx2_diffvae_tiling(decoder, 500)
+
+    @pytest.mark.parametrize("tile_size", [True, 512.0, "512"])
+    def test_diffvae_spatial_tile_size_rejects_non_integer_extra(self, tile_size):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_diffvae_spatial_tile_size
+
+        with pytest.raises(TypeError, match="ltx2_diffvae_spatial_tile_size"):
+            _ltx2_diffvae_spatial_tile_size(SimpleNamespace(extras={"ltx2_diffvae_spatial_tile_size": tile_size}))
+
     def test_native_diffusion_decoder_conversion_splits_qkv_and_folds_gates(self):
         from vllm_omni.diffusion.models.ltx2.vae.decoder import (
             convert_ltx25_native_diffusion_decoder_state_dict,

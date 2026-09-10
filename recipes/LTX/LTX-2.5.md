@@ -66,7 +66,17 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 
 Both decoders are untiled by default. Set `vae_use_tiling` for memory-saving
 serial tiling; DiffVAE tiles only above 80 frames or 768 pixels in either spatial
-dimension. DiffVAE also supports distributed VAE decode; see the
+dimension. Its startup-only `ltx2_diffvae_spatial_tile_size` extra sets a square
+spatial tile in decoded pixels and also enables tiling. The spatial overlap stays
+at 64 pixels, so a 512-pixel tile uses a 448-pixel stride; temporal tiling is
+unchanged. The value must be an integer multiple of 8 and greater than the
+overlap. For example:
+
+```python
+stage_overrides='{"0":{"extras":{"ltx2_diffvae_spatial_tile_size":512}}}'
+```
+
+DiffVAE also supports distributed VAE decode; see the
 [VAE Parallelism Guide](../../docs/user_guide/diffusion/parallelism/vae_parallelism.md).
 DiffVAE is decoder-only, so I2V still uses the convolutional VAE encoder.
 
@@ -156,6 +166,7 @@ python examples/offline_inference/text_to_video/text_to_video.py \
   --frame-rate 24 \
   --fps 24 \
   --vae-use-tiling \
+  --stage-overrides '{"0":{"extras":{"ltx2_diffvae_spatial_tile_size":512}}}' \
   --diffusion-offload-config '{"mode":"layer","components":["dit","text_encoder"]}' \
   --seed 42 \
   --output ltx25-dfr-4k.mp4
@@ -165,7 +176,10 @@ The same offload JSON is supported by `vllm serve` and the Python
 `Omni(diffusion_offload_config=...)` argument. This configuration uses
 rank-local layerwise transfers; the legacy `--enable-layerwise-offload`
 flag selects only the DiT. Offload trades GPU weight memory for CPU RAM
-and transfer overhead. See the
+and transfer overhead. On four NVIDIA H200 GPUs with Ulysses4 and VAE patch
+parallel 4, the 512-pixel DiffVAE tile reduced the measured highest-rank peak
+from 80.82 to 70.76 GiB versus the default 768-pixel tile, while worker
+generation increased from 51.04 to 52.81 seconds for 121 frames. See the
 [offload configuration guide](../../docs/user_guide/diffusion/offloader/distributed_layerwise_offload.md).
 
 ## Offline inference
