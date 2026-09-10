@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from itertools import product
 from typing import Any
 
 import torch
@@ -70,6 +71,159 @@ class LTX2VideoDiffusionTileTask(TileTask):
     noise_generator: torch.Generator | list[torch.Generator] | None = None
     x_t: torch.Tensor | None = None
     output_shape: tuple[int, int, int, int, int] | None = None
+
+
+class _LTX2VideoDiffusionStreamingMerger:
+    """Reference-order spatiotemporal tile blending with bounded storage."""
+
+    def __init__(
+        self,
+        model: DistributedLTX2VideoDiffusionDecoderModel,
+        plan: LTX2VideoDiffusionTilePlan,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.model = model
+        self.plan = plan
+        self.expected_coords = iter(
+            product(
+                range(len(plan.temporal_tiles)),
+                range(len(plan.height_tiles)),
+                range(len(plan.width_tiles)),
+            )
+        )
+        self.num_tiles = len(plan.temporal_tiles) * len(plan.height_tiles) * len(plan.width_tiles)
+        self.num_consumed = 0
+        self.output = torch.empty(
+            (
+                batch_size,
+                model.decoder.out_channels,
+                plan.num_frames * plan.scale_t - (1 if plan.scale_t == 2 else 0),
+                plan.height * plan.scale_h,
+                plan.width * plan.scale_w,
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        self.output_frame_offset = 0
+        self.current_t = -1
+        self.current_h = -1
+        self.previous_group: torch.Tensor | None = None
+        self.current_group: torch.Tensor | None = None
+        self.previous_row: list[torch.Tensor | None] = []
+        self.current_row: list[torch.Tensor | None] = []
+
+    def _finish_current_group(self) -> None:
+        if self.current_group is None:
+            return
+
+        group = self.current_group
+        if self.current_t > 0:
+            if self.previous_group is None:
+                raise RuntimeError(f"Missing temporal tile before LTX DiffVAE tile group {self.current_t}.")
+            group = self.model.blend_t(self.previous_group, group, self.plan.blend_frames)
+
+        if self.current_t < len(self.plan.temporal_tiles) - 1:
+            keep_frames = self.plan.stride_t * self.plan.scale_t
+            if self.current_t == 0 and self.plan.scale_t == 2:
+                keep_frames -= 1
+        else:
+            keep_frames = group.shape[2]
+        keep_frames = min(keep_frames, self.output.shape[2] - self.output_frame_offset)
+        self.output[:, :, self.output_frame_offset : self.output_frame_offset + keep_frames].copy_(
+            group[:, :, :keep_frames]
+        )
+        self.output_frame_offset += keep_frames
+        self.previous_group = group
+        self.current_group = None
+
+    def _start_group(self, t_idx: int, tile: torch.Tensor) -> None:
+        self._finish_current_group()
+        self.current_t = t_idx
+        self.current_h = -1
+        self.previous_row = []
+        self.current_row = []
+        self.current_group = torch.empty(
+            (
+                tile.shape[0],
+                tile.shape[1],
+                tile.shape[2],
+                self.plan.height * self.plan.scale_h,
+                self.plan.width * self.plan.scale_w,
+            ),
+            device=tile.device,
+            dtype=tile.dtype,
+        )
+
+    def add(self, coord: tuple[int, int, int], tile: torch.Tensor) -> None:
+        expected = next(self.expected_coords)
+        if coord != expected:
+            raise ValueError(f"Expected LTX DiffVAE tile {expected}, got {coord}.")
+
+        t_idx, h_idx, w_idx = coord
+        if t_idx != self.current_t:
+            self._start_group(t_idx, tile)
+        if h_idx != self.current_h:
+            if h_idx != self.current_h + 1 or w_idx != 0:
+                raise ValueError(f"Unexpected LTX DiffVAE tile row transition at {coord}.")
+            self.previous_row = self.current_row
+            self.current_row = []
+            self.current_h = h_idx
+
+        if h_idx > 0:
+            above = self.previous_row[w_idx]
+            if above is None:
+                raise RuntimeError(f"Missing tile above LTX DiffVAE tile {coord}.")
+            overlap = self.plan.height_tiles[h_idx - 1][1] - self.plan.height_tiles[h_idx][0]
+            tile = self.model.blend_v(above, tile, overlap * self.plan.scale_h)
+            self.previous_row[w_idx] = None
+        if w_idx > 0:
+            left = self.current_row[w_idx - 1]
+            if left is None:
+                raise RuntimeError(f"Missing tile left of LTX DiffVAE tile {coord}.")
+            overlap = self.plan.width_tiles[w_idx - 1][1] - self.plan.width_tiles[w_idx][0]
+            tile = self.model.blend_h(left, tile, overlap * self.plan.scale_w)
+        self.current_row.append(tile)
+
+        keep_height = (
+            (self.plan.height_tiles[h_idx + 1][0] - self.plan.height_tiles[h_idx][0]) * self.plan.scale_h
+            if h_idx < len(self.plan.height_tiles) - 1
+            else tile.shape[3]
+        )
+        keep_width = (
+            (self.plan.width_tiles[w_idx + 1][0] - self.plan.width_tiles[w_idx][0]) * self.plan.scale_w
+            if w_idx < len(self.plan.width_tiles) - 1
+            else tile.shape[4]
+        )
+        core = tile[:, :, :, :keep_height, :keep_width]
+        h_start = self.plan.height_tiles[h_idx][0] * self.plan.scale_h
+        w_start = self.plan.width_tiles[w_idx][0] * self.plan.scale_w
+        if self.current_group is None:
+            raise RuntimeError(f"Missing output group for LTX DiffVAE tile {coord}.")
+        self.current_group[
+            :,
+            :,
+            :,
+            h_start : h_start + keep_height,
+            w_start : w_start + keep_width,
+        ].copy_(core)
+
+        self.num_consumed += 1
+
+    def finish(self) -> torch.Tensor:
+        if self.num_consumed != self.num_tiles:
+            raise RuntimeError(f"Merged {self.num_consumed} LTX DiffVAE tiles, expected {self.num_tiles}.")
+        self._finish_current_group()
+        if self.output_frame_offset != self.output.shape[2]:
+            raise RuntimeError(
+                f"Merged {self.output_frame_offset} LTX DiffVAE frames, expected {self.output.shape[2]}."
+            )
+        self.previous_group = None
+        self.previous_row = []
+        self.current_row = []
+        return self.output
 
 
 class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, DistributedVaeMixin):
@@ -411,6 +565,22 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
             raise RuntimeError(f"Missing output shape for LTX DiffVAE tile {task.tile_id}.")
         return task.output_shape
 
+    def _distributed_streaming_merger(
+        self,
+        grid_spec: GridSpec,
+        z: torch.Tensor,
+    ) -> _LTX2VideoDiffusionStreamingMerger:
+        plan = grid_spec.tile_spec["plan"]
+        if not isinstance(plan, LTX2VideoDiffusionTilePlan):
+            raise TypeError(f"Expected an LTX2VideoDiffusionTilePlan, got {type(plan)!r}.")
+        return _LTX2VideoDiffusionStreamingMerger(
+            self,
+            plan,
+            batch_size=z.shape[0],
+            device=z.device,
+            dtype=grid_spec.output_dtype or z.dtype,
+        )
+
     @staticmethod
     def _balance_distributed_tile_tasks(
         tasks: list[LTX2VideoDiffusionTileTask],
@@ -424,13 +594,13 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
             workloads[rank] += task.workload
         return assigned
 
-    def _execute_distributed_exact_size_decode(
+    def _execute_distributed_streaming_decode(
         self,
         z: torch.Tensor,
         generator: torch.Generator | list[torch.Generator] | None,
         num_inference_steps: int,
     ) -> torch.Tensor:
-        """Decode local tiles and send exact-size results to rank 0."""
+        """Decode local tiles and stream exact-size results to rank 0."""
         executor = self.distributed_executor
         parallel_size = min(executor.parallel_size, executor.world_size)
         tasks, grid_spec = self._distributed_tile_split(z, generator, num_inference_steps)
@@ -439,11 +609,13 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
         local_results = {task.tile_id: self._distributed_tile_exec(task, num_inference_steps) for task in local_tasks}
         task_owner = {task.tile_id: owner for owner, rank_tasks in enumerate(assigned) for task in rank_tasks}
         output_dtype = grid_spec.output_dtype if grid_spec.output_dtype is not None else z.dtype
-        tiles: dict[tuple[int, int, int], torch.Tensor] = {}
+        merger = self._distributed_streaming_merger(grid_spec, z) if executor.rank == 0 else None
 
         for task in sorted(tasks, key=lambda item: item.tile_id):
             owner = task_owner[task.tile_id]
             if executor.rank == 0:
+                if merger is None:
+                    raise RuntimeError("Missing rank-0 LTX DiffVAE streaming merger.")
                 if owner == 0:
                     tile = local_results.pop(task.tile_id)
                 else:
@@ -453,15 +625,19 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
                         dtype=output_dtype,
                     )
                     dist.recv(tile, src=owner, group=executor.group)
-                tiles[task.grid_coord] = tile
+                merger.add(task.grid_coord, tile)
+                del tile
             elif executor.rank == owner:
                 tile = local_results.pop(task.tile_id)
                 if not tile.is_contiguous():
                     tile = tile.contiguous()
                 dist.send(tile, dst=0, group=executor.group)
+                del tile
 
         if executor.rank == 0:
-            return self._distributed_tile_merge(tiles, grid_spec)
+            if merger is None:
+                raise RuntimeError("Missing rank-0 LTX DiffVAE streaming merger.")
+            return merger.finish()
         return torch.empty(0, device=z.device, dtype=output_dtype)
 
     def tiled_decode(
@@ -475,7 +651,7 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
 
         logger.debug("LTX-2.5 diffusion decoder running with distributed stage-4/stage-5 tiles")
         num_inference_steps = num_inference_steps or self.decoder.default_num_inference_steps
-        result = self._execute_distributed_exact_size_decode(
+        result = self._execute_distributed_streaming_decode(
             z,
             generator,
             num_inference_steps,
