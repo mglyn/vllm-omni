@@ -114,6 +114,7 @@ def _cuda_registered_shm_copy(tensor: torch.Tensor, d2h_stream: torch.Stream) ->
     cudart = torch.cuda.cudart()
     pointer = shm_array.ctypes.data
     registered = False
+    succeeded = False
     try:
         error = cudart.cudaHostRegister(pointer, handle["nbytes"], 0)
         if int(error) != 0:
@@ -126,29 +127,26 @@ def _cuda_registered_shm_copy(tensor: torch.Tensor, d2h_stream: torch.Stream) ->
         finally:
             torch.accelerator.set_stream(old_stream)
         d2h_stream.synchronize()
-    except BaseException:
-        del host_tensor, shm_array
+        error = cudart.cudaHostUnregister(pointer)
+        registered = False
+        if int(error) != 0:
+            raise RuntimeError(f"cudaHostUnregister failed: {cudart.cudaGetErrorString(error)}")
+        handle["borrow_on_unpack"] = True
+        handle.update(
+            {
+                "__tensor_shm__": True,
+                "torch_dtype": str(original_dtype),
+            }
+        )
+        succeeded = True
+        return handle
+    finally:
         if registered:
             cudart.cudaHostUnregister(pointer)
-        shm.close()
-        shm.unlink()
-        raise
-    error = cudart.cudaHostUnregister(pointer)
-    if int(error) != 0:
         del host_tensor, shm_array
         shm.close()
-        shm.unlink()
-        raise RuntimeError(f"cudaHostUnregister failed: {cudart.cudaGetErrorString(error)}")
-    handle["borrow_on_unpack"] = True
-    del host_tensor, shm_array
-    shm.close()
-    handle.update(
-        {
-            "__tensor_shm__": True,
-            "torch_dtype": str(original_dtype),
-        }
-    )
-    return handle
+        if not succeeded:
+            shm.unlink()
 
 
 def _tensor_to_shm(
