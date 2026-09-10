@@ -19,7 +19,6 @@ from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
-    DistributedOperator,
     DistributedVaeMixin,
     GridSpec,
     TileTask,
@@ -70,6 +69,7 @@ class LTX2VideoDiffusionTileTask(TileTask):
     crop_trailing_ghost: bool = False
     noise_generator: torch.Generator | list[torch.Generator] | None = None
     x_t: torch.Tensor | None = None
+    output_shape: tuple[int, int, int, int, int] | None = None
 
 
 class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, DistributedVaeMixin):
@@ -354,6 +354,7 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
                     crop_trailing_ghost=is_trailing,
                     noise_generator=tile_generator,
                     x_t=x_t,
+                    output_shape=tile_pixel_shape,
                 )
             )
 
@@ -402,6 +403,67 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
             raise TypeError(f"Expected an LTX2VideoDiffusionTilePlan, got {type(plan)!r}.")
         return self._merge_tiled_decode(tiles, plan)
 
+    @staticmethod
+    def _distributed_tile_output_shape(
+        task: LTX2VideoDiffusionTileTask,
+    ) -> tuple[int, int, int, int, int]:
+        if task.output_shape is None:
+            raise RuntimeError(f"Missing output shape for LTX DiffVAE tile {task.tile_id}.")
+        return task.output_shape
+
+    @staticmethod
+    def _balance_distributed_tile_tasks(
+        tasks: list[LTX2VideoDiffusionTileTask],
+        num_ranks: int,
+    ) -> list[list[LTX2VideoDiffusionTileTask]]:
+        workloads: list[int | float] = [0] * num_ranks
+        assigned: list[list[LTX2VideoDiffusionTileTask]] = [[] for _ in range(num_ranks)]
+        for task in sorted(tasks, key=lambda item: item.workload, reverse=True):
+            rank = workloads.index(min(workloads))
+            assigned[rank].append(task)
+            workloads[rank] += task.workload
+        return assigned
+
+    def _execute_distributed_exact_size_decode(
+        self,
+        z: torch.Tensor,
+        generator: torch.Generator | list[torch.Generator] | None,
+        num_inference_steps: int,
+    ) -> torch.Tensor:
+        """Decode local tiles and send exact-size results to rank 0."""
+        executor = self.distributed_executor
+        parallel_size = min(executor.parallel_size, executor.world_size)
+        tasks, grid_spec = self._distributed_tile_split(z, generator, num_inference_steps)
+        assigned = self._balance_distributed_tile_tasks(tasks, parallel_size)
+        local_tasks = assigned[executor.rank] if executor.rank < parallel_size else []
+        local_results = {task.tile_id: self._distributed_tile_exec(task, num_inference_steps) for task in local_tasks}
+        task_owner = {task.tile_id: owner for owner, rank_tasks in enumerate(assigned) for task in rank_tasks}
+        output_dtype = grid_spec.output_dtype if grid_spec.output_dtype is not None else z.dtype
+        tiles: dict[tuple[int, int, int], torch.Tensor] = {}
+
+        for task in sorted(tasks, key=lambda item: item.tile_id):
+            owner = task_owner[task.tile_id]
+            if executor.rank == 0:
+                if owner == 0:
+                    tile = local_results.pop(task.tile_id)
+                else:
+                    tile = torch.empty(
+                        self._distributed_tile_output_shape(task),
+                        device=z.device,
+                        dtype=output_dtype,
+                    )
+                    dist.recv(tile, src=owner, group=executor.group)
+                tiles[task.grid_coord] = tile
+            elif executor.rank == owner:
+                tile = local_results.pop(task.tile_id)
+                if not tile.is_contiguous():
+                    tile = tile.contiguous()
+                dist.send(tile, dst=0, group=executor.group)
+
+        if executor.rank == 0:
+            return self._distributed_tile_merge(tiles, grid_spec)
+        return torch.empty(0, device=z.device, dtype=output_dtype)
+
     def tiled_decode(
         self,
         z: torch.Tensor,
@@ -413,14 +475,10 @@ class DistributedLTX2VideoDiffusionDecoderModel(LTX2VideoDiffusionDecoderModel, 
 
         logger.debug("LTX-2.5 diffusion decoder running with distributed stage-4/stage-5 tiles")
         num_inference_steps = num_inference_steps or self.decoder.default_num_inference_steps
-        result = self.distributed_executor.execute(
+        result = self._execute_distributed_exact_size_decode(
             z,
-            DistributedOperator(
-                split=lambda tensor: self._distributed_tile_split(tensor, generator, num_inference_steps),
-                exec=lambda task: self._distributed_tile_exec(task, num_inference_steps),
-                merge=self._distributed_tile_merge,
-            ),
-            broadcast_result=False,
+            generator,
+            num_inference_steps,
         )
         if result.numel() == 0:
             # The base decode method crops five dimensions before the LTX
