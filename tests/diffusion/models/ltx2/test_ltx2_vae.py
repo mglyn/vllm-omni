@@ -702,7 +702,13 @@ class TestLTXDiffusionDecoder:
         transfers = []
         monkeypatch.setattr(torch.distributed, "send", lambda tile, **_kwargs: transfers.append(tile.clone()))
 
-        nonzero_result = model._execute_distributed_exact_size_decode(z, None, 1)
+        reference_tiles = {task.grid_coord: model._distributed_tile_exec(task, 1) for task in tasks}
+        model._distributed_streaming_merger = lambda _spec, _z: SimpleNamespace(
+            add=lambda coord, tile: reference_tiles.__setitem__(coord, tile),
+            finish=lambda: model._distributed_tile_merge(reference_tiles, grid_spec),
+        )
+
+        nonzero_result = model._execute_distributed_streaming_decode(z, None, 1)
 
         assert nonzero_result.numel() == 0
         assert [tuple(tile.shape) for tile in transfers] == [shapes[1], shapes[2]]
@@ -713,10 +719,147 @@ class TestLTXDiffusionDecoder:
             tile.copy_(transfers.pop(0))
 
         monkeypatch.setattr(torch.distributed, "recv", recv)
-        rank_zero_result = model._execute_distributed_exact_size_decode(z, None, 1)
+        rank_zero_result = model._execute_distributed_streaming_decode(z, None, 1)
 
         torch.testing.assert_close(rank_zero_result, torch.tensor([1.0, 2.0, 3.0, 4.0]))
         assert not transfers
+
+    def test_distributed_diffusion_streaming_merge_matches_reference_order(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+            LTX2VideoDiffusionTilePlan,
+            _LTX2VideoDiffusionStreamingMerger,
+        )
+
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.decoder = SimpleNamespace(out_channels=1)
+        plan = LTX2VideoDiffusionTilePlan(
+            temporal_tiles=((0, 2), (1, 3)),
+            height_tiles=((0, 3), (2, 5), (4, 7)),
+            width_tiles=((0, 3), (2, 5), (4, 7)),
+            num_frames=3,
+            height=7,
+            width=7,
+            scale_t=1,
+            scale_h=1,
+            scale_w=1,
+            stride_t=1,
+            stride_h=2,
+            stride_w=2,
+            blend_frames=1,
+            blend_height=1,
+            blend_width=1,
+            single_step_x0=True,
+        )
+        generator = torch.Generator().manual_seed(123)
+        tiles = {
+            (t_idx, h_idx, w_idx): torch.randn((1, 1, 2, 3, 3), generator=generator)
+            for t_idx in range(len(plan.temporal_tiles))
+            for h_idx in range(len(plan.height_tiles))
+            for w_idx in range(len(plan.width_tiles))
+        }
+        expected = model._merge_tiled_decode({coord: tile.clone() for coord, tile in tiles.items()}, plan)
+        merger = _LTX2VideoDiffusionStreamingMerger(
+            model,
+            plan,
+            batch_size=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        for coord in tiles:
+            merger.add(coord, tiles[coord].clone())
+
+        torch.testing.assert_close(merger.finish(), expected, rtol=0, atol=0)
+
+    def test_distributed_diffusion_streaming_merge_scale_t_two_matches_reference(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+            LTX2VideoDiffusionTilePlan,
+            _LTX2VideoDiffusionStreamingMerger,
+        )
+
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.decoder = SimpleNamespace(out_channels=1)
+        plan = LTX2VideoDiffusionTilePlan(
+            temporal_tiles=((0, 2), (1, 3)),
+            height_tiles=((0, 2),),
+            width_tiles=((0, 2),),
+            num_frames=3,
+            height=2,
+            width=2,
+            scale_t=2,
+            scale_h=1,
+            scale_w=1,
+            stride_t=1,
+            stride_h=2,
+            stride_w=2,
+            blend_frames=2,
+            blend_height=0,
+            blend_width=0,
+            single_step_x0=True,
+        )
+        generator = torch.Generator().manual_seed(123)
+        tiles = {
+            (0, 0, 0): torch.randn((1, 1, 3, 2, 2), generator=generator),
+            (1, 0, 0): torch.randn((1, 1, 4, 2, 2), generator=generator),
+        }
+        expected = model._merge_tiled_decode({coord: tile.clone() for coord, tile in tiles.items()}, plan)
+        merger = _LTX2VideoDiffusionStreamingMerger(
+            model,
+            plan,
+            batch_size=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        for coord, tile in tiles.items():
+            merger.add(coord, tile.clone())
+
+        torch.testing.assert_close(merger.finish(), expected, rtol=0, atol=0)
+
+    def test_distributed_diffusion_streaming_merge_crops_short_clip_context(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+            LTX2VideoDiffusionTilePlan,
+            _LTX2VideoDiffusionStreamingMerger,
+        )
+
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.decoder = SimpleNamespace(out_channels=3)
+        plan = LTX2VideoDiffusionTilePlan(
+            temporal_tiles=((0, 1),),
+            height_tiles=((0, 2),),
+            width_tiles=((0, 2),),
+            num_frames=1,
+            height=2,
+            width=2,
+            scale_t=2,
+            scale_h=1,
+            scale_w=1,
+            stride_t=1,
+            stride_h=2,
+            stride_w=2,
+            blend_frames=0,
+            blend_height=0,
+            blend_width=0,
+            single_step_x0=True,
+        )
+        tile = torch.randn((1, 3, 11, 2, 2), generator=torch.Generator().manual_seed(123))
+        merger = _LTX2VideoDiffusionStreamingMerger(
+            model,
+            plan,
+            batch_size=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        merger.add((0, 0, 0), tile)
+
+        torch.testing.assert_close(merger.finish(), tile[:, :, :1], rtol=0, atol=0)
 
 
 class TestLTXOutputRank:
