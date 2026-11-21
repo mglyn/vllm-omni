@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata, QueryRange
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
@@ -232,6 +232,40 @@ def test_dense_flash_attn_func_for_prefers_optional_except_fp16(monkeypatch):
 
     assert fa.dense_flash_attn_func_for(torch.bfloat16) is optional
     assert fa.dense_flash_attn_func_for(torch.float16) is generic
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("layout", ["full", "suffix_padding", "two_documents", "short"])
+def test_packed_single_sequence_dense_fa3(monkeypatch, layout):
+    live = 4096 if layout == "short" else 6144
+    total = live if layout == "full" else live + 16
+    bounds = [0, live] if layout == "full" else [0, live, total]
+    cu = torch.tensor(bounds, dtype=torch.int32)
+    q = torch.ones(1, total, 1, 128, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(
+        extra=dict(cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=live, max_seqlen_k=live),
+        packed_padding=PackedPaddingMetadata(live, live, cu[:2], cu[:2]) if layout != "two_documents" else None,
+    )
+    dense = Mock(side_effect=lambda q, k, v, **kwargs: (v, None))
+    varlen = Mock(side_effect=lambda **kwargs: kwargs["v"])
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", dense)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", varlen)
+    monkeypatch.setattr(fa, "vllm_varlen_version_kwargs", lambda fn: {"fa_version": 3})
+
+    impl = FlashAttentionImpl(num_heads=1, head_size=128, softmax_scale=0.125)
+    result = impl.forward_cuda(q, q, q, metadata)
+    assert result.shape == q.shape
+    if layout in ("two_documents", "short"):
+        dense.assert_not_called()
+        assert varlen.call_args.kwargs["cu_seqlens_q"] is cu
+        torch.testing.assert_close(result, q)
+    else:
+        varlen.assert_not_called()
+        assert [x.shape[1] for x in dense.call_args.args] == [live] * 3
+        assert dense.call_args.kwargs == {"softmax_scale": 0.125, "causal": False}
+        torch.testing.assert_close(result[:, :live], q[:, :live])
+        assert result[:, live:].count_nonzero() == 0
 
 
 @pytest.mark.cpu

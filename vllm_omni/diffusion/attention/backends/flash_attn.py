@@ -748,6 +748,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             dense_flash_attn_func_for,
             flash_attn_func,
             flash_attn_varlen_func,
+            optional_fa3_fwd_dense_func,
+            vllm_varlen_version_kwargs,
         )
 
         if not HAS_FLASH_ATTN:
@@ -799,6 +801,40 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         if metadata_plan.packing_mode is not PackingMode.NONE:
+            # Only producer-validated suffix padding identifies a single live
+            # document. Two real documents can have identical cu_seqlens shapes.
+            padding = attn_metadata.packed_padding
+            if (
+                optional_fa3_fwd_dense_func is not None
+                and padding is not None
+                and metadata_plan.packing_mode is PackingMode.PACKED_PADDING
+                and attn_metadata.query_ranges is None
+                and attention_mask is None
+                and not self.causal
+                and not self.is_cross_attn
+                and not self.fa_deterministic
+                and query.dtype == key.dtype == value.dtype == torch.bfloat16
+                and query.shape == key.shape == value.shape
+                and query.shape[0] == 1
+                and query.shape[-1] == 128
+                and padding.q_length == padding.kv_length
+                # For short sequences the padded output copy can outweigh
+                # the benefit of the fixed-length kernel.
+                and 6144 <= padding.q_length <= query.shape[1]
+                and vllm_varlen_version_kwargs(flash_attn_varlen_func).get("fa_version") == 3
+            ):
+                length = padding.q_length
+                out = optional_fa3_fwd_dense_func(
+                    query[:, :length],
+                    key[:, :length],
+                    value[:, :length],
+                    softmax_scale=self.softmax_scale,
+                    causal=False,
+                )
+                live = self._unwrap_flash_output(out)
+                tail = query.shape[1] - length
+                return F.pad(live, (0, 0, 0, 0, 0, tail)) if tail else live
+
             self._warn_fa_deterministic_non_dense("packed-varlen")
             return self._forward_varlen_packed(
                 query,
@@ -826,8 +862,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 attention_mask,
             )
 
-        # optional_fa3_fwd_dense_func is consulted only here so masked/packed/
-        # piecewise/FP8 keep the vLLM varlen dispatcher. FP16 skips fa3-fwd.
+        # General unmasked dense path. FP16 skips the optional Hopper BF16 kernel.
         dense_attn_func = dense_flash_attn_func_for(query.dtype)
         if dense_attn_func is not None:
             if IS_FLASH_ATTN_4:

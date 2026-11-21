@@ -60,7 +60,7 @@ def _bind_optional_fa3_fwd_dense() -> FlashAttnFn | None:
     Hopper, restore a dense FA3 callable for the unmasked dense path so those
     workloads do not fall through to vLLM varlen emulation (#9092). The returned
     callable is kept separate from ``flash_attn_func`` / ``flash_attn_varlen_func``
-    so masked, packed, piecewise, and FP8 paths stay on the vLLM dispatcher
+    so masked, multi-document, piecewise, and FP8 paths stay on the vLLM dispatcher
     (#9100). ``fa3-fwd`` 0.0.3 disables FP16 kernels; callers must skip this
     binding for ``torch.float16`` inputs.
     """
@@ -97,7 +97,7 @@ def is_flash_attn_4_available() -> bool:
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
 # Hopper-only optional dense FA3 from fa3-fwd. Not assigned to flash_attn_func
-# so masked/packed/piecewise/FP8 keep the vLLM varlen dispatcher.
+# so other layouts can continue to use the vLLM varlen dispatcher.
 optional_fa3_fwd_dense_func: FlashAttnFn | None = None
 # FP8 descales are supported by vLLM's FA3 dispatcher and standalone FA3.
 FLASH_ATTN_SUPPORTS_FP8 = False
@@ -165,7 +165,7 @@ else:
             pass
 
     # Optional Hopper dense FA3 (not a hard dependency since #7735). Kept
-    # separate from flash_attn_* so only the unmasked dense path can prefer it
+    # separate from flash_attn_* so only eligible dense calls can prefer it
     # (#9092); vLLM varlen + fa_version (#9100) remains for other routes.
     optional_fa3_fwd_dense_func = _bind_optional_fa3_fwd_dense()
 
