@@ -2,11 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Install once after weight loading; TP reduction and weight loaders stay on each layer."""
 
-import json
-import os
-from dataclasses import asdict
 from pathlib import Path
-from uuid import uuid4
 
 import torch
 from vllm.logger import init_logger
@@ -16,13 +12,12 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.platforms import current_omni_platform
 
-from .profile import OPERATION, Target, load_configs, shape_key
+from .profile import Target, load_configs
 
 logger = init_logger(__name__)
 
 
-def make_dispatch(device, target, configs, fallback, trace: Path | None = None):
-    """Use the same lookup and eligibility checks for offline confirmation and inference."""
+def _make_dispatch(device, target, configs, fallback):
     seen = set()
 
     def dispatch(layer, x, weight, bias):
@@ -50,12 +45,6 @@ def make_dispatch(device, target, configs, fallback, trace: Path | None = None):
             return fallback(layer, x, weight, bias)
         n, k = weight.shape
         shape = (x.numel() // k, n, k)
-        if trace is not None and shape not in seen:
-            with trace.open("a") as stream:
-                stream.write(
-                    json.dumps({"operation": OPERATION, "target": asdict(target), "shape": shape_key(shape)}) + "\n"
-                )
-            seen.add(shape)
         config = configs.get(shape)
         if config is None:
             return fallback(layer, x, weight, bias)
@@ -70,11 +59,10 @@ def make_dispatch(device, target, configs, fallback, trace: Path | None = None):
 def install(pipeline: torch.nn.Module, device: torch.device, options: dict) -> None:
     if not isinstance(options, dict):
         raise ValueError("gemm_tuning must be an object")
-    mode = options.get("mode")
-    if mode not in ("collect", "dispatch"):
-        raise ValueError("gemm_tuning mode must be 'collect' or 'dispatch'")
+    if options.get("mode") != "dispatch":
+        raise ValueError("gemm_tuning mode must be 'dispatch'")
     location = options.get("directory")
-    if location is None and mode == "dispatch":
+    if location is None:
         directory = Path(__file__).with_name("configs")
     elif isinstance(location, str) and location:
         directory = Path(location)
@@ -91,16 +79,12 @@ def install(pipeline: torch.nn.Module, device: torch.device, options: dict) -> N
     if device.index is None:
         device = torch.device(device.type, torch.accelerator.current_device_index())
     target = Target.current(device)
-    configs = load_configs(directory, target) if mode == "dispatch" else {}
-    if mode == "dispatch" and not configs:
+    configs = load_configs(directory, target)
+    if not configs:
         logger.info("No optimized entries for %s; keeping the default linear implementation", target.filename)
         return
-    trace = None
-    if mode == "collect":
-        directory.mkdir(parents=True, exist_ok=True)
-        trace = directory / f"shapes-{os.getpid()}-{uuid4().hex}.jsonl"
     fallback = dispatch_unquantized_gemm()
-    dispatch = make_dispatch(device, target, configs, fallback, trace)
+    dispatch = _make_dispatch(device, target, configs, fallback)
     weight_shapes = {(n, k) for _, n, k in configs}
     installed = 0
     for layer in pipeline.modules():
@@ -112,14 +96,13 @@ def install(pipeline: torch.nn.Module, device: torch.device, options: dict) -> N
         ):
             continue
         weight = getattr(layer, "weight", None)
-        if mode == "dispatch" and weight is not None and weight.ndim == 2 and tuple(weight.shape) not in weight_shapes:
+        if weight is not None and weight.ndim == 2 and tuple(weight.shape) not in weight_shapes:
             continue
         method._gemm_impl = dispatch
         installed += 1
     logger.info(
-        "Diffusion GEMM %s: %d eligible linear modules, target=%s, file=%s",
-        mode,
+        "Diffusion GEMM dispatch: %d eligible linear modules, target=%s, file=%s",
         installed,
         target.device,
-        trace or directory / target.filename,
+        directory / target.filename,
     )

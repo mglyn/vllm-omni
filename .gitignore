@@ -259,7 +259,6 @@ datasets/
 !tests/e2e/accuracy/qwen_image_21/thresholds.json
 !tests/dfx/perf/baselines/qwen3_omni.json
 *.jsonl
-!benchmarks/kernels/gemm_shapes/*.jsonl
 # Shared Hunyuan IT2I input for accuracy tests and vllm bench.
 !tests/assets/hunyuan_image3/it2i.jsonl
 !tests/assets/livekit/client_vad_replay.jsonl

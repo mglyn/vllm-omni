@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""On-disk contract shared by the offline tuner and inference workers."""
+"""Load a device-specific table of measured GEMM configurations."""
 
 import hashlib
 import json

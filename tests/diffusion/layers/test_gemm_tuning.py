@@ -2,14 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 
 import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.layers.gemm_tuning.backends import PadRows, Tile, entry
+from vllm_omni.diffusion.layers.gemm_tuning.backends import PadRows, Tile
 from vllm_omni.diffusion.layers.gemm_tuning.profile import Target, load_configs, profile_entries
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -21,8 +20,8 @@ def table(target):
         "operation": "bf16_nt_no_bias",
         "target": asdict(target),
         "entries": {
-            "37,128,64": entry(Tile(32, 64, 32, 4, 3)),
-            "37,64,128": entry(PadRows(16)),
+            "37,128,64": {"backend": "triton", "config": asdict(Tile(32, 64, 32, 4, 3))},
+            "37,64,128": {"backend": "pad_rows", "config": {"multiple": 16}},
             "36,64,128": {"backend": "default"},
         },
     }
@@ -44,26 +43,6 @@ def test_target_and_exact_shape(tmp_path):
 
 
 @pytest.mark.cpu
-def test_tuner_merges_shapes_and_isolates_targets(tmp_path):
-    from benchmarks.kernels.tune_diffusion_gemm import merge_decisions
-
-    target = Target("cuda", "GPU", "80", "torch", "triton", "cuda", 108, "vllm")
-    other = replace(target, arch="90")
-    config = Tile(32, 64, 32, 4, 3)
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        writes = [
-            pool.submit(merge_decisions, tmp_path, device, {shape: entry(config)})
-            for device, shape in [(target, "37,128,64"), (target, "38,128,64"), (other, "39,128,64")]
-        ]
-        for write in writes:
-            assert write.result().is_file()
-    assert set(load_configs(tmp_path, target)) == {(37, 128, 64), (38, 128, 64)}
-    merge_decisions(tmp_path, target, {"37,128,64": {"backend": "default"}})
-    assert load_configs(tmp_path, target) == {(38, 128, 64): config}
-    assert load_configs(tmp_path, other) == {(39, 128, 64): config}
-
-
-@pytest.mark.cpu
 @pytest.mark.parametrize(
     "key,row",
     [
@@ -82,7 +61,7 @@ def test_reject_invalid_entry(key, row):
 
 @hardware_test(res={"cuda": ["H100", "B200"]})
 @torch.inference_mode()
-def test_bagel_mlp_collect_and_replay(tmp_path, monkeypatch):
+def test_bagel_mlp_dispatch(tmp_path, monkeypatch):
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -104,13 +83,6 @@ def test_bagel_mlp_collect_and_replay(tmp_path, monkeypatch):
             p.copy_(torch.randint(-1, 2, p.shape, device=device))
         x = torch.randint(-1, 2, (1, 37, 64), device=device).to(torch.bfloat16)
         baseline = model(x)
-        runtime.install(model, device, {"mode": "collect", "directory": str(tmp_path)})
-        for _ in range(2):
-            assert torch.equal(model(x), baseline)
-        (trace,) = tmp_path.glob("*.jsonl")
-        records = [json.loads(line) for line in trace.read_text().splitlines()]
-        assert [r["shape"] for r in records] == ["37,256,64", "37,64,128"]
-
         target = Target.current(device)
         data = table(target)
         data["entries"]["37,256,64"] = data["entries"].pop("37,128,64")
