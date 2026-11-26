@@ -258,9 +258,12 @@ def _euler_target_step(rows: torch.Tensor, velocity: torch.Tensor, n_cond: int, 
     target.copy_(target + delta * velocity[n_cond:].float())
 
 
-def _image_packed_seq_len(used_rows: int) -> int:
-    """Used rows (text + target + references) rounded up to 16, plus 16 rows."""
-    return ((used_rows + 15) // 16) * 16 + 16
+def _image_packed_seq_len(used_rows: int, *, tune_a100: bool = False) -> int:
+    """Preserve valid rows and a nonempty isolated padding document."""
+    release_rows = ((used_rows + 15) // 16) * 16 + 16
+    if tune_a100 and release_rows == 4112 and used_rows < 4096:
+        return 4096
+    return release_rows
 
 
 def _upright_rgb(image: Image.Image) -> Image.Image:
@@ -397,19 +400,19 @@ class MiniMaxH3ImagePipeline(
         tuned_gemm = additional.get("use_tuned_bf16_gemm", False)
         if type(tuned_gemm) is not bool:
             raise ValueError("use_tuned_bf16_gemm must be a bool")
-        if (
+        self._tune_a100_rows = (
             tuned_gemm
             and transformer_quant_config is None
             and (parallel.tensor_parallel_size, parallel.sequence_parallel_size) == (1, 1)
-        ):
-            from vllm_omni.diffusion.layers.cublaslt.linear import install_tuned_gemm
-
-            projections = (
-                layer
+            and od_config.diffusion_attention_schedule is None
+            and current_omni_platform.is_cuda()
+            and current_omni_platform.get_device_name(self.device.index or 0) == "NVIDIA A100 80GB PCIe"
+            and all(
+                block.attn.attention.attn_backend is not None
+                and block.attn.attention.attn_backend.get_name() == "FLASH_ATTN"
                 for block in self.transformer.blocks
-                for layer in (block.attn.qkv_proj, block.attn.out_proj, block.mlp.fc1, block.mlp.fc2)
             )
-            install_tuned_gemm(projections, self.device)
+        )
         if self.transformer.arch.audio_enabled:
             raise ValueError("MiniMax-H3-Image requires an audio-free DiT (audio_enabled: false)")
 
@@ -704,7 +707,7 @@ class MiniMaxH3ImagePipeline(
             latent_w=latent_w,
             audio_t=0,
             ref_blocks=blocks,
-            seq_len=_image_packed_seq_len(used),
+            seq_len=_image_packed_seq_len(used, tune_a100=self._tune_a100_rows and not grids),
         )
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"].view(-1)] = text_tags

@@ -510,29 +510,43 @@ def test_reference_limit_matches_model_metadata():
     assert metadata.max_multimodal_image_inputs == h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES
 
 
-def test_tuned_1080p_projections_require_exact_packed_rows():
-    from pathlib import Path
+@pytest.mark.parametrize(
+    ("used", "release", "tuned"),
+    [
+        (4080, 4096, 4096),
+        (4081, 4112, 4096),
+        (4087, 4112, 4096),
+        (4095, 4112, 4096),
+        (4096, 4112, 4112),
+        (4097, 4128, 4128),
+    ],
+)
+def test_tuned_gemm_packed_rows(used, release, tuned):
+    assert h3i._image_packed_seq_len(used) == release
+    assert h3i._image_packed_seq_len(used, tune_a100=True) == tuned
+    assert tuned > used
 
-    from vllm_omni.diffusion.layers import cublaslt
 
-    table = json.loads((Path(cublaslt.__file__).parent / "NVIDIA_A100_80GB_PCIe.bf16.cublaslt-130101.json").read_text())
+def test_1080p_tuned_packing_preserves_valid_rows():
     w, h = h3i.minimax_h3_image_generation_canvas(1920, 1080, 2048**2)
-    m = h3i._image_packed_seq_len((w // 32) * (h // 32) + 7)
-    assert m == 4112
-    for n, k in [(21504, 5376), (5376, 7168), (28672, 5376), (5376, 14336)]:
-        assert f"{m},{n},{k}" in table
-        assert f"{m + 1},{n},{k}" not in table
+    used = 7 + (w // 32) * (h // 32)
 
+    def pack(tune):
+        return minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=7,
+            latent_t=1,
+            latent_h=h // 16,
+            latent_w=w // 16,
+            audio_t=0,
+            ref_blocks=[],
+            seq_len=h3i._image_packed_seq_len(used, tune_a100=tune),
+        )
 
-@torch.inference_mode()
-def test_tuned_gemm_keeps_original_linear_on_neighboring_m():
-    from unittest.mock import Mock
-
-    from vllm_omni.diffusion.layers.cublaslt.linear import _TunedGemm
-
-    device = torch.device("cpu")
-    dispatch = _TunedGemm(Mock(), device, {(16, 8, 16): [6, 20, 11, 1]})
-    x = torch.ones((32, 16), dtype=torch.bfloat16)
-    weight = torch.ones((8, 16), dtype=torch.bfloat16)
-    assert torch.equal(dispatch(torch.nn.Identity(), x, weight, None), torch.nn.functional.linear(x, weight))
-    assert not dispatch.plans
+    release, tuned = pack(False), pack(True)
+    assert release["cu_seqlens"].tolist() == [0, 4087, 4112]
+    assert tuned["cu_seqlens"].tolist() == [0, 4087, 4096]
+    for key in ("token_tags", "img_position_ids", "document_id"):
+        assert torch.equal(release[key][:used], tuned[key][:used])
+    for key in ("img_pos", "text_pos", "update_mask", "latent_grid"):
+        assert torch.equal(release[key], tuned[key])
+    assert torch.all(tuned["document_id"][used:] == 1)

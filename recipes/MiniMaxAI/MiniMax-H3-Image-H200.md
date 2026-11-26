@@ -263,23 +263,20 @@ Correctness guard:
   request that same size; combine several changes into one edit instead of
   chaining edits.
 
-### A100 PCIe BF16 projection tuning (experimental)
+### A100 PCIe BF16 DiT shape tuning
 
-On a single A100 80GB PCIe with cuBLASLt 13.1.1, install the optional
-`nvmath-python` bindings (tested with 1.0.1) and add
-`--additional-config '{"use_tuned_bf16_gemm":true}'` to exercise the
-exact-shape table. The default is off. The table applies to the unquantized
-DiT projections at TP=SP=1. Unlisted shapes retain the configured linear
-backend. A 1920×1080 generation request with the default minimum area uses
-a 2720×1536 canvas internally and returns a 1920×1080 image.
+For text-to-image serving on one A100 80GB PCIe with unquantized DiT weights,
+TP=SP=1 and static FlashAttention, add
+`--additional-config '{"use_tuned_bf16_gemm":true}'` to opt in. The default is
+off. This selects a measured physical row count for the DiT while keeping the
+ordinary BF16 linear backend.
 
-The bundled 17-entry experimental table was selected in GEMM microbenchmarks.
-In four warm, alternating pairs on an A100, it increased median paired HTTP
-latency by 1.80% for 1920×1080 and 5.76% for 2048×2048 with a seven-token
-prompt. Keep the default for those workloads. To measure near-native 1080p
-separately, pass `"extra_params":{"min_generation_area":2073600}` in the
-Images API request. This changes the internal canvas to 1920×1088 and can
-change the generated image.
+For example, a 1920×1080 request with the default minimum area generates a
+2720×1536 canvas. With seven prompt tokens, the DiT has 4087 valid rows.
+The release packs them into 4112 rows; the tuned path uses 4096. The final
+nine padding rows remain a separate attention document. All image and text
+rows, the canvas, six-step schedule and returned resolution are preserved.
+Edits, a full 4096 valid rows, and unlisted buckets keep the release layout.
 
 ## Supported features
 
