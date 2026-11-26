@@ -1,0 +1,76 @@
+{
+  "entries": {
+    "1033,21504,5376": {
+      "backend": "default"
+    },
+    "1033,28672,5376": {
+      "backend": "default"
+    },
+    "1033,5376,14336": {
+      "backend": "default"
+    },
+    "1033,5376,7168": {
+      "backend": "default"
+    },
+    "1040,5120,25600": {
+      "backend": "default"
+    },
+    "1040,5120,8192": {
+      "backend": "default"
+    },
+    "4112,21504,5376": {
+      "backend": "default"
+    },
+    "4112,28672,5376": {
+      "backend": "default"
+    },
+    "4112,5376,14336": {
+      "backend": "default"
+    },
+    "4112,5376,7168": {
+      "backend": "default"
+    },
+    "6176,21504,5376": {
+      "backend": "default"
+    },
+    "6176,28672,5376": {
+      "backend": "default"
+    },
+    "6176,5376,14336": {
+      "backend": "default"
+    },
+    "6176,5376,7168": {
+      "backend": "default"
+    },
+    "7,21504,5376": {
+      "backend": "default"
+    },
+    "7,28672,5376": {
+      "backend": "default"
+    },
+    "7,5376,14336": {
+      "backend": "default"
+    },
+    "7,5376,7168": {
+      "backend": "default"
+    },
+    "8,5120,25600": {
+      "backend": "default"
+    },
+    "8,5120,8192": {
+      "backend": "default"
+    }
+  },
+  "operation": "bf16_nt_no_bias",
+  "target": {
+    "arch": "80",
+    "compute_units": 108,
+    "device": "NVIDIA A100 80GB PCIe",
+    "platform": "cuda",
+    "runtime": "13.0",
+    "torch_version": "2.14.0+cu130",
+    "triton_version": "3.8.0",
+    "vllm_version": "0.34.0"
+  },
+  "version": 1
+}

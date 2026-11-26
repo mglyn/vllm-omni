@@ -528,7 +528,7 @@ def test_reference_limit_matches_model_metadata():
 )
 def test_tuned_gemm_packed_rows(used, release, tuned):
     assert h3i._image_packed_seq_len(used) == release
-    assert h3i._image_packed_seq_len(used, tune_a100=True) == tuned
+    assert h3i._image_packed_seq_len(used, row_profile=h3i._device_row_profile("NVIDIA A100 80GB PCIe")) == tuned
     assert tuned > used
 
 
@@ -544,7 +544,9 @@ def test_1080p_tuned_packing_preserves_valid_rows():
             latent_w=w // 16,
             audio_t=0,
             ref_blocks=[],
-            seq_len=h3i._image_packed_seq_len(used, tune_a100=tune),
+            seq_len=h3i._image_packed_seq_len(
+                used, row_profile=h3i._device_row_profile("NVIDIA A100 80GB PCIe") if tune else None
+            ),
         )
 
     release, tuned = pack(False), pack(True)
@@ -555,3 +557,18 @@ def test_1080p_tuned_packing_preserves_valid_rows():
     for key in ("img_pos", "text_pos", "update_mask", "latent_grid"):
         assert torch.equal(release[key], tuned[key])
     assert torch.all(tuned["document_id"][used:] == 1)
+
+
+def test_custom_device_profile_is_exact_and_preserves_padding():
+    profiles = {"test GPU": {"4112": 4096, "2064": 2080}}
+    profile = h3i._device_row_profile("test GPU", profiles)
+    assert h3i._device_row_profile("different GPU", profiles) == {}
+    assert h3i._image_packed_seq_len(2047, row_profile=profile) == 2080
+    assert h3i._image_packed_seq_len(4096, row_profile=profile) == 4112
+    assert h3i._device_row_profile("NVIDIA A100 80GB PCIe", {"NVIDIA A100 80GB PCIe": {}}) == {}
+
+
+@pytest.mark.parametrize("entries", [[], {"x": 4096}, {"4112": True}, {"4112": -16}, {"4112": 4087}, {"4112": 2**28}])
+def test_bad_device_profile(entries):
+    with pytest.raises(ValueError):
+        h3i._device_row_profile("test GPU", {"test GPU": entries})
