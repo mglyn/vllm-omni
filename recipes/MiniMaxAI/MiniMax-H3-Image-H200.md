@@ -263,6 +263,16 @@ Correctness guard:
   request that same size; combine several changes into one edit instead of
   chaining edits.
 
+### A100 PCIe BF16 projection tuning (experimental)
+
+On a single A100 80GB PCIe with cuBLASLt 13.1.1, install the optional
+`nvmath-python` bindings (tested with 1.0.1) and add
+`--additional-config '{"use_tuned_bf16_gemm":true}'` to exercise the
+exact-shape table. The default is off. The table applies to the unquantized
+DiT projections at TP=SP=1. Unlisted shapes retain the configured linear
+backend. A 1920×1080 generation request with the default minimum area uses
+a 2720×1536 canvas internally and returns a 1920×1080 image.
+
 ## Supported features
 
 | Feature | Status on this model | Guide |

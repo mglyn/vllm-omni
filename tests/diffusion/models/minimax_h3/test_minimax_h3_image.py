@@ -30,6 +30,7 @@ _RELEASE_PDD = {
         ((1024, 1024), 2048 * 2048, (2048, 2048)),
         # Matches the reference implementation's log for a 16:9 request.
         ((1280, 720), 2048 * 2048, (2720, 1536)),
+        ((1920, 1080), 2048 * 2048, (2720, 1536)),
         # At or above the area: only aligned to the 32px grid.
         ((4736, 3552), 2048 * 2048, (4736, 3552)),
         ((4000, 3000), 2048 * 2048, (4000, 3008)),
@@ -507,3 +508,17 @@ def test_reference_limit_matches_model_metadata():
     assert h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES == 16
     metadata = get_diffusion_model_metadata("MiniMaxH3ImagePipeline")
     assert metadata.max_multimodal_image_inputs == h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES
+
+
+def test_tuned_1080p_projections_require_exact_packed_rows():
+    from pathlib import Path
+
+    from vllm_omni.diffusion.layers import cublaslt
+
+    table = json.loads((Path(cublaslt.__file__).parent / "NVIDIA_A100_80GB_PCIe.bf16.cublaslt-130101.json").read_text())
+    w, h = h3i.minimax_h3_image_generation_canvas(1920, 1080, 2048**2)
+    m = h3i._image_packed_seq_len((w // 32) * (h // 32) + 7)
+    assert m == 4112
+    for n, k in [(21504, 5376), (5376, 7168), (28672, 5376), (5376, 14336)]:
+        assert f"{m},{n},{k}" in table
+        assert f"{m + 1},{n},{k}" not in table

@@ -394,6 +394,22 @@ class MiniMaxH3ImagePipeline(
 
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.transformer = MiniMaxH3DiTModel(od_config, quant_config=transformer_quant_config)
+        tuned_gemm = additional.get("use_tuned_bf16_gemm", False)
+        if type(tuned_gemm) is not bool:
+            raise ValueError("use_tuned_bf16_gemm must be a bool")
+        if (
+            tuned_gemm
+            and transformer_quant_config is None
+            and (parallel.tensor_parallel_size, parallel.sequence_parallel_size) == (1, 1)
+        ):
+            from vllm_omni.diffusion.layers.cublaslt.linear import install_tuned_gemm
+
+            projections = (
+                layer
+                for block in self.transformer.blocks
+                for layer in (block.attn.qkv_proj, block.attn.out_proj, block.mlp.fc1, block.mlp.fc2)
+            )
+            install_tuned_gemm(projections, self.device)
         if self.transformer.arch.audio_enabled:
             raise ValueError("MiniMax-H3-Image requires an audio-free DiT (audio_enabled: false)")
 
