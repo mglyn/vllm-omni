@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 
 import pytest
@@ -40,6 +41,26 @@ def test_target_and_exact_shape(tmp_path):
         assert load_configs(tmp_path, other) == {}
         with pytest.raises(ValueError):
             profile_entries(data, other)
+
+
+@pytest.mark.cpu
+def test_tuner_merges_shapes_and_isolates_targets(tmp_path):
+    from benchmarks.kernels.tune_diffusion_gemm import merge_decisions
+
+    target = Target("cuda", "GPU", "80", "torch", "triton", "cuda", 108, "vllm")
+    other = replace(target, arch="90")
+    config = Tile(32, 64, 32, 4, 3)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        writes = [
+            pool.submit(merge_decisions, tmp_path, device, {shape: entry(config)})
+            for device, shape in [(target, "37,128,64"), (target, "38,128,64"), (other, "39,128,64")]
+        ]
+        for write in writes:
+            assert write.result().is_file()
+    assert set(load_configs(tmp_path, target)) == {(37, 128, 64), (38, 128, 64)}
+    merge_decisions(tmp_path, target, {"37,128,64": {"backend": "default"}})
+    assert load_configs(tmp_path, target) == {(38, 128, 64): config}
+    assert load_configs(tmp_path, other) == {(39, 128, 64): config}
 
 
 @pytest.mark.cpu

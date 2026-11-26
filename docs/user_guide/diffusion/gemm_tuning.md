@@ -12,6 +12,8 @@ python benchmarks/kernels/tune_diffusion_gemm.py \
     --output-dir ./gemm-tables --report ./measurements.json
 ```
 
+For a controlled comparison of the dispatch boundary, add `--shape 4096,3072,64 --shape 8192,3072,64 --shape 16384,3072,64`. The packaged A100 profile selects the default at 4096 rows and Triton at 8192 and 16384 rows. These three synthetic projection shapes supplement the H3 trace.
+
 Use a fresh report path for each run. Use repeated `--shape M,N,K` arguments for individual projections, or pass several trace files after `--trace`. The tuning process detects the target locally. Run the same command on a second device to produce its own table. Serve and tune with the same vLLM and math settings.
 
 ## Collect a different workload
