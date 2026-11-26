@@ -273,6 +273,14 @@ DiT projections at TP=SP=1. Unlisted shapes retain the configured linear
 backend. A 1920×1080 generation request with the default minimum area uses
 a 2720×1536 canvas internally and returns a 1920×1080 image.
 
+The bundled 17-entry experimental table was selected in GEMM microbenchmarks.
+In four warm, alternating pairs on an A100, it increased median paired HTTP
+latency by 1.80% for 1920×1080 and 5.76% for 2048×2048 with a seven-token
+prompt. Keep the default for those workloads. To measure near-native 1080p
+separately, pass `"extra_params":{"min_generation_area":2073600}` in the
+Images API request. This changes the internal canvas to 1920×1088 and can
+change the generated image.
+
 ## Supported features
 
 | Feature | Status on this model | Guide |

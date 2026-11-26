@@ -522,3 +522,17 @@ def test_tuned_1080p_projections_require_exact_packed_rows():
     for n, k in [(21504, 5376), (5376, 7168), (28672, 5376), (5376, 14336)]:
         assert f"{m},{n},{k}" in table
         assert f"{m + 1},{n},{k}" not in table
+
+
+@torch.inference_mode()
+def test_tuned_gemm_keeps_original_linear_on_neighboring_m():
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion.layers.cublaslt.linear import _TunedGemm
+
+    device = torch.device("cpu")
+    dispatch = _TunedGemm(Mock(), device, {(16, 8, 16): [6, 20, 11, 1]})
+    x = torch.ones((32, 16), dtype=torch.bfloat16)
+    weight = torch.ones((8, 16), dtype=torch.bfloat16)
+    assert torch.equal(dispatch(torch.nn.Identity(), x, weight, None), torch.nn.functional.linear(x, weight))
+    assert not dispatch.plans
