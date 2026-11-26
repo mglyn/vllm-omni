@@ -473,6 +473,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             device=self.device,
         )
 
+        gemm_options = (getattr(self.od_config, "additional_config", None) or {}).get("gemm_tuning")
+        if gemm_options is not None:
+            from vllm_omni.diffusion.layers.gemm_tuning.runtime import install
+
+            install(self.pipeline, self.device, gemm_options)
+
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():

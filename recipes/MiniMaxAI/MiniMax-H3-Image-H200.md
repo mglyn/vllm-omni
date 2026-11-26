@@ -263,6 +263,26 @@ Correctness guard:
   request that same size; combine several changes into one edit instead of
   chaining edits.
 
+### A100 PCIe BF16 DiT shape tuning
+
+For text-to-image serving on one A100 80GB PCIe with unquantized DiT weights,
+TP=SP=1 and static FlashAttention, add
+`--additional-config '{"use_tuned_bf16_gemm":true}'` to opt in. The default is
+off. This selects a measured physical row count for the DiT while keeping the
+ordinary BF16 linear backend.
+
+For example, a 1920×1080 request with the default minimum area generates a
+2720×1536 canvas. With seven prompt tokens, the DiT has 4087 valid rows.
+The release packs them into 4112 rows; the tuned path uses 4096. The final
+nine padding rows remain a separate attention document. All image and text
+rows, the canvas, six-step schedule and returned resolution are preserved.
+For a near-native 1920×1080 workload, setting
+`"extra_params":{"min_generation_area":2073600}` in the Images API request
+uses a 1920×1088 internal canvas. At the same prompt length, 2047 valid rows
+fit in the tuned 2048-row bucket (2064 in the release). This changes the canvas
+policy independently of tuning. Edits, unlisted buckets and a fully occupied
+candidate bucket keep the release layout.
+
 ## Supported features
 
 | Feature | Status on this model | Guide |

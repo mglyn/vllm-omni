@@ -102,6 +102,7 @@ The executor then chooses how the worker runs:
 
 In all backends, each worker owns its device, distributed state,
 `DiffusionWorker`, `DiffusionModelRunner`, and pipeline instance.
+After offload setup, the runner can install a device-specific GEMM table for eager inference. See the [dispatch guide](../../../user_guide/diffusion/gemm_tuning.md).
 
 ```mermaid
 flowchart TB

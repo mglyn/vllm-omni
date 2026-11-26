@@ -30,6 +30,7 @@ _RELEASE_PDD = {
         ((1024, 1024), 2048 * 2048, (2048, 2048)),
         # Matches the reference implementation's log for a 16:9 request.
         ((1280, 720), 2048 * 2048, (2720, 1536)),
+        ((1920, 1080), 2048 * 2048, (2720, 1536)),
         # At or above the area: only aligned to the 32px grid.
         ((4736, 3552), 2048 * 2048, (4736, 3552)),
         ((4000, 3000), 2048 * 2048, (4000, 3008)),
@@ -507,3 +508,67 @@ def test_reference_limit_matches_model_metadata():
     assert h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES == 16
     metadata = get_diffusion_model_metadata("MiniMaxH3ImagePipeline")
     assert metadata.max_multimodal_image_inputs == h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES
+
+
+@pytest.mark.parametrize(
+    ("used", "release", "tuned"),
+    [
+        (2032, 2048, 2048),
+        (2033, 2064, 2048),
+        (2047, 2064, 2048),
+        (2048, 2064, 2064),
+        (2049, 2080, 2080),
+        (4080, 4096, 4096),
+        (4081, 4112, 4096),
+        (4087, 4112, 4096),
+        (4095, 4112, 4096),
+        (4096, 4112, 4112),
+        (4097, 4128, 4128),
+    ],
+)
+def test_tuned_gemm_packed_rows(used, release, tuned):
+    assert h3i._image_packed_seq_len(used) == release
+    assert h3i._image_packed_seq_len(used, row_profile=h3i._device_row_profile("NVIDIA A100 80GB PCIe")) == tuned
+    assert tuned > used
+
+
+def test_1080p_tuned_packing_preserves_valid_rows():
+    w, h = h3i.minimax_h3_image_generation_canvas(1920, 1080, 2048**2)
+    used = 7 + (w // 32) * (h // 32)
+
+    def pack(tune):
+        return minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=7,
+            latent_t=1,
+            latent_h=h // 16,
+            latent_w=w // 16,
+            audio_t=0,
+            ref_blocks=[],
+            seq_len=h3i._image_packed_seq_len(
+                used, row_profile=h3i._device_row_profile("NVIDIA A100 80GB PCIe") if tune else None
+            ),
+        )
+
+    release, tuned = pack(False), pack(True)
+    assert release["cu_seqlens"].tolist() == [0, 4087, 4112]
+    assert tuned["cu_seqlens"].tolist() == [0, 4087, 4096]
+    for key in ("token_tags", "img_position_ids", "document_id"):
+        assert torch.equal(release[key][:used], tuned[key][:used])
+    for key in ("img_pos", "text_pos", "update_mask", "latent_grid"):
+        assert torch.equal(release[key], tuned[key])
+    assert torch.all(tuned["document_id"][used:] == 1)
+
+
+def test_custom_device_profile_is_exact_and_preserves_padding():
+    profiles = {"test GPU": {"4112": 4096, "2064": 2080}}
+    profile = h3i._device_row_profile("test GPU", profiles)
+    assert h3i._device_row_profile("different GPU", profiles) == {}
+    assert h3i._image_packed_seq_len(2047, row_profile=profile) == 2080
+    assert h3i._image_packed_seq_len(4096, row_profile=profile) == 4112
+    assert h3i._device_row_profile("NVIDIA A100 80GB PCIe", {"NVIDIA A100 80GB PCIe": {}}) == {}
+
+
+@pytest.mark.parametrize("entries", [[], {"x": 4096}, {"4112": True}, {"4112": -16}, {"4112": 4087}, {"4112": 2**28}])
+def test_bad_device_profile(entries):
+    with pytest.raises(ValueError):
+        h3i._device_row_profile("test GPU", {"test GPU": entries})

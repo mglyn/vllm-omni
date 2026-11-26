@@ -71,7 +71,7 @@ from .encoder import MiniMaxH3Qwen3VLEncoder
 from .image_resize import resize_lanczos_uint8
 from .image_vae import MiniMaxH3ImageVAE
 from .minimax_h3_transformer import MiniMaxH3DiTModel
-from .packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
+from .packed_sequence import MINIMAX_H3_MAX_PAD_SEQ_LEN, minimax_h3_packed_sequence_ref2va_blocks
 from .packed_tokens import minimax_h3_patchify_video_latent, minimax_h3_unpatchify_video_tokens
 from .pipeline_minimax_h3 import MiniMaxH3Pipeline, _broadcast_tensor, _dit_rank_world
 
@@ -258,9 +258,37 @@ def _euler_target_step(rows: torch.Tensor, velocity: torch.Tensor, n_cond: int, 
     target.copy_(target + delta * velocity[n_cond:].float())
 
 
-def _image_packed_seq_len(used_rows: int) -> int:
-    """Used rows (text + target + references) rounded up to 16, plus 16 rows."""
-    return ((used_rows + 15) // 16) * 16 + 16
+# Exact GPU name -> release packed M -> measured physical M. No implicit
+# architecture-family or nearest-shape substitution.
+_BF16_PACKED_ROW_PROFILES = {"NVIDIA A100 80GB PCIe": {2064: 2048, 4112: 4096}}
+
+
+def _device_row_profile(device_name: str, overrides: object = None) -> dict[int, int]:
+    if overrides is None:
+        return _BF16_PACKED_ROW_PROFILES.get(device_name, {})
+    if not isinstance(overrides, dict):
+        raise ValueError("bf16_gemm_row_profiles must map device names to row tables")
+    if device_name not in overrides:
+        return _BF16_PACKED_ROW_PROFILES.get(device_name, {})
+    entries = overrides[device_name]
+    if not isinstance(entries, dict):
+        raise ValueError(f"Expected a row table for {device_name}")
+    table = {}
+    for key, value in entries.items():
+        if not isinstance(key, str) or not key.isascii() or not key.isdecimal() or type(value) is not int:
+            raise ValueError("Expected decimal release-row keys and integer physical-row values")
+        release = int(key)
+        if any(n <= 0 or n > MINIMAX_H3_MAX_PAD_SEQ_LEN or n % 16 for n in (release, value)):
+            raise ValueError("Row counts must be positive multiples of 16 within the packed-sequence limit")
+        table[release] = value
+    return table
+
+
+def _image_packed_seq_len(used_rows: int, *, row_profile: dict[int, int] | None = None) -> int:
+    """Preserve valid rows and a nonempty isolated padding document."""
+    release_rows = ((used_rows + 15) // 16) * 16 + 16
+    candidate = row_profile.get(release_rows) if row_profile else None
+    return candidate if candidate is not None and used_rows < candidate else release_rows
 
 
 def _upright_rgb(image: Image.Image) -> Image.Image:
@@ -394,6 +422,27 @@ class MiniMaxH3ImagePipeline(
 
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.transformer = MiniMaxH3DiTModel(od_config, quant_config=transformer_quant_config)
+        tuned_gemm = additional.get("use_tuned_bf16_gemm", False)
+        if type(tuned_gemm) is not bool:
+            raise ValueError("use_tuned_bf16_gemm must be a bool")
+        arch = self.transformer.arch
+        self._gemm_row_profile: dict[int, int] = {}
+        if (
+            tuned_gemm
+            and transformer_quant_config is None
+            and (arch.hidden_size, arch.ffn_hidden_size, arch.num_attention_heads, arch.attention_head_dim)
+            == (5376, 14336, 56, 128)
+            and (parallel.tensor_parallel_size, parallel.sequence_parallel_size) == (1, 1)
+            and od_config.diffusion_attention_schedule is None
+            and current_omni_platform.is_cuda()
+            and all(
+                block.attn.attention.attn_backend is not None
+                and block.attn.attention.attn_backend.get_name() == "FLASH_ATTN"
+                for block in self.transformer.blocks
+            )
+        ):
+            device_name = current_omni_platform.get_device_name(self.device.index or 0)
+            self._gemm_row_profile = _device_row_profile(device_name, additional.get("bf16_gemm_row_profiles"))
         if self.transformer.arch.audio_enabled:
             raise ValueError("MiniMax-H3-Image requires an audio-free DiT (audio_enabled: false)")
 
@@ -591,6 +640,9 @@ class MiniMaxH3ImagePipeline(
         width = int(width or MINIMAX_H3_IMAGE_DEFAULT_SIZE)
         height = int(height or MINIMAX_H3_IMAGE_DEFAULT_SIZE)
         extra = getattr(sampling, "extra_args", None) or {}
+        use_tuned_rows = extra.get("use_tuned_bf16_gemm", True)
+        if type(use_tuned_rows) is not bool:
+            raise OmniClientError("use_tuned_bf16_gemm must be a boolean")
         min_area = self.min_generation_area
         if "min_generation_area" in extra:
             if min_area is None:
@@ -608,6 +660,7 @@ class MiniMaxH3ImagePipeline(
             "width": width,
             "height": height,
             "canvas": (canvas_w, canvas_h),
+            "use_tuned_rows": use_tuned_rows,
             "seed": int(sampling.seed if sampling.seed is not None else 0),
             "steps": run_steps,
             "generator_device": "cpu" if device == "cpu" else current_omni_platform.device_type,
@@ -677,10 +730,17 @@ class MiniMaxH3ImagePipeline(
         latent_h: int,
         latent_w: int,
         num_steps: int,
+        use_tuned_rows: bool,
     ) -> torch.Tensor:
         text_len = int(hidden.shape[0])
         blocks = [{"kind": "image", "latent_h": h, "latent_w": w} for h, w in grids]
         used = text_len + latent_h * latent_w // 4 + sum(h * w // 4 for h, w in grids)
+        profile = self._gemm_row_profile if use_tuned_rows and not grids else None
+        seq_len = _image_packed_seq_len(used, row_profile=profile)
+        if profile and seq_len != _image_packed_seq_len(used):
+            logger.info_once(
+                "H3 tuned BF16 rows used=%d release=%d physical=%d", used, _image_packed_seq_len(used), seq_len
+            )
         packed = minimax_h3_packed_sequence_ref2va_blocks(
             text_len=text_len,
             latent_t=1,
@@ -688,7 +748,7 @@ class MiniMaxH3ImagePipeline(
             latent_w=latent_w,
             audio_t=0,
             ref_blocks=blocks,
-            seq_len=_image_packed_seq_len(used),
+            seq_len=seq_len,
         )
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"].view(-1)] = text_tags
@@ -761,6 +821,7 @@ class MiniMaxH3ImagePipeline(
                 latent_h=latent_h,
                 latent_w=latent_w,
                 num_steps=parsed["steps"],
+                use_tuned_rows=parsed["use_tuned_rows"],
             )
         latent = minimax_h3_unpatchify_video_tokens(
             target.float(), latent_shape=(1, latent_h // 2, latent_w // 2, _LATENT_CHANNELS), patch_size=_PATCH
