@@ -258,11 +258,17 @@ def _euler_target_step(rows: torch.Tensor, velocity: torch.Tensor, n_cond: int, 
     target.copy_(target + delta * velocity[n_cond:].float())
 
 
+# Release packed M -> measured physical M of the BF16 DiT projections.
+_A100_BF16_PACKED_ROWS = {2064: 2048, 4112: 4096}
+
+
 def _image_packed_seq_len(used_rows: int, *, tune_a100: bool = False) -> int:
     """Preserve valid rows and a nonempty isolated padding document."""
     release_rows = ((used_rows + 15) // 16) * 16 + 16
-    if tune_a100 and release_rows == 4112 and used_rows < 4096:
-        return 4096
+    if tune_a100:
+        candidate = _A100_BF16_PACKED_ROWS.get(release_rows)
+        if candidate is not None and used_rows < candidate:
+            return candidate
     return release_rows
 
 
@@ -400,9 +406,12 @@ class MiniMaxH3ImagePipeline(
         tuned_gemm = additional.get("use_tuned_bf16_gemm", False)
         if type(tuned_gemm) is not bool:
             raise ValueError("use_tuned_bf16_gemm must be a bool")
+        arch = self.transformer.arch
         self._tune_a100_rows = (
             tuned_gemm
             and transformer_quant_config is None
+            and (arch.hidden_size, arch.ffn_hidden_size, arch.num_attention_heads, arch.attention_head_dim)
+            == (5376, 14336, 56, 128)
             and (parallel.tensor_parallel_size, parallel.sequence_parallel_size) == (1, 1)
             and od_config.diffusion_attention_schedule is None
             and current_omni_platform.is_cuda()

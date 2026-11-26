@@ -276,7 +276,12 @@ For example, a 1920×1080 request with the default minimum area generates a
 The release packs them into 4112 rows; the tuned path uses 4096. The final
 nine padding rows remain a separate attention document. All image and text
 rows, the canvas, six-step schedule and returned resolution are preserved.
-Edits, a full 4096 valid rows, and unlisted buckets keep the release layout.
+For a near-native 1920×1080 workload, setting
+`"extra_params":{"min_generation_area":2073600}` in the Images API request
+uses a 1920×1088 internal canvas. At the same prompt length, 2047 valid rows
+fit in the tuned 2048-row bucket (2064 in the release). This changes the canvas
+policy independently of tuning. Edits, unlisted buckets and a fully occupied
+candidate bucket keep the release layout.
 
 ## Supported features
 
